@@ -20,9 +20,9 @@ from pathlib import Path
 import pytest
 
 from benchmarks.dataset.prepare import DATASETS, download_dataset
-from benchmarks.eval.benchmark_omni_tts_speed import (
-    OmniTtsSpeedBenchmarkConfig,
-    run_omni_tts_speed_benchmark,
+from benchmarks.eval.benchmark_omni_seedtts import (
+    OmniSeedttsBenchmarkConfig,
+    run_omni_seedtts_benchmark,
 )
 from sglang_omni.utils import find_available_port
 from tests.utils import (
@@ -37,6 +37,11 @@ from tests.utils import (
 )
 
 MODEL_PATH = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+
+# Speed benchmark output dir is populated by test_voice_cloning_non_streaming
+# and reused by the wer_audio_dir fixture (module-scope) to avoid a second
+# audio generation pass.
+_SPEED_OUTPUT_DIR: str = ""
 
 # TODO(Chenyang): Currently we only run concurrency=1 and a small dataset
 # (seedtts-mini, 10 samples). Support higher concurrency and larger datasets
@@ -81,23 +86,24 @@ WER_SCRIPT = str(
     Path(__file__).resolve().parents[2]
     / "benchmarks"
     / "eval"
-    / "voice_clone_omni_wer.py"
+    / "benchmark_omni_seedtts.py"
 )
 
 
 def _run_benchmark(
     port: int,
-    testset: str,
+    meta: str,
     output_dir: str,
 ) -> dict:
-    config = OmniTtsSpeedBenchmarkConfig(
+    config = OmniSeedttsBenchmarkConfig(
         model="qwen3-omni",
         port=port,
-        testset=testset,
+        meta=meta,
         output_dir=output_dir,
         max_samples=MAX_SAMPLES,
+        voice_clone=True,
     )
-    speed_results = asyncio.run(run_omni_tts_speed_benchmark(config))
+    speed_results = asyncio.run(run_omni_seedtts_benchmark(config))
     assert (
         "summary" in speed_results
     ), f"Missing 'summary' key in results. Keys: {list(speed_results.keys())}"
@@ -105,44 +111,6 @@ def _run_benchmark(
         "per_request" in speed_results
     ), f"Missing 'per_request' key in results. Keys: {list(speed_results.keys())}"
     return speed_results
-
-
-def _run_wer_generate(
-    port: int,
-    meta_path: str,
-    output_dir: str,
-    voice_clone: bool = True,
-) -> None:
-    """Generate TTS audio in CI."""
-    cmd = [
-        sys.executable,
-        WER_SCRIPT,
-        "--generate-only",
-        "--meta",
-        meta_path,
-        "--output-dir",
-        output_dir,
-        "--model",
-        "qwen3-omni",
-        "--port",
-        str(port),
-        "--max-samples",
-        str(MAX_SAMPLES),
-    ]
-    if voice_clone:
-        cmd.append("--voice-clone")
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=WER_TIMEOUT,
-        env=no_proxy_env(),
-    )
-    assert result.returncode == 0, (
-        f"WER generate failed (rc={result.returncode}).\n"
-        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
 
 
 def _run_wer_transcribe(
@@ -246,25 +214,13 @@ def server_process(tmp_path_factory: pytest.TempPathFactory):
 
 
 @pytest.fixture(scope="module")
-def wer_audio_dir(
-    server_process: subprocess.Popen,
-    dataset_dir: Path,
-    tmp_path_factory: pytest.TempPathFactory,
-):
-    """Generate WER audio in CI, then kill server to free GPU for Whisper."""
-    tmp = tmp_path_factory.mktemp("wer")
-    meta = str(dataset_dir / "en" / "meta.lst")
-
-    _run_wer_generate(
-        server_process.port,
-        meta,
-        str(tmp / "vc"),
-        voice_clone=True,
-    )
-
+def wer_audio_dir(server_process: subprocess.Popen) -> str:
+    """Reuse speed-benchmark audio for WER after freeing the TTS server GPU."""
     stop_server(server_process)
-
-    return str(tmp / "vc")
+    assert _SPEED_OUTPUT_DIR, "Speed benchmark output dir not set; run speed test first"
+    generated_path = Path(_SPEED_OUTPUT_DIR) / "generated.json"
+    assert generated_path.exists(), f"WER metadata missing: {generated_path}"
+    return _SPEED_OUTPUT_DIR
 
 
 @pytest.mark.benchmark
@@ -273,11 +229,14 @@ def test_voice_cloning_non_streaming(
     dataset_dir: Path,
     tmp_path: Path,
 ) -> None:
+    global _SPEED_OUTPUT_DIR
+    output_dir = str(tmp_path / "vc_nonstream")
     results = _run_benchmark(
         server_process.port,
         str(dataset_dir / "en" / "meta.lst"),
-        str(tmp_path / "vc_nonstream"),
+        output_dir,
     )
+    _SPEED_OUTPUT_DIR = output_dir
     summary, per_request = results["summary"], results["per_request"]
     assert_summary_metrics(summary)
     assert_per_request_fields(per_request)
