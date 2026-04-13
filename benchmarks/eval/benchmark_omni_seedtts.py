@@ -204,7 +204,7 @@ async def run_omni_seedtts_benchmark(
     api_url = f"{base_url}/v1/chat/completions"
 
     samples = load_seedtts_samples(config.meta, config.max_samples)
-    logger.info("Prepared %d requests", len(samples))
+    logger.info(f"Prepared {len(samples)} requests")
 
     save_audio_dir = os.path.abspath(os.path.join(config.output_dir, "audio"))
     os.makedirs(save_audio_dir, exist_ok=True)
@@ -247,12 +247,12 @@ def evaluate_generated_audio(config: OmniSeedttsBenchmarkConfig) -> dict:
     """
     if "cuda" in config.device:
         torch.cuda.set_device(config.device)
-        logger.info("Set ASR CUDA device to %s", config.device)
+        logger.info(f"Set ASR CUDA device to {config.device}")
 
     generated_path = os.path.join(config.output_dir, "generated.json")
     with open(generated_path) as f:
         generated: list[dict] = json.load(f)
-    logger.info("Loaded %d entries from %s", len(generated), generated_path)
+    logger.info(f"Loaded {len(generated)} entries from {generated_path}")
 
     asr = load_asr_model(config.lang, config.device)
 
@@ -282,14 +282,14 @@ def evaluate_generated_audio(config: OmniSeedttsBenchmarkConfig) -> dict:
             )
         else:
             logger.warning(
-                f"[{i+1}/{len(generated)}] Transcription failed: {entry["sample_id"]} -- {output.error}",
+                f"[{i+1}/{len(generated)}] Transcription failed: {entry['sample_id']} -- {output.error}",
             )
 
     wer_metrics = calculate_wer_metrics(outputs, config.lang)
     asr_metrics = calculate_asr_speed_metrics(outputs)
 
-    print_asr_speed_summary(metrics, config.model)
-    print_wer_summary(metrics, config.model)
+    print_asr_speed_summary(asr_metrics, config.model)
+    print_wer_summary(wer_metrics, config.model)
 
     wer_config = {
         "model": config.model,
@@ -298,9 +298,9 @@ def evaluate_generated_audio(config: OmniSeedttsBenchmarkConfig) -> dict:
         "meta": config.meta,
         "max_samples": config.max_samples,
     }
-    save_wer_results(outputs, metrics, wer_config, config.output_dir)
-    save_json_results(asr_speed, config.output_dir, "asr_speed_results.json")
-    return {"wer_summary": wer_metrics, "asr_speed": asr_speed,"per_sample": outputs}
+    save_wer_results(outputs, wer_metrics, wer_config, config.output_dir)
+    save_json_results(asr_metrics, config.output_dir, "asr_speed_results.json")
+    return {"wer_summary": wer_metrics, "asr_speed": asr_metrics,"per_sample": outputs}
 
 
 def _config_from_args(args: argparse.Namespace) -> OmniSeedttsBenchmarkConfig:
@@ -421,19 +421,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    base_url = args.base_url or f"http://{args.host}:{args.port}"
+    wait_for_service(base_url, timeout=args.server_timeout)
+
     if args.transcribe_only:
         config = _config_from_args(args)
-        run_omni_seedtts_transcribe(config)
+        evaluate_generated_audio(config)
     elif args.generate_only:
-        base_url = args.base_url or f"http://{args.host}:{args.port}"
-        wait_for_service(base_url, timeout=args.server_timeout)
         asyncio.run(benchmark(args))
     else:
-        base_url = args.base_url or f"http://{args.host}:{args.port}"
-        wait_for_service(base_url, timeout=args.server_timeout)
         gen_results = asyncio.run(benchmark(args))
         config = _config_from_args(args)
-        accuracy_results = run_omni_seedtts_transcribe(config)
+        accuracy_results = evaluate_generated_audio(config)
 
         combined = {
             "generation": {
