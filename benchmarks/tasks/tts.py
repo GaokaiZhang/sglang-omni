@@ -68,6 +68,7 @@ class SampleOutput:
     hits: int = 0
     audio_duration_s: float = 0.0
     latency_s: float = 0.0
+    asr_latency_s: float = 0.0
     is_success: bool = False
     error: str = ""
 
@@ -352,6 +353,101 @@ def print_wer_summary(
         f"{metrics.get('audio_duration_mean_s', 'N/A')}"
     )
     print(f"{'=' * w}\n")
+
+
+def calculate_asr_speed_metrics(outputs: list[SampleOutput]) -> dict:
+    """Compute speed metrics for the ASR transcription phase."""
+    successes = [o for o in outputs if o.is_success and o.asr_latency_s > 0]
+    if not successes:
+        return {
+            "total_samples": len(outputs),
+            "evaluated": 0,
+            "skipped": len(outputs),
+            "asr_latency_mean_s": 0.0,
+            "asr_latency_median_s": 0.0,
+            "asr_latency_p95_s": 0.0,
+            "asr_latency_p99_s": 0.0,
+            "asr_total_time_s": 0.0,
+            "asr_throughput_samples_per_s": 0.0,
+            "asr_rtf_mean": 0.0,
+            "asr_rtf_median": 0.0,
+            "asr_audio_processed_s": 0.0,
+        }
+
+    latencies = np.array([o.asr_latency_s for o in successes])
+    total_asr_time = float(np.sum(latencies))
+
+    audio_durations = [o.audio_duration_s for o in successes if o.audio_duration_s > 0]
+    rtfs = np.array([
+        o.asr_latency_s / o.audio_duration_s
+        for o in successes
+        if o.audio_duration_s > 0
+    ])
+
+    return {
+        "total_samples": len(outputs),
+        "evaluated": len(successes),
+        "skipped": len(outputs) - len(successes),
+        "asr_latency_mean_s": float(np.mean(latencies)),
+        "asr_latency_median_s": float(np.median(latencies)),
+        "asr_latency_p95_s": float(np.percentile(latencies, 95)),
+        "asr_latency_p99_s": float(np.percentile(latencies, 99)),
+        "asr_total_time_s": total_asr_time,
+        "asr_throughput_samples_per_s": (
+            float(len(successes) / total_asr_time) if total_asr_time > 0 else 0.0
+        ),
+        "asr_rtf_mean": float(np.mean(rtfs)) if len(rtfs) > 0 else 0.0,
+        "asr_rtf_median": float(np.median(rtfs)) if len(rtfs) > 0 else 0.0,
+        "asr_audio_processed_s": float(sum(audio_durations)) if audio_durations else 0.0,
+    }
+
+
+def print_asr_speed_summary(metrics: dict, model_name: str) -> None:
+    """Print ASR speed metrics summary table."""
+    lw = SUMMARY_LABEL_WIDTH
+    w = SUMMARY_LINE_WIDTH
+    print(f"\n{'=' * w}")
+    print(f"{'ASR Speed Benchmark Result':^{w}}")
+    print(f"{'=' * w}")
+    print(f"  {'Model:':<{lw}} {model_name}")
+    print(
+        f"  {'Evaluated / Total:':<{lw}} "
+        f"{metrics.get('evaluated', 0)}/{metrics.get('total_samples', 0)}"
+    )
+    print(f"  {'Skipped:':<{lw}} {metrics.get('skipped', 0)}")
+    print(f"{'-' * w}")
+    print(
+        f"  {'ASR latency mean (s):':<{lw}} "
+        f"{metrics.get('asr_latency_mean_s', 'N/A')}"
+    )
+    print(
+        f"  {'ASR latency median (s):':<{lw}} "
+        f"{metrics.get('asr_latency_median_s', 'N/A')}"
+    )
+    print(
+        f"  {'ASR latency p95 (s):':<{lw}} "
+        f"{metrics.get('asr_latency_p95_s', 'N/A')}"
+    )
+    print(
+        f"  {'ASR latency p99 (s):':<{lw}} "
+        f"{metrics.get('asr_latency_p99_s', 'N/A')}"
+    )
+    print(f"  {'ASR RTF mean:':<{lw}} {metrics.get('asr_rtf_mean', 'N/A')}")
+    print(f"  {'ASR RTF median:':<{lw}} {metrics.get('asr_rtf_median', 'N/A')}")
+    print(
+        f"  {'ASR total time (s):':<{lw}} "
+        f"{metrics.get('asr_total_time_s', 'N/A')}"
+    )
+    print(
+        f"  {'ASR throughput (samples/s):':<{lw}} "
+        f"{metrics.get('asr_throughput_samples_per_s', 'N/A')}"
+    )
+    if metrics.get("asr_audio_processed_s"):
+        print(
+            f"  {'Audio processed (s):':<{lw}} "
+            f"{metrics['asr_audio_processed_s']}"
+        )
+    print(f"{'=' * w}")
 
 
 def save_wer_results(

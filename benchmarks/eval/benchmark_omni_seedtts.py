@@ -47,7 +47,7 @@ from tqdm import tqdm
 
 from benchmarks.benchmarker.data import RequestResult
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
-from benchmarks.benchmarker.utils import get_wav_duration, wait_for_service
+from benchmarks.benchmarker.utils import get_wav_duration, save_json_results, wait_for_service
 from benchmarks.dataset.seedtts import SampleInput, load_seedtts_samples
 from benchmarks.metrics.performance import compute_speed_metrics
 from benchmarks.tasks.tts import (
@@ -55,8 +55,10 @@ from benchmarks.tasks.tts import (
     VoiceCloneOmni,
     _transcribe_and_compute_wer,
     build_speed_results,
+    calculate_asr_speed_metrics,
     calculate_wer_metrics,
     load_asr_model,
+    print_asr_speed_summary,
     print_speed_summary,
     print_wer_summary,
     save_generated_audio_metadata,
@@ -236,10 +238,12 @@ async def run_omni_seedtts_benchmark(
     return benchmark_results
 
 
-def run_omni_seedtts_transcribe(config: OmniSeedttsBenchmarkConfig) -> dict:
-    """Transcribe saved audio and compute WER. Server need not be running.
+def evaluate_generated_audio(config: OmniSeedttsBenchmarkConfig) -> dict:
+    """Transcribe previously saved audio with ASR and compute speed metrics.
 
-    Returns a dict with keys: summary, per_sample.
+    Note(haojin2): Server need not be running.
+
+    Returns a dict with keys: wer_summary, asr_speed, per_sample.
     """
     if "cuda" in config.device:
         torch.cuda.set_device(config.device)
@@ -265,30 +269,26 @@ def run_omni_seedtts_transcribe(config: OmniSeedttsBenchmarkConfig) -> dict:
 
         output.latency_s = entry.get("latency_s", 0.0)
         output.audio_duration_s = entry.get("audio_duration_s", 0.0)
+        asr_t0 = time.perf_counter()
         output = _transcribe_and_compute_wer(
             output, entry["wav_path"], asr, config.lang, config.device
         )
+        output.asr_latency_s = time.perf_counter() - asr_t0
         outputs.append(output)
 
         if output.is_success:
             logger.info(
-                "[%d/%d] WER=%.3f  ref=%s  hyp=%s",
-                i + 1,
-                len(generated),
-                output.wer,
-                output.ref_norm[:50],
-                output.hyp_norm[:50],
+                f"[{i+1}/{len(generated)}] WER={output.wer:.3f}s  asr={output.asr_latency_s:.3f}s  ref={output.ref_norm[:50]}  hyp={output.hyp_norm[:50]}",
             )
         else:
             logger.warning(
-                "[%d/%d] Transcription failed: %s -- %s",
-                i + 1,
-                len(generated),
-                entry["sample_id"],
-                output.error,
+                f"[{i+1}/{len(generated)}] Transcription failed: {entry["sample_id"]} -- {output.error}",
             )
 
-    metrics = calculate_wer_metrics(outputs, config.lang)
+    wer_metrics = calculate_wer_metrics(outputs, config.lang)
+    asr_metrics = calculate_asr_speed_metrics(outputs)
+
+    print_asr_speed_summary(metrics, config.model)
     print_wer_summary(metrics, config.model)
 
     wer_config = {
@@ -299,7 +299,8 @@ def run_omni_seedtts_transcribe(config: OmniSeedttsBenchmarkConfig) -> dict:
         "max_samples": config.max_samples,
     }
     save_wer_results(outputs, metrics, wer_config, config.output_dir)
-    return {"summary": metrics, "per_sample": outputs}
+    save_json_results(asr_speed, config.output_dir, "asr_speed_results.json")
+    return {"wer_summary": wer_metrics, "asr_speed": asr_speed,"per_sample": outputs}
 
 
 def _config_from_args(args: argparse.Namespace) -> OmniSeedttsBenchmarkConfig:
@@ -430,9 +431,22 @@ def main() -> None:
     else:
         base_url = args.base_url or f"http://{args.host}:{args.port}"
         wait_for_service(base_url, timeout=args.server_timeout)
-        asyncio.run(benchmark(args))
+        gen_results = asyncio.run(benchmark(args))
         config = _config_from_args(args)
-        run_omni_seedtts_transcribe(config)
+        accuracy_results = run_omni_seedtts_transcribe(config)
+
+        combined = {
+            "generation": {
+                "speed": gen_results["summary"],
+                "config": gen_results["config"],
+                "per_request": gen_results["per_request"],
+            },
+            "accuracy": {
+                "asr_speed": accuracy_results["asr_speed"],
+                "wer": accuracy_results["wer_summary"],
+            }
+        }
+        save_json_results(combined, config.output_dir, "eval_results.json")
 
 
 if __name__ == "__main__":
