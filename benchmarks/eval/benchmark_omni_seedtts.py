@@ -421,8 +421,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    base_url = args.base_url or f"http://{args.host}:{args.port}"
-    wait_for_service(base_url, timeout=args.server_timeout)
+    if not args.transcribe_only:
+        base_url = args.base_url or f"http://{args.host}:{args.port}"
+        wait_for_service(base_url, timeout=args.server_timeout)
 
     if args.transcribe_only:
         config = _config_from_args(args)
