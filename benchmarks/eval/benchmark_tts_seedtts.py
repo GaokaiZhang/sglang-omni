@@ -205,7 +205,7 @@ def run_tts_seedtts_transcribe(config: TtsSeedttsBenchmarkConfig) -> dict:
 def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
     # ``--no-ref-audio`` is preserved as a legacy CLI flag; it flips the
     # dataclass default (``voice_clone=True``) to False for plain TTS.
-    voice_clone = not getattr(args, "no_ref_audio", False)
+    voice_clone = not args.no_ref_audio
     return TtsSeedttsBenchmarkConfig(
         base_url=args.base_url,
         host=args.host,

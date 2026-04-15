@@ -247,7 +247,13 @@ def wer_audio_dir(
     server_process: subprocess.Popen,
     speed_output_dir: str,
 ) -> str:
-    """Reuse speed-benchmark audio for WER after freeing the TTS server GPU."""
+    """Reuse speed-benchmark audio for WER after freeing the TTS server GPU.
+
+    ``stop_server`` is called here (in addition to the ``server_process``
+    teardown) so Whisper-large-v3 can claim the GPU memory before the
+    transcribe subprocess runs. ``stop_server`` is idempotent so the later
+    teardown call is a safe no-op.
+    """
     stop_server(server_process)
     generated_path = Path(speed_output_dir) / "generated.json"
     assert generated_path.exists(), f"WER metadata missing: {generated_path}"

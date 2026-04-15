@@ -46,7 +46,7 @@ from dataclasses import dataclass
 import aiohttp
 
 from benchmarks.benchmarker.data import RequestResult
-from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
+from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig, SendFn
 from benchmarks.benchmarker.utils import (
     get_wav_duration,
     save_json_results,
@@ -125,7 +125,7 @@ def make_send_fn(
     max_tokens: int,
     temperature: float,
     save_audio_dir: str,
-):
+) -> SendFn:
     """Return a SendFn that calls Qwen3-Omni via VoiceCloneOmni and saves WAV."""
     task = VoiceCloneOmni()
 
@@ -258,9 +258,7 @@ def _config_from_args(args: argparse.Namespace) -> OmniSeedttsBenchmarkConfig:
     # shell history keep working after the script merge.  ``--voice-clone``
     # remains the canonical flag.  If neither is passed the dataclass default
     # (``voice_clone=False``) applies.
-    voice_clone = getattr(args, "voice_clone", False)
-    if getattr(args, "no_ref_audio", False):
-        voice_clone = False
+    voice_clone = args.voice_clone and not args.no_ref_audio
     device = args.device if args.device is not None else args.asr_device
     return OmniSeedttsBenchmarkConfig(
         base_url=args.base_url,

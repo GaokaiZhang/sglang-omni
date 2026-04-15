@@ -534,26 +534,82 @@ def save_wer_results(
 # ---------------------------------------------------------------------------
 
 
-class SeedttsTranscribeConfig(Protocol):
-    """Subset of fields the shared transcribe pipeline reads from a config.
+class ServerEndpointConfig(Protocol):
+    """Subset used by :func:`build_base_url` to resolve a server endpoint."""
 
-    note (Chenyang): kept as a Protocol so both `OmniSeedttsBenchmarkConfig`
-    and `TtsSeedttsBenchmarkConfig` (and any future benchmark config) can be
-    passed without inheriting a common base class.
+    base_url: str | None
+    host: str
+    port: int
+
+
+class SeedttsTranscribeConfig(Protocol):
+    """Subset of config fields the shared transcribe pipeline reads.
+
+    Kept narrow on purpose: ``run_seedtts_transcribe`` does not touch any
+    server fields, so callers whose configs lack ``host``/``port`` can still
+    satisfy this Protocol.
     """
 
     model: str
     output_dir: str
     lang: str
     device: str
-    base_url: str | None
-    host: str
-    port: int
 
 
-def build_base_url(config: SeedttsTranscribeConfig) -> str:
+def build_base_url(config: ServerEndpointConfig) -> str:
     """Resolve the server base URL from an explicit override or host/port."""
     return config.base_url or f"http://{config.host}:{config.port}"
+
+
+def _transcribe_one_entry(
+    entry: dict,
+    asr: dict,
+    lang: str,
+    device: str,
+) -> SampleOutput:
+    """Transcribe a single ``generated.json`` entry and compute its WER."""
+    output = SampleOutput(
+        sample_id=entry["sample_id"],
+        target_text=entry["target_text"],
+    )
+    if not entry.get("is_success", False):
+        output.error = f"Generation failed: {entry.get('error', 'unknown')}"
+        return output
+
+    output.latency_s = entry.get("latency_s", 0.0)
+    output.audio_duration_s = entry.get("audio_duration_s", 0.0)
+    asr_t0 = time.perf_counter()
+    output = transcribe_and_compute_wer(output, entry["wav_path"], asr, lang, device)
+    output.asr_latency_s = time.perf_counter() - asr_t0
+    return output
+
+
+def _log_transcribe_result(
+    *,
+    idx: int,
+    total: int,
+    entry: dict,
+    output: SampleOutput,
+    log_per_sample: bool,
+) -> None:
+    if output.is_success:
+        if log_per_sample:
+            logger.info(
+                f"[{idx + 1}/{total}] "
+                f"WER={output.wer:.3f}  "
+                f"asr={output.asr_latency_s:.3f}s  "
+                f"ref={output.ref_norm[:50]}  "
+                f"hyp={output.hyp_norm[:50]}",
+            )
+        return
+
+    # Only warn for post-generation transcription failures; generation
+    # failures are surfaced at speed-benchmark time and already logged.
+    if entry.get("is_success", False):
+        logger.warning(
+            f"[{idx + 1}/{total}] Transcription failed: "
+            f"{entry['sample_id']} -- {output.error}",
+        )
 
 
 def run_seedtts_transcribe(
@@ -585,43 +641,20 @@ def run_seedtts_transcribe(
 
     asr = load_asr_model(config.lang, config.device, generation_mode)
 
-    outputs: list[SampleOutput] = []
     tqdm_desc = (
         f"Transcribing ({config.lang})" if not generation_mode else "WER transcribe"
     )
-    for i, entry in enumerate(tqdm(generated, desc=tqdm_desc)):
-        output = SampleOutput(
-            sample_id=entry["sample_id"],
-            target_text=entry["target_text"],
-        )
-        if not entry.get("is_success", False):
-            output.error = f"Generation failed: {entry.get('error', 'unknown')}"
-            outputs.append(output)
-            continue
-
-        output.latency_s = entry.get("latency_s", 0.0)
-        output.audio_duration_s = entry.get("audio_duration_s", 0.0)
-        asr_t0 = time.perf_counter()
-        output = transcribe_and_compute_wer(
-            output, entry["wav_path"], asr, config.lang, config.device
-        )
-        output.asr_latency_s = time.perf_counter() - asr_t0
+    outputs: list[SampleOutput] = []
+    for idx, entry in enumerate(tqdm(generated, desc=tqdm_desc)):
+        output = _transcribe_one_entry(entry, asr, config.lang, config.device)
         outputs.append(output)
-
-        if output.is_success:
-            if log_per_sample:
-                logger.info(
-                    f"[{i + 1}/{len(generated)}] "
-                    f"WER={output.wer:.3f}  "
-                    f"asr={output.asr_latency_s:.3f}s  "
-                    f"ref={output.ref_norm[:50]}  "
-                    f"hyp={output.hyp_norm[:50]}",
-                )
-        else:
-            logger.warning(
-                f"[{i + 1}/{len(generated)}] Transcription failed: "
-                f"{entry['sample_id']} -- {output.error}",
-            )
+        _log_transcribe_result(
+            idx=idx,
+            total=len(generated),
+            entry=entry,
+            output=output,
+            log_per_sample=log_per_sample,
+        )
 
     wer_metrics = calculate_wer_metrics(outputs, config.lang)
     asr_metrics = calculate_asr_speed_metrics(outputs)
