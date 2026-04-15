@@ -5,22 +5,29 @@ Combines benchmark_omni_tts_speed.py and voice_clone_omni_wer.py into a
 two-phase pipeline: generate audio while the server is running, then
 transcribe without the server to avoid GPU OOM.
 
-Usage:
+The benchmark always persists generated WAVs to disk so the follow-up
+transcribe phase can reuse them without regenerating audio.  Callers who
+only need speed numbers may still pass ``--generate-only`` and discard the
+resulting ``audio/`` directory.
+
+Usage (run from project root so ``benchmarks`` is on sys.path; use
+``python -m benchmarks.eval.benchmark_omni_seedtts`` if invoking via a
+subprocess from another directory):
     # Full pipeline (generate + transcribe)
-    python benchmarks/eval/benchmark_omni_seedtts.py \
+    python -m benchmarks.eval.benchmark_omni_seedtts \
         --meta seedtts_testset/en/meta.lst \
         --output-dir results/qwen3_omni_en \
         --model qwen3-omni --port 8000 --max-samples 50
 
     # Phase 1: generate audio only (server must be running)
-    python benchmarks/eval/benchmark_omni_seedtts.py \
+    python -m benchmarks.eval.benchmark_omni_seedtts \
         --generate-only \
         --meta seedtts_testset/en/meta.lst \
         --output-dir results/qwen3_omni_en \
         --model qwen3-omni --port 8000 --max-samples 50
 
     # Phase 2: transcribe + WER only (server not needed)
-    python benchmarks/eval/benchmark_omni_seedtts.py \
+    python -m benchmarks.eval.benchmark_omni_seedtts \
         --transcribe-only \
         --meta seedtts_testset/en/meta.lst \
         --output-dir results/qwen3_omni_en \
@@ -31,19 +38,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import os
-import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import aiohttp
-import torch
-from tqdm import tqdm
 
 from benchmarks.benchmarker.data import RequestResult
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
@@ -55,19 +55,13 @@ from benchmarks.benchmarker.utils import (
 from benchmarks.dataset.seedtts import SampleInput, load_seedtts_samples
 from benchmarks.metrics.performance import compute_speed_metrics
 from benchmarks.tasks.tts import (
-    SampleOutput,
     VoiceCloneOmni,
+    build_base_url,
     build_speed_results,
-    calculate_asr_speed_metrics,
-    calculate_wer_metrics,
-    load_asr_model,
-    print_asr_speed_summary,
     print_speed_summary,
-    print_wer_summary,
+    run_seedtts_transcribe,
     save_generated_audio_metadata,
     save_speed_results,
-    save_wer_results,
-    transcribe_and_compute_wer,
 )
 
 logging.basicConfig(
@@ -101,10 +95,6 @@ class OmniSeedttsBenchmarkConfig:
     device: str = "cuda:0"
 
 
-def _build_base_url(config: OmniSeedttsBenchmarkConfig) -> str:
-    return config.base_url or f"http://{config.host}:{config.port}"
-
-
 def _build_results_config(
     config: OmniSeedttsBenchmarkConfig,
     *,
@@ -125,7 +115,7 @@ def _build_results_config(
     }
 
 
-def _make_send_fn(
+def make_send_fn(
     model_name: str,
     api_url: str,
     *,
@@ -171,7 +161,7 @@ def _make_send_fn(
                 result.prompt_tokens = usage.get("prompt_tokens", 0)
                 result.completion_tokens = usage.get("completion_tokens", 0)
 
-            # Note (chenyang): engine_time_s should be the time taken by
+            # note (Chenyang): engine_time_s should be the time taken by
             # the engine. Current omni chat completions has no X-Engine-Time
             # header, so we use request elapsed time as engine_time_s proxy.
             # This shall largely affect the results at high concurrency,
@@ -204,7 +194,7 @@ async def run_omni_seedtts_benchmark(
     if not os.path.isfile(config.meta):
         raise FileNotFoundError(f"Meta file not found: {config.meta}")
 
-    base_url = _build_base_url(config)
+    base_url = build_base_url(config)
     api_url = f"{base_url}/v1/chat/completions"
 
     samples = load_seedtts_samples(config.meta, config.max_samples)
@@ -213,7 +203,7 @@ async def run_omni_seedtts_benchmark(
     save_audio_dir = os.path.abspath(os.path.join(config.output_dir, "audio"))
     os.makedirs(save_audio_dir, exist_ok=True)
 
-    send_fn = _make_send_fn(
+    send_fn = make_send_fn(
         config.model,
         api_url,
         lang=config.lang,
@@ -243,58 +233,12 @@ async def run_omni_seedtts_benchmark(
 
 
 def evaluate_generated_audio(config: OmniSeedttsBenchmarkConfig) -> dict:
-    """Transcribe previously saved audio with ASR and compute speed metrics.
+    """Transcribe previously saved audio with ASR and compute WER + ASR speed.
 
-    Note(haojin2): Server need not be running.
+    note (Chenyang): Server need not be running.
 
     Returns a dict with keys: wer_summary, asr_speed, per_sample.
     """
-    if "cuda" in config.device:
-        torch.cuda.set_device(config.device)
-        logger.info(f"Set ASR CUDA device to {config.device}")
-
-    generated_path = os.path.join(config.output_dir, "generated.json")
-    with open(generated_path) as f:
-        generated: list[dict] = json.load(f)
-    logger.info(f"Loaded {len(generated)} entries from {generated_path}")
-
-    asr = load_asr_model(config.lang, config.device)
-
-    outputs: list[SampleOutput] = []
-    for i, entry in enumerate(tqdm(generated, desc=f"Transcribing ({config.lang})")):
-        output = SampleOutput(
-            sample_id=entry["sample_id"],
-            target_text=entry["target_text"],
-        )
-        if not entry.get("is_success", False):
-            output.error = f"Generation failed: {entry.get('error', 'unknown')}"
-            outputs.append(output)
-            continue
-
-        output.latency_s = entry.get("latency_s", 0.0)
-        output.audio_duration_s = entry.get("audio_duration_s", 0.0)
-        asr_t0 = time.perf_counter()
-        output = transcribe_and_compute_wer(
-            output, entry["wav_path"], asr, config.lang, config.device
-        )
-        output.asr_latency_s = time.perf_counter() - asr_t0
-        outputs.append(output)
-
-        if output.is_success:
-            logger.info(
-                f"[{i+1}/{len(generated)}] WER={output.wer:.3f}  asr={output.asr_latency_s:.3f}s  ref={output.ref_norm[:50]}  hyp={output.hyp_norm[:50]}",
-            )
-        else:
-            logger.warning(
-                f"[{i+1}/{len(generated)}] Transcription failed: {entry['sample_id']} -- {output.error}",
-            )
-
-    wer_metrics = calculate_wer_metrics(outputs, config.lang)
-    asr_metrics = calculate_asr_speed_metrics(outputs)
-
-    print_asr_speed_summary(asr_metrics, config.model)
-    print_wer_summary(wer_metrics, config.model)
-
     wer_config = {
         "model": config.model,
         "speaker": config.speaker,
@@ -302,12 +246,22 @@ def evaluate_generated_audio(config: OmniSeedttsBenchmarkConfig) -> dict:
         "meta": config.meta,
         "max_samples": config.max_samples,
     }
-    save_wer_results(outputs, wer_metrics, wer_config, config.output_dir)
-    save_json_results(asr_metrics, config.output_dir, "asr_speed_results.json")
-    return {"wer_summary": wer_metrics, "asr_speed": asr_metrics, "per_sample": outputs}
+    return run_seedtts_transcribe(
+        config,
+        wer_config=wer_config,
+        log_per_sample=True,
+    )
 
 
 def _config_from_args(args: argparse.Namespace) -> OmniSeedttsBenchmarkConfig:
+    # ``--no-ref-audio`` is kept as a legacy alias so existing automation and
+    # shell history keep working after the script merge.  ``--voice-clone``
+    # remains the canonical flag.  If neither is passed the dataclass default
+    # (``voice_clone=False``) applies.
+    voice_clone = getattr(args, "voice_clone", False)
+    if getattr(args, "no_ref_audio", False):
+        voice_clone = False
+    device = args.device if args.device is not None else args.asr_device
     return OmniSeedttsBenchmarkConfig(
         base_url=args.base_url,
         host=args.host,
@@ -316,7 +270,7 @@ def _config_from_args(args: argparse.Namespace) -> OmniSeedttsBenchmarkConfig:
         meta=args.meta,
         lang=args.lang,
         speaker=args.speaker,
-        voice_clone=args.voice_clone,
+        voice_clone=voice_clone,
         output_dir=args.output_dir,
         max_samples=args.max_samples,
         max_new_tokens=args.max_new_tokens,
@@ -325,12 +279,11 @@ def _config_from_args(args: argparse.Namespace) -> OmniSeedttsBenchmarkConfig:
         max_concurrency=args.max_concurrency,
         request_rate=args.request_rate,
         disable_tqdm=args.disable_tqdm,
-        device=args.device,
+        device=device,
     )
 
 
-async def benchmark(args: argparse.Namespace) -> dict:
-    config = _config_from_args(args)
+async def benchmark(config: OmniSeedttsBenchmarkConfig) -> dict:
     results = await run_omni_seedtts_benchmark(config)
     print_speed_summary(
         results["summary"], config.model, concurrency=config.max_concurrency
@@ -338,7 +291,7 @@ async def benchmark(args: argparse.Namespace) -> dict:
     return results
 
 
-def main() -> None:
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="SeedTTS benchmark for Qwen3-Omni: speed and WER evaluation."
     )
@@ -356,8 +309,11 @@ def main() -> None:
         default="qwen3-omni",
         help="Model name for the API request.",
     )
+    # ``--testset`` is a legacy alias for ``--meta`` (kept for shell history).
     parser.add_argument(
         "--meta",
+        "--testset",
+        dest="meta",
         type=str,
         default="seedtts_testset/en/meta.lst",
         help="Path to a meta.lst file (seed-tts-eval format).",
@@ -376,11 +332,24 @@ def main() -> None:
         choices=["Ethan", "Chelsie", "Aiden"],
         help="Speaker voice for TTS.",
     )
-    parser.add_argument(
+    # Voice-clone toggle: ``--voice-clone`` and ``--no-ref-audio`` are
+    # complementary flags.  They map to a single ``voice_clone`` bool with the
+    # dataclass default ``False`` (plain TTS, no reference audio).
+    voice_clone_group = parser.add_mutually_exclusive_group()
+    voice_clone_group.add_argument(
         "--voice-clone",
+        dest="voice_clone",
         action="store_true",
-        help="Pass ref_audio for voice cloning (default: off).",
+        help="Pass ref_audio via 'audios' field for voice cloning.",
     )
+    voice_clone_group.add_argument(
+        "--no-ref-audio",
+        dest="no_ref_audio",
+        action="store_true",
+        help="Legacy alias: disable voice cloning (equivalent to omitting "
+        "--voice-clone; kept for backward-compatible shell history).",
+    )
+    parser.set_defaults(voice_clone=False, no_ref_audio=False)
     parser.add_argument("--output-dir", type=str, default="results/omni_seedtts")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=256)
@@ -398,12 +367,26 @@ def main() -> None:
         default=float("inf"),
         help="Requests per second (inf = send all at once).",
     )
+    parser.add_argument(
+        "--save-audio",
+        action="store_true",
+        help="Legacy flag kept for backward compatibility. The unified "
+        "benchmark always saves generated WAVs so the transcribe phase can "
+        "reuse them; passing this flag is a no-op.",
+    )
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda:0",
+        default=None,
         help="Device for ASR model (transcribe phase).",
+    )
+    parser.add_argument(
+        "--asr-device",
+        dest="asr_device",
+        type=str,
+        default="cuda:0",
+        help="Legacy alias for --device (ASR transcription device).",
     )
     parser.add_argument(
         "--server-timeout",
@@ -423,34 +406,40 @@ def main() -> None:
         action="store_true",
         help="Only run ASR transcription and WER on existing output-dir.",
     )
-    args = parser.parse_args()
+    return parser
 
-    if not args.transcribe_only:
-        base_url = args.base_url or f"http://{args.host}:{args.port}"
-        wait_for_service(base_url, timeout=args.server_timeout)
+
+def main() -> None:
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+    config = _config_from_args(args)
+
+    if args.save_audio:
+        logger.info("--save-audio is a no-op: the unified benchmark always saves WAVs.")
 
     if args.transcribe_only:
-        config = _config_from_args(args)
         evaluate_generated_audio(config)
-    elif args.generate_only:
-        asyncio.run(benchmark(args))
-    else:
-        gen_results = asyncio.run(benchmark(args))
-        config = _config_from_args(args)
-        accuracy_results = evaluate_generated_audio(config)
+        return
 
-        combined = {
-            "generation": {
-                "speed": gen_results["summary"],
-                "config": gen_results["config"],
-                "per_request": gen_results["per_request"],
-            },
-            "accuracy": {
-                "asr_speed": accuracy_results["asr_speed"],
-                "wer": accuracy_results["wer_summary"],
-            },
-        }
-        save_json_results(combined, config.output_dir, "eval_results.json")
+    wait_for_service(build_base_url(config), timeout=args.server_timeout)
+    gen_results = asyncio.run(benchmark(config))
+
+    if args.generate_only:
+        return
+
+    accuracy_results = evaluate_generated_audio(config)
+    combined = {
+        "generation": {
+            "speed": gen_results["summary"],
+            "config": gen_results["config"],
+            "per_request": gen_results["per_request"],
+        },
+        "accuracy": {
+            "asr_speed": accuracy_results["asr_speed"],
+            "wer": accuracy_results["wer_summary"],
+        },
+    }
+    save_json_results(combined, config.output_dir, "eval_results.json")
 
 
 if __name__ == "__main__":

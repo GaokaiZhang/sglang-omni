@@ -38,12 +38,9 @@ from tests.utils import (
 
 MODEL_PATH = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
-# Speed benchmark output dir is populated by test_voice_cloning_non_streaming
-# and reused by the wer_audio_dir fixture (module-scope) to avoid a second
-# audio generation pass.
-_SPEED_OUTPUT_DIR: str = ""
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# TODO(Chenyang): Currently we only run concurrency=1 and a small dataset
+# note (Chenyang): Currently we only run concurrency=1 and a small dataset
 # (seedtts-mini, 10 samples). Support higher concurrency and larger datasets
 # once the Qwen3-Omni pipeline is optimized for concurrent requests.
 
@@ -55,7 +52,7 @@ DATASET_CACHE_ENV = "SGLANG_SEEDTTS_MINI_DIR"
 STARTUP_TIMEOUT = 900
 WER_TIMEOUT = 600
 
-# Note (Chenyang): P95 values measured on H20 CI machines with concurrency=1,
+# note (Chenyang): P95 values measured on H20 CI machines with concurrency=1,
 # seedtts-mini dataset (5 samples). Update these when hardware or model changes.
 
 _VC_NON_STREAM_P95 = {
@@ -81,13 +78,6 @@ VC_NON_STREAM_THRESHOLDS = apply_slack(
 
 VC_WER_MAX_CORPUS = 0.06
 VC_WER_MAX_PER_SAMPLE = 0.30
-
-WER_SCRIPT = str(
-    Path(__file__).resolve().parents[2]
-    / "benchmarks"
-    / "eval"
-    / "benchmark_omni_seedtts.py"
-)
 
 
 def _run_benchmark(
@@ -119,10 +109,17 @@ def _run_wer_transcribe(
     lang: str = "en",
     device: str = "cuda:0",
 ) -> dict:
-    """Transcribe saved audio and compute WER in CI."""
+    """Transcribe saved audio and compute WER in CI.
+
+    note (Chenyang): We invoke the benchmark as ``python -m
+    benchmarks.eval.benchmark_omni_seedtts`` rather than via a direct file
+    path so the ``benchmarks`` package is discovered via PEP 420 namespace
+    lookup from the project root (which PYTHONPATH guarantees below).
+    """
     cmd = [
         sys.executable,
-        WER_SCRIPT,
+        "-m",
+        "benchmarks.eval.benchmark_omni_seedtts",
         "--transcribe-only",
         "--meta",
         meta_path,
@@ -136,12 +133,19 @@ def _run_wer_transcribe(
         device,
     ]
 
+    env = no_proxy_env()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        f"{PROJECT_ROOT}{os.pathsep}{existing}" if existing else str(PROJECT_ROOT)
+    )
+
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         timeout=WER_TIMEOUT,
-        env=no_proxy_env(),
+        env=env,
+        cwd=str(PROJECT_ROOT),
     )
     assert result.returncode == 0, (
         f"WER transcribe failed (rc={result.returncode}).\n"
@@ -214,33 +218,46 @@ def server_process(tmp_path_factory: pytest.TempPathFactory):
 
 
 @pytest.fixture(scope="module")
-def wer_audio_dir(server_process: subprocess.Popen) -> str:
-    """Reuse speed-benchmark audio for WER after freeing the TTS server GPU."""
-    stop_server(server_process)
-    assert _SPEED_OUTPUT_DIR, "Speed benchmark output dir not set; run speed test first"
-    generated_path = Path(_SPEED_OUTPUT_DIR) / "generated.json"
-    assert generated_path.exists(), f"WER metadata missing: {generated_path}"
-    return _SPEED_OUTPUT_DIR
-
-
-@pytest.mark.benchmark
-def test_voice_cloning_non_streaming(
+def speed_output_dir(
     server_process: subprocess.Popen,
     dataset_dir: Path,
-    tmp_path: Path,
-) -> None:
-    global _SPEED_OUTPUT_DIR
-    output_dir = str(tmp_path / "vc_nonstream")
+    tmp_path_factory: pytest.TempPathFactory,
+) -> str:
+    """Run the speed benchmark once and expose the output directory.
+
+    Keeping the benchmark in its own fixture (rather than a test body that
+    writes a module-level global) lets the WER stage consume the audio
+    without coupling test ordering through mutable globals.
+    """
+    output_dir = str(tmp_path_factory.mktemp("vc_nonstream"))
     results = _run_benchmark(
         server_process.port,
         str(dataset_dir / "en" / "meta.lst"),
         output_dir,
     )
-    _SPEED_OUTPUT_DIR = output_dir
     summary, per_request = results["summary"], results["per_request"]
     assert_summary_metrics(summary)
     assert_per_request_fields(per_request)
     assert_speed_thresholds(summary, VC_NON_STREAM_THRESHOLDS, CONCURRENCY)
+    return output_dir
+
+
+@pytest.fixture(scope="module")
+def wer_audio_dir(
+    server_process: subprocess.Popen,
+    speed_output_dir: str,
+) -> str:
+    """Reuse speed-benchmark audio for WER after freeing the TTS server GPU."""
+    stop_server(server_process)
+    generated_path = Path(speed_output_dir) / "generated.json"
+    assert generated_path.exists(), f"WER metadata missing: {generated_path}"
+    return speed_output_dir
+
+
+@pytest.mark.benchmark
+def test_voice_cloning_non_streaming(speed_output_dir: str) -> None:
+    """Smoke check: the speed-benchmark fixture asserts metrics/thresholds."""
+    assert Path(speed_output_dir).is_dir()
 
 
 @pytest.mark.benchmark

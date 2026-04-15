@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import csv
 import functools
 import io
@@ -20,6 +21,7 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import aiohttp
 import numpy as np
@@ -28,6 +30,7 @@ import soundfile as sf
 import torch
 import transformers
 from jiwer import process_words
+from tqdm import tqdm
 
 from benchmarks.benchmarker.data import RequestResult
 from benchmarks.benchmarker.runner import SendFn
@@ -77,7 +80,15 @@ class SampleOutput:
 def _get_en_normalizer():
     """Lazy-load the English text normalizer.
 
-    Tries whisper_normalizer first, then openai-whisper, then transformers.
+    Tries whisper_normalizer (standalone pip package) first, then openai-whisper,
+    then the transformers built-in normalizer.
+
+    note (Chenyang): The three fallbacks exist because our deployments don't always
+    have whisper_normalizer installed, whisper's own normalizer lives under a
+    different path depending on the release, and on minimal CI images we rely on
+    the transformers copy bundled with the library.  Keeping all three paths lets
+    the WER numbers stay stable across environments (the official seed-tts-eval
+    reference uses whisper_normalizer, so we prefer it when available).
     """
     try:
         from whisper_normalizer.english import EnglishTextNormalizer
@@ -112,7 +123,7 @@ def _get_en_normalizer():
         )
         return normalizer
     except (ImportError, FileNotFoundError) as exc:
-        logger.debug("transformers EnglishTextNormalizer failed: %s", exc)
+        logger.debug(f"transformers EnglishTextNormalizer failed: {exc}")
 
     logger.warning(
         "EnglishTextNormalizer not found; falling back to punctuation-strip normalizer."
@@ -151,21 +162,21 @@ def load_asr_model(lang: str, device: str, generation_mode: str | None = None):
     if lang == "en":
         from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-        logger.info("Loading Whisper-large-v3 on %s%s...", device, mode_suffix)
+        logger.info(f"Loading Whisper-large-v3 on {device}{mode_suffix}...")
         t0 = time.perf_counter()
         processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
         model = WhisperForConditionalGeneration.from_pretrained(
             "openai/whisper-large-v3"
         ).to(device)
-        logger.info("Whisper loaded in %.1fs%s", time.perf_counter() - t0, mode_suffix)
+        logger.info(f"Whisper loaded in {time.perf_counter() - t0:.1f}s{mode_suffix}")
         return {"type": "whisper", "processor": processor, "model": model}
     elif lang == "zh":
         from funasr import AutoModel
 
-        logger.info("Loading FunASR paraformer-zh%s...", mode_suffix)
+        logger.info(f"Loading FunASR paraformer-zh{mode_suffix}...")
         t0 = time.perf_counter()
         model = AutoModel(model="paraformer-zh")
-        logger.info("FunASR loaded in %.1fs%s", time.perf_counter() - t0, mode_suffix)
+        logger.info(f"FunASR loaded in {time.perf_counter() - t0:.1f}s{mode_suffix}")
         return {"type": "funasr", "model": model}
     else:
         raise ValueError(f"Unsupported language: {lang}")
@@ -211,7 +222,7 @@ def transcribe_and_compute_wer(
         hyp_text = transcribe(asr, wav_path, lang, device)
     except Exception as exc:
         output.error = f"Transcription failed: {exc}"
-        logger.error("[%s] %s", output.sample_id, output.error)
+        logger.error(f"[{output.sample_id}] {output.error}")
         return output
 
     output.whisper_text = hyp_text
@@ -519,6 +530,116 @@ def save_wer_results(
 
 
 # ---------------------------------------------------------------------------
+# Shared transcribe pipeline (seed-tts-eval style)
+# ---------------------------------------------------------------------------
+
+
+class SeedttsTranscribeConfig(Protocol):
+    """Subset of fields the shared transcribe pipeline reads from a config.
+
+    note (Chenyang): kept as a Protocol so both `OmniSeedttsBenchmarkConfig`
+    and `TtsSeedttsBenchmarkConfig` (and any future benchmark config) can be
+    passed without inheriting a common base class.
+    """
+
+    model: str
+    output_dir: str
+    lang: str
+    device: str
+    base_url: str | None
+    host: str
+    port: int
+
+
+def build_base_url(config: SeedttsTranscribeConfig) -> str:
+    """Resolve the server base URL from an explicit override or host/port."""
+    return config.base_url or f"http://{config.host}:{config.port}"
+
+
+def run_seedtts_transcribe(
+    config: SeedttsTranscribeConfig,
+    *,
+    wer_config: dict,
+    generation_mode: str | None = None,
+    log_per_sample: bool = False,
+) -> dict:
+    """Transcribe saved audio, compute WER + ASR-speed metrics, and persist them.
+
+    Shared pipeline used by both Qwen3-Omni and S2-Pro seed-tts-eval benchmarks.
+    The caller-specific ``wer_config`` dict is embedded in ``wer_results.json``
+    to preserve backward-compatible fields.
+
+    Returns a dict with keys:
+        - ``wer_summary``: corpus-level WER metrics (see :func:`calculate_wer_metrics`)
+        - ``asr_speed``:   ASR transcription latency/throughput metrics
+        - ``per_sample``:  list[SampleOutput] with per-sample details
+    """
+    if "cuda" in config.device:
+        torch.cuda.set_device(config.device)
+        logger.info(f"Set ASR CUDA device to {config.device}")
+
+    generated_path = os.path.join(config.output_dir, "generated.json")
+    with open(generated_path) as f:
+        generated: list[dict] = json.load(f)
+    logger.info(f"Loaded {len(generated)} entries from {generated_path}")
+
+    asr = load_asr_model(config.lang, config.device, generation_mode)
+
+    outputs: list[SampleOutput] = []
+    tqdm_desc = (
+        f"Transcribing ({config.lang})" if not generation_mode else "WER transcribe"
+    )
+    for i, entry in enumerate(tqdm(generated, desc=tqdm_desc)):
+        output = SampleOutput(
+            sample_id=entry["sample_id"],
+            target_text=entry["target_text"],
+        )
+        if not entry.get("is_success", False):
+            output.error = f"Generation failed: {entry.get('error', 'unknown')}"
+            outputs.append(output)
+            continue
+
+        output.latency_s = entry.get("latency_s", 0.0)
+        output.audio_duration_s = entry.get("audio_duration_s", 0.0)
+        asr_t0 = time.perf_counter()
+        output = transcribe_and_compute_wer(
+            output, entry["wav_path"], asr, config.lang, config.device
+        )
+        output.asr_latency_s = time.perf_counter() - asr_t0
+        outputs.append(output)
+
+        if output.is_success:
+            if log_per_sample:
+                logger.info(
+                    f"[{i + 1}/{len(generated)}] "
+                    f"WER={output.wer:.3f}  "
+                    f"asr={output.asr_latency_s:.3f}s  "
+                    f"ref={output.ref_norm[:50]}  "
+                    f"hyp={output.hyp_norm[:50]}",
+                )
+        else:
+            logger.warning(
+                f"[{i + 1}/{len(generated)}] Transcription failed: "
+                f"{entry['sample_id']} -- {output.error}",
+            )
+
+    wer_metrics = calculate_wer_metrics(outputs, config.lang)
+    asr_metrics = calculate_asr_speed_metrics(outputs)
+
+    print_asr_speed_summary(asr_metrics, config.model)
+    print_wer_summary(wer_metrics, config.model, generation_mode)
+
+    save_wer_results(outputs, wer_metrics, wer_config, config.output_dir)
+    save_json_results(asr_metrics, config.output_dir, "asr_speed_results.json")
+
+    return {
+        "wer_summary": wer_metrics,
+        "asr_speed": asr_metrics,
+        "per_sample": outputs,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Voice-clone API clients
 # ---------------------------------------------------------------------------
 
@@ -697,7 +818,7 @@ class VoiceCloneTTS:
             output.audio_duration_s = round(sf.info(wav_path).duration, 4)
         except Exception as exc:
             output.error = f"Generation failed: {exc}"
-            logger.error("[%s] %s", sample.sample_id, output.error)
+            logger.error(f"[{sample.sample_id}] {output.error}")
             return output
 
         return transcribe_and_compute_wer(output, wav_path, asr, lang, device)
@@ -824,7 +945,7 @@ class VoiceCloneOmni:
             output.audio_duration_s = round(sf.info(wav_path).duration, 4)
         except Exception as exc:
             output.error = f"Generation failed: {exc}"
-            logger.error("[%s] %s", sample.sample_id, output.error)
+            logger.error(f"[{sample.sample_id}] {output.error}")
             return output
 
         return transcribe_and_compute_wer(output, wav_path, asr, lang, asr_device)
@@ -971,8 +1092,8 @@ def _collect_streaming_audio(
                 if stream_format is not None:
                     return stream_format
                 return (wf.getframerate(), wf.getnchannels(), wf.getsampwidth())
-    except Exception as exc:
-        logger.debug("Skipping malformed streaming audio chunk: %s", exc)
+    except (binascii.Error, wave.Error, EOFError) as exc:
+        logger.debug(f"Skipping malformed streaming audio chunk: {exc}")
         return stream_format
 
 
@@ -1122,7 +1243,7 @@ def save_generated_audio_metadata(
     metadata_path = os.path.join(output_dir, "generated.json")
     with open(metadata_path, "w") as fh:
         json.dump(generated, fh, indent=2, ensure_ascii=False)
-    logger.info("Generated audio metadata saved to %s", metadata_path)
+    logger.info(f"Generated audio metadata saved to {metadata_path}")
 
 
 def _request_result_to_generated_entry(
@@ -1183,4 +1304,4 @@ def save_speed_results(
                     o.error or "",
                 ]
             )
-    logger.info("Results saved to %s", output_dir)
+    logger.info(f"Results saved to {output_dir}")

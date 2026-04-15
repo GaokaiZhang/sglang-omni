@@ -39,11 +39,11 @@ from benchmarks.dataset.mmmu import load_mmmu_samples
 from benchmarks.metrics.performance import compute_speed_metrics
 from benchmarks.tasks.tts import (
     SampleOutput,
-    _transcribe_and_compute_wer,
     calculate_wer_metrics,
     load_asr_model,
     print_speed_summary,
     print_wer_summary,
+    transcribe_and_compute_wer,
 )
 from benchmarks.tasks.visual_understand import (
     compute_mmmu_metrics,
@@ -181,7 +181,7 @@ def _compute_audio_wer(
             outputs.append(output)
             continue
 
-        output = _transcribe_and_compute_wer(
+        output = transcribe_and_compute_wer(
             output, result.wav_path, asr, lang, asr_device
         )
         outputs.append(output)

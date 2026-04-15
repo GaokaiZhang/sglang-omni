@@ -5,26 +5,33 @@ Combines benchmark_tts_speed.py and voice_clone_tts_wer.py into a two-phase
 pipeline: generate audio while the server is running, then transcribe without
 the server to avoid GPU OOM.
 
-Usage:
+The benchmark always persists generated WAVs to disk so the follow-up
+transcribe phase can reuse them without regenerating audio.  Callers who
+only need speed numbers may still pass ``--generate-only`` and discard the
+resulting ``audio/`` directory.
+
+Usage (run from project root so ``benchmarks`` is on sys.path; use
+``python -m benchmarks.eval.benchmark_tts_seedtts`` if invoking via a
+subprocess from another directory):
     # Full pipeline (generate + transcribe)
-    python benchmarks/eval/benchmark_tts_seedtts.py \
+    python -m benchmarks.eval.benchmark_tts_seedtts \
         --meta seedtts_testset/en/meta.lst \
         --model fishaudio/s2-pro --port 8000
 
     # Full pipeline, streaming, high concurrency
-    python benchmarks/eval/benchmark_tts_seedtts.py \
+    python -m benchmarks.eval.benchmark_tts_seedtts \
         --meta seedtts_testset/en/meta.lst \
         --model fishaudio/s2-pro --port 8000 \
         --concurrency 8 --stream
 
     # Phase 1: generate audio only (server must be running)
-    python benchmarks/eval/benchmark_tts_seedtts.py \
+    python -m benchmarks.eval.benchmark_tts_seedtts \
         --generate-only \
         --meta seedtts_testset/en/meta.lst \
         --model fishaudio/s2-pro --port 8000 --concurrency 8
 
     # Phase 2: transcribe + WER only (server not needed)
-    python benchmarks/eval/benchmark_tts_seedtts.py \
+    python -m benchmarks.eval.benchmark_tts_seedtts \
         --transcribe-only \
         --meta seedtts_testset/en/meta.lst \
         --model fishaudio/s2-pro \
@@ -36,35 +43,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import os
-import sys
-import time
 from dataclasses import dataclass
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-import torch
-from tqdm import tqdm
 
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
 from benchmarks.benchmarker.utils import wait_for_service
 from benchmarks.dataset.seedtts import load_seedtts_samples
 from benchmarks.metrics.performance import compute_speed_metrics
 from benchmarks.tasks.tts import (
-    SampleOutput,
+    build_base_url,
     build_speed_results,
-    calculate_wer_metrics,
-    load_asr_model,
     make_tts_send_fn,
     print_speed_summary,
-    print_wer_summary,
+    run_seedtts_transcribe,
     save_generated_audio_metadata,
     save_speed_results,
-    save_wer_results,
-    transcribe_and_compute_wer,
 )
 
 logging.basicConfig(
@@ -81,7 +75,10 @@ class TtsSeedttsBenchmarkConfig:
     base_url: str | None = None
     host: str = "localhost"
     port: int = 8000
-    no_ref_audio: bool = False
+    # note (Chenyang): Default is voice-clone ON — S2-Pro's canonical flow
+    # uses the seed-tts-eval reference audio.  The legacy ``--no-ref-audio``
+    # CLI flag flips this to False for plain TTS.
+    voice_clone: bool = True
     output_dir: str = "results/tts_seedtts"
     max_samples: int | None = None
     max_new_tokens: int | None = 2048
@@ -97,10 +94,6 @@ class TtsSeedttsBenchmarkConfig:
     # Transcribe phase
     lang: str = "en"
     device: str = "cuda:0"
-
-
-def _build_base_url(config: TtsSeedttsBenchmarkConfig) -> str:
-    return config.base_url or f"http://{config.host}:{config.port}"
 
 
 def _build_generation_kwargs(config: TtsSeedttsBenchmarkConfig) -> dict:
@@ -127,7 +120,7 @@ def _build_results_config(
         "model": config.model,
         "base_url": base_url,
         "meta": config.meta,
-        "no_ref_audio": config.no_ref_audio,
+        "voice_clone": config.voice_clone,
         "stream": config.stream,
         "max_samples": config.max_samples,
         "max_new_tokens": config.max_new_tokens,
@@ -147,11 +140,11 @@ async def run_tts_seedtts_benchmark(
     if not os.path.isfile(config.meta):
         raise FileNotFoundError(f"Meta file not found: {config.meta}")
 
-    base_url = _build_base_url(config)
+    base_url = build_base_url(config)
     api_url = f"{base_url}/v1/audio/speech"
 
     samples = load_seedtts_samples(config.meta, config.max_samples)
-    logger.info("Prepared %d requests", len(samples))
+    logger.info(f"Prepared {len(samples)} requests")
 
     save_audio_dir = os.path.abspath(os.path.join(config.output_dir, "audio"))
     os.makedirs(save_audio_dir, exist_ok=True)
@@ -161,7 +154,7 @@ async def run_tts_seedtts_benchmark(
         config.model,
         api_url,
         stream=config.stream,
-        no_ref_audio=config.no_ref_audio,
+        no_ref_audio=not config.voice_clone,
         save_audio_dir=save_audio_dir,
         **generation_kwargs,
     )
@@ -185,69 +178,41 @@ async def run_tts_seedtts_benchmark(
 
 
 def run_tts_seedtts_transcribe(config: TtsSeedttsBenchmarkConfig) -> dict:
-    """Transcribe saved audio and compute WER. Server need not be running.
+    """Transcribe saved audio and compute WER + ASR speed metrics.
 
-    Returns a dict with keys: summary, per_sample.
+    Server need not be running.
+
+    Returns a dict with keys: wer_summary, asr_speed, per_sample.
     """
     generation_mode = "streaming" if config.stream else "non-streaming"
-    if "cuda" in config.device:
-        torch.cuda.set_device(config.device)
-
-    generated_path = os.path.join(config.output_dir, "generated.json")
-    with open(generated_path) as f:
-        generated: list[dict] = json.load(f)
-    logger.info("Loaded %d entries from %s", len(generated), generated_path)
-
-    asr = load_asr_model(config.lang, config.device, generation_mode)
-
-    outputs: list[SampleOutput] = []
-    for entry in tqdm(generated, desc="WER transcribe", unit="sample"):
-        output = SampleOutput(
-            sample_id=entry["sample_id"],
-            target_text=entry["target_text"],
-        )
-        if not entry.get("is_success", False):
-            output.error = f"Generation failed: {entry.get('error', 'unknown')}"
-            outputs.append(output)
-            continue
-
-        output.latency_s = entry.get("latency_s", 0.0)
-        output.audio_duration_s = entry.get("audio_duration_s", 0.0)
-        asr_t0 = time.perf_counter()
-        output = transcribe_and_compute_wer(
-            output, entry["wav_path"], asr, config.lang, config.device
-        )
-        output.asr_latency_s = time.perf_counter() - asr_t0
-        if not output.is_success:
-            logger.warning(
-                "Transcription failed: %s -- %s", entry["sample_id"], output.error
-            )
-        outputs.append(output)
-
-    metrics = calculate_wer_metrics(outputs, config.lang)
-    print_wer_summary(metrics, config.model, generation_mode)
-
     wer_config = {
         "model": config.model,
         "meta": config.meta,
+        "voice_clone": config.voice_clone,
         "max_new_tokens": config.max_new_tokens,
         "temperature": config.temperature,
         "max_samples": config.max_samples,
         "stream": config.stream,
         "concurrency": config.concurrency,
     }
-    save_wer_results(outputs, metrics, wer_config, config.output_dir)
-    return {"summary": metrics, "per_sample": outputs}
+    return run_seedtts_transcribe(
+        config,
+        wer_config=wer_config,
+        generation_mode=generation_mode,
+    )
 
 
 def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
+    # ``--no-ref-audio`` is preserved as a legacy CLI flag; it flips the
+    # dataclass default (``voice_clone=True``) to False for plain TTS.
+    voice_clone = not getattr(args, "no_ref_audio", False)
     return TtsSeedttsBenchmarkConfig(
         base_url=args.base_url,
         host=args.host,
         port=args.port,
         model=args.model,
         meta=args.meta,
-        no_ref_audio=args.no_ref_audio,
+        voice_clone=voice_clone,
         output_dir=args.output_dir,
         max_samples=args.max_samples,
         max_new_tokens=args.max_new_tokens,
@@ -265,8 +230,7 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
     )
 
 
-async def benchmark(args: argparse.Namespace) -> dict:
-    config = _config_from_args(args)
+async def benchmark(config: TtsSeedttsBenchmarkConfig) -> dict:
     results = await run_tts_seedtts_benchmark(config)
     print_speed_summary(
         results["summary"], config.model, concurrency=config.concurrency
@@ -274,7 +238,7 @@ async def benchmark(args: argparse.Namespace) -> dict:
     return results
 
 
-def main() -> None:
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="SeedTTS benchmark for S2-Pro TTS: speed and WER evaluation."
     )
@@ -292,14 +256,18 @@ def main() -> None:
         default="fishaudio/s2-pro",
         help="Model name for the API request.",
     )
+    # ``--testset`` is a legacy alias for ``--meta`` (kept for shell history).
     parser.add_argument(
         "--meta",
+        "--testset",
+        dest="meta",
         type=str,
         default="seedtts_testset/en/meta.lst",
         help="Path to a meta.lst file (seed-tts-eval format).",
     )
     parser.add_argument(
         "--no-ref-audio",
+        dest="no_ref_audio",
         action="store_true",
         help="Skip ref audio/text from testset (TTS without voice cloning).",
     )
@@ -328,6 +296,13 @@ def main() -> None:
         action="store_true",
         help="Use streaming SSE for TTS generation.",
     )
+    parser.add_argument(
+        "--save-audio",
+        action="store_true",
+        help="Legacy flag kept for backward compatibility. The unified "
+        "benchmark always saves generated WAVs so the transcribe phase can "
+        "reuse them; passing this flag is a no-op.",
+    )
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument(
         "--lang",
@@ -342,6 +317,12 @@ def main() -> None:
         default="cuda:0",
         help="Device for ASR model (transcribe phase).",
     )
+    parser.add_argument(
+        "--server-timeout",
+        type=int,
+        default=1200,
+        help="Timeout in seconds to wait for server readiness.",
+    )
 
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -354,21 +335,28 @@ def main() -> None:
         action="store_true",
         help="Only run ASR transcription and WER on existing output-dir.",
     )
+    return parser
+
+
+def main() -> None:
+    parser = _build_arg_parser()
     args = parser.parse_args()
+    config = _config_from_args(args)
+
+    if args.save_audio:
+        logger.info("--save-audio is a no-op: the unified benchmark always saves WAVs.")
 
     if args.transcribe_only:
-        config = _config_from_args(args)
         run_tts_seedtts_transcribe(config)
-    elif args.generate_only:
-        base_url = args.base_url or f"http://{args.host}:{args.port}"
-        wait_for_service(base_url)
-        asyncio.run(benchmark(args))
-    else:
-        base_url = args.base_url or f"http://{args.host}:{args.port}"
-        wait_for_service(base_url)
-        asyncio.run(benchmark(args))
-        config = _config_from_args(args)
-        run_tts_seedtts_transcribe(config)
+        return
+
+    wait_for_service(build_base_url(config), timeout=args.server_timeout)
+    asyncio.run(benchmark(config))
+
+    if args.generate_only:
+        return
+
+    run_tts_seedtts_transcribe(config)
 
 
 if __name__ == "__main__":
