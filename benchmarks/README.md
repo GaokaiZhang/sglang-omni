@@ -60,6 +60,7 @@ python benchmarks/eval/voice_clone_tts_wer.py \
 | `eval/benchmark_omni_tts_speed.py` | TTS speed | Qwen3 Omni | `/v1/chat/completions` |
 | `eval/voice_clone_tts_wer.py` | Voice clone WER | S2 Pro | `/v1/audio/speech` |
 | `eval/voice_clone_omni_wer.py` | Voice clone WER | Qwen3 Omni | `/v1/chat/completions` |
+| `eval/benchmark_omni_mmsu.py` | MMSU accuracy | Qwen3 Omni | `/v1/chat/completions` |
 
 ## Adding a New Model
 
