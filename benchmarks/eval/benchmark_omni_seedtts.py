@@ -53,7 +53,7 @@ from benchmarks.metrics.performance import compute_speed_metrics
 from benchmarks.tasks.tts import (
     SampleOutput,
     VoiceCloneOmni,
-    _transcribe_and_compute_wer,
+    transcribe_and_compute_wer,
     build_speed_results,
     calculate_asr_speed_metrics,
     calculate_wer_metrics,
@@ -270,7 +270,7 @@ def evaluate_generated_audio(config: OmniSeedttsBenchmarkConfig) -> dict:
         output.latency_s = entry.get("latency_s", 0.0)
         output.audio_duration_s = entry.get("audio_duration_s", 0.0)
         asr_t0 = time.perf_counter()
-        output = _transcribe_and_compute_wer(
+        output = transcribe_and_compute_wer(
             output, entry["wav_path"], asr, config.lang, config.device
         )
         output.asr_latency_s = time.perf_counter() - asr_t0
@@ -278,7 +278,7 @@ def evaluate_generated_audio(config: OmniSeedttsBenchmarkConfig) -> dict:
 
         if output.is_success:
             logger.info(
-                f"[{i+1}/{len(generated)}] WER={output.wer:.3f}s  asr={output.asr_latency_s:.3f}s  ref={output.ref_norm[:50]}  hyp={output.hyp_norm[:50]}",
+                f"[{i+1}/{len(generated)}] WER={output.wer:.3f}  asr={output.asr_latency_s:.3f}s  ref={output.ref_norm[:50]}  hyp={output.hyp_norm[:50]}",
             )
         else:
             logger.warning(
@@ -300,7 +300,7 @@ def evaluate_generated_audio(config: OmniSeedttsBenchmarkConfig) -> dict:
     }
     save_wer_results(outputs, wer_metrics, wer_config, config.output_dir)
     save_json_results(asr_metrics, config.output_dir, "asr_speed_results.json")
-    return {"wer_summary": wer_metrics, "asr_speed": asr_metrics,"per_sample": outputs}
+    return {"wer_summary": wer_metrics, "asr_speed": asr_metrics, "per_sample": outputs}
 
 
 def _config_from_args(args: argparse.Namespace) -> OmniSeedttsBenchmarkConfig:
@@ -444,7 +444,7 @@ def main() -> None:
             "accuracy": {
                 "asr_speed": accuracy_results["asr_speed"],
                 "wer": accuracy_results["wer_summary"],
-            }
+            },
         }
         save_json_results(combined, config.output_dir, "eval_results.json")
 

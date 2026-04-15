@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,7 +55,7 @@ from benchmarks.dataset.seedtts import load_seedtts_samples
 from benchmarks.metrics.performance import compute_speed_metrics
 from benchmarks.tasks.tts import (
     SampleOutput,
-    _transcribe_and_compute_wer,
+    transcribe_and_compute_wer,
     build_speed_results,
     calculate_wer_metrics,
     load_asr_model,
@@ -212,9 +213,11 @@ def run_tts_seedtts_transcribe(config: TtsSeedttsBenchmarkConfig) -> dict:
 
         output.latency_s = entry.get("latency_s", 0.0)
         output.audio_duration_s = entry.get("audio_duration_s", 0.0)
-        output = _transcribe_and_compute_wer(
+        asr_t0 = time.perf_counter()
+        output = transcribe_and_compute_wer(
             output, entry["wav_path"], asr, config.lang, config.device
         )
+        output.asr_latency_s = time.perf_counter() - asr_t0
         if not output.is_success:
             logger.warning(
                 "Transcription failed: %s -- %s", entry["sample_id"], output.error
