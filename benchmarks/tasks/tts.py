@@ -199,7 +199,7 @@ def transcribe(asr: dict, wav_path: str, lang: str, device: str) -> str:
         raise ValueError(f"Unknown ASR type: {asr['type']}")
 
 
-def _transcribe_and_compute_wer(
+def transcribe_and_compute_wer(
     output: SampleOutput,
     wav_path: str,
     asr: dict,
@@ -378,11 +378,13 @@ def calculate_asr_speed_metrics(outputs: list[SampleOutput]) -> dict:
     total_asr_time = float(np.sum(latencies))
 
     audio_durations = [o.audio_duration_s for o in successes if o.audio_duration_s > 0]
-    rtfs = np.array([
-        o.asr_latency_s / o.audio_duration_s
-        for o in successes
-        if o.audio_duration_s > 0
-    ])
+    rtfs = np.array(
+        [
+            o.asr_latency_s / o.audio_duration_s
+            for o in successes
+            if o.audio_duration_s > 0
+        ]
+    )
 
     return {
         "total_samples": len(outputs),
@@ -398,7 +400,9 @@ def calculate_asr_speed_metrics(outputs: list[SampleOutput]) -> dict:
         ),
         "asr_rtf_mean": float(np.mean(rtfs)) if len(rtfs) > 0 else 0.0,
         "asr_rtf_median": float(np.median(rtfs)) if len(rtfs) > 0 else 0.0,
-        "asr_audio_processed_s": float(sum(audio_durations)) if audio_durations else 0.0,
+        "asr_audio_processed_s": (
+            float(sum(audio_durations)) if audio_durations else 0.0
+        ),
     }
 
 
@@ -434,19 +438,13 @@ def print_asr_speed_summary(metrics: dict, model_name: str) -> None:
     )
     print(f"  {'ASR RTF mean:':<{lw}} {metrics.get('asr_rtf_mean', 'N/A')}")
     print(f"  {'ASR RTF median:':<{lw}} {metrics.get('asr_rtf_median', 'N/A')}")
-    print(
-        f"  {'ASR total time (s):':<{lw}} "
-        f"{metrics.get('asr_total_time_s', 'N/A')}"
-    )
+    print(f"  {'ASR total time (s):':<{lw}} " f"{metrics.get('asr_total_time_s', 'N/A')}")
     print(
         f"  {'ASR throughput (samples/s):':<{lw}} "
         f"{metrics.get('asr_throughput_samples_per_s', 'N/A')}"
     )
     if metrics.get("asr_audio_processed_s"):
-        print(
-            f"  {'Audio processed (s):':<{lw}} "
-            f"{metrics['asr_audio_processed_s']}"
-        )
+        print(f"  {'Audio processed (s):':<{lw}} " f"{metrics['asr_audio_processed_s']}")
     print(f"{'=' * w}")
 
 
@@ -698,7 +696,7 @@ class VoiceCloneTTS:
             logger.error("[%s] %s", sample.sample_id, output.error)
             return output
 
-        return _transcribe_and_compute_wer(output, wav_path, asr, lang, device)
+        return transcribe_and_compute_wer(output, wav_path, asr, lang, device)
 
 
 class VoiceCloneOmni:
@@ -825,7 +823,7 @@ class VoiceCloneOmni:
             logger.error("[%s] %s", sample.sample_id, output.error)
             return output
 
-        return _transcribe_and_compute_wer(output, wav_path, asr, lang, asr_device)
+        return transcribe_and_compute_wer(output, wav_path, asr, lang, asr_device)
 
 
 # ---------------------------------------------------------------------------
