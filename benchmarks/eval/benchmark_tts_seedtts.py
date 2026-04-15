@@ -55,7 +55,6 @@ from benchmarks.dataset.seedtts import load_seedtts_samples
 from benchmarks.metrics.performance import compute_speed_metrics
 from benchmarks.tasks.tts import (
     SampleOutput,
-    transcribe_and_compute_wer,
     build_speed_results,
     calculate_wer_metrics,
     load_asr_model,
@@ -65,6 +64,7 @@ from benchmarks.tasks.tts import (
     save_generated_audio_metadata,
     save_speed_results,
     save_wer_results,
+    transcribe_and_compute_wer,
 )
 
 logging.basicConfig(

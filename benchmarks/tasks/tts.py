@@ -438,13 +438,17 @@ def print_asr_speed_summary(metrics: dict, model_name: str) -> None:
     )
     print(f"  {'ASR RTF mean:':<{lw}} {metrics.get('asr_rtf_mean', 'N/A')}")
     print(f"  {'ASR RTF median:':<{lw}} {metrics.get('asr_rtf_median', 'N/A')}")
-    print(f"  {'ASR total time (s):':<{lw}} " f"{metrics.get('asr_total_time_s', 'N/A')}")
+    print(
+        f"  {'ASR total time (s):':<{lw}} " f"{metrics.get('asr_total_time_s', 'N/A')}"
+    )
     print(
         f"  {'ASR throughput (samples/s):':<{lw}} "
         f"{metrics.get('asr_throughput_samples_per_s', 'N/A')}"
     )
     if metrics.get("asr_audio_processed_s"):
-        print(f"  {'Audio processed (s):':<{lw}} " f"{metrics['asr_audio_processed_s']}")
+        print(
+            f"  {'Audio processed (s):':<{lw}} " f"{metrics['asr_audio_processed_s']}"
+        )
     print(f"{'=' * w}")
 
 

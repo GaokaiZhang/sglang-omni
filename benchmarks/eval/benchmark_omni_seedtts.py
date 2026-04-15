@@ -47,13 +47,16 @@ from tqdm import tqdm
 
 from benchmarks.benchmarker.data import RequestResult
 from benchmarks.benchmarker.runner import BenchmarkRunner, RunConfig
-from benchmarks.benchmarker.utils import get_wav_duration, save_json_results, wait_for_service
+from benchmarks.benchmarker.utils import (
+    get_wav_duration,
+    save_json_results,
+    wait_for_service,
+)
 from benchmarks.dataset.seedtts import SampleInput, load_seedtts_samples
 from benchmarks.metrics.performance import compute_speed_metrics
 from benchmarks.tasks.tts import (
     SampleOutput,
     VoiceCloneOmni,
-    transcribe_and_compute_wer,
     build_speed_results,
     calculate_asr_speed_metrics,
     calculate_wer_metrics,
@@ -64,6 +67,7 @@ from benchmarks.tasks.tts import (
     save_generated_audio_metadata,
     save_speed_results,
     save_wer_results,
+    transcribe_and_compute_wer,
 )
 
 logging.basicConfig(
