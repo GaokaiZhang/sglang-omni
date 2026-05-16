@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Stage executor factories for the Voxtral TTS pipeline."""
 
 from __future__ import annotations
@@ -10,10 +11,10 @@ from typing import Any
 
 import torch
 
-from sglang_omni.executors import PreprocessingExecutor
 from sglang_omni.models.voxtral_tts.io import VoxtralTTSState
 from sglang_omni.models.voxtral_tts.pipeline.state_io import load_state, store_state
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ def _resolve_checkpoint(checkpoint: str) -> str:
 # ---- Preprocessing ----
 
 
-def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
+def create_preprocessing_executor(model_path: str) -> SimpleScheduler:
     """Factory for the preprocessing stage."""
     checkpoint_dir = _resolve_checkpoint(model_path)
 
@@ -69,7 +70,7 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
 
         tts_params = metadata.get("tts_params", {})
         voice = tts_params.get("voice") or params.get("voice")
-        if voice is None:
+        if voice in (None, "", "default"):
             voice = "cheerful_female"
 
         encoded = tokenizer.encode_speech_request(
@@ -90,7 +91,7 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
 
         return store_state(payload, state)
 
-    return PreprocessingExecutor(_preprocess)
+    return SimpleScheduler(_preprocess)
 
 
 # ---- Generation ----
@@ -183,7 +184,7 @@ def create_generation_executor(
     *,
     device: str = "cuda:0",
     max_new_tokens: int = 4096,
-) -> PreprocessingExecutor:
+) -> SimpleScheduler:
     """Factory for the AR generation stage."""
     from sglang_omni.models.voxtral_tts.voxtral_tts_audio_generation import (
         VoxtralTTSAudioGeneration,
@@ -215,7 +216,7 @@ def create_generation_executor(
         state.completion_tokens = completion_tokens
         return store_state(payload, state)
 
-    return PreprocessingExecutor(_generate)
+    return SimpleScheduler(_generate)
 
 
 # ---- Vocoder ----
@@ -269,7 +270,7 @@ def _load_audio_tokenizer(checkpoint_dir: str, audio_config: dict, device: str):
         tokenizer.load_weight((remapped, tensor))
 
     tokenizer = tokenizer.to(dtype=torch.bfloat16, device=device).eval()
-    logger.info("Audio tokenizer loaded in %.2fs", time.perf_counter() - t0)
+    logger.info(f"Audio tokenizer loaded in {time.perf_counter() - t0:.2f}s")
     return tokenizer
 
 
@@ -277,7 +278,7 @@ def create_vocoder_executor(
     model_path: str,
     *,
     device: str = "cuda:0",
-) -> PreprocessingExecutor:
+) -> SimpleScheduler:
     """Factory for the vocoder (audio tokenizer decode) stage."""
     checkpoint_dir = _resolve_checkpoint(model_path)
 
@@ -355,4 +356,4 @@ def create_vocoder_executor(
 
         return payload
 
-    return PreprocessingExecutor(_vocode)
+    return SimpleScheduler(_vocode)

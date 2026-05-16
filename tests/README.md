@@ -46,16 +46,20 @@ tests/
     │   ├── test_thinker.py
     │   ├── test_tokenizer.py
     │   └── test_tp.py
+    ├── qwen3_tts/
+    │   └── test_pipeline.py
     ├── router/
     │   ├── test_app.py
     │   └── test_core.py
     ├── serve/
     │   └── test_openai_api.py
-    └── fishaudio_s2_pro/
-        ├── test_pipeline.py
-        ├── test_streaming_vocoder.py
-        ├── test_tts.py
-        └── test_vocoder.py
+    ├── fishaudio_s2_pro/
+    │   ├── test_pipeline.py
+    │   ├── test_streaming_vocoder.py
+    │   ├── test_tts.py
+    │   └── test_vocoder.py
+    └── voxtral_tts/
+        └── test_pipeline.py
 ```
 
 ## How To Add A Test
@@ -202,6 +206,13 @@ that happened to contain an older version of the test.
   - Bailing tokenizer loader fallback for vocab compatibility
   - TP topology validation (rank-specific stage specs, talker/thinker GPU collision detection, server_args alignment before infra init).
 
+- `unit_test/qwen3_tts/`: Qwen3-TTS Base unit tests:
+  - pipeline config and registry contracts
+  - request mapping for `ref_audio` / `ref_text` and `references`
+  - upstream default preservation for language and sampling parameters
+  - voice-clone reference validation
+  - pipeline payload state serialization.
+
 - `unit_test/router/`: SGLang-Omni Router unit tests:
   - router CLI/config behavior
   - worker metadata and health-state contracts
@@ -219,6 +230,12 @@ that happened to contain an older version of the test.
   - model-runner state transitions
   - vocoder batching/trim behavior
   - streaming vocoder chunking, flush, and abort behavior.
+
+- `unit_test/voxtral_tts/`: Voxtral-TTS unit tests:
+  - pipeline config and registry contracts
+  - current `StageConfig` schema wiring
+  - generation/vocoder GPU placement contracts
+  - terminal stage behavior.
 
 - `unit_test/fixtures/`: Shared fakes. Single-test
   helpers should stay local until a second test needs them.

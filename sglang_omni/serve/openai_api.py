@@ -661,11 +661,25 @@ def _build_speech_generate_request(
 ) -> GenerateRequest:
     """Convert a CreateSpeechRequest into a client GenerateRequest."""
 
+    explicit_generation_params = [
+        field
+        for field in (
+            "max_new_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "repetition_penalty",
+            "seed",
+        )
+        if field in req.model_fields_set and getattr(req, field) is not None
+    ]
+
     # Build TTS-specific parameters to pass through the pipeline
     tts_params: dict[str, Any] = {
         "voice": req.voice,
         "response_format": req.response_format,
         "speed": req.speed,
+        "explicit_generation_params": explicit_generation_params,
     }
     if req.task_type is not None:
         tts_params["task_type"] = req.task_type
