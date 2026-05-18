@@ -19,18 +19,21 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
     stages: list[StageConfig] = [
         StageConfig(
             name="preprocessing",
+            process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
             next="tts_engine",
         ),
         StageConfig(
             name="tts_engine",
-            factory=f"{_PKG}.stages.create_tts_engine_executor",
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
             factory_args={"device": "cuda:0", "dtype": "bfloat16"},
             gpu=0,
             next="vocoder",
         ),
         StageConfig(
             name="vocoder",
+            process="pipeline",
             factory=f"{_PKG}.stages.create_vocoder_executor",
             factory_args={"device": "cuda:0", "dtype": "bfloat16"},
             gpu=0,

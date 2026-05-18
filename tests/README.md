@@ -208,8 +208,9 @@ that happened to contain an older version of the test.
 
 - `unit_test/qwen3_tts/`: Qwen3-TTS Base unit tests:
   - pipeline config and registry contracts
+  - OmniScheduler-backed AR stage factory wiring
   - request mapping for `ref_audio` / `ref_text` and `references`
-  - upstream default preservation for language and sampling parameters
+  - model-owned default preservation for language and sampling parameters
   - voice-clone reference validation
   - pipeline payload state serialization.
 
@@ -234,7 +235,7 @@ that happened to contain an older version of the test.
 - `unit_test/voxtral_tts/`: Voxtral-TTS unit tests:
   - pipeline config and registry contracts
   - current `StageConfig` schema wiring
-  - generation/vocoder GPU placement contracts
+  - SGLang-backed generation and vocoder GPU placement contracts
   - terminal stage behavior.
 
 - `unit_test/fixtures/`: Shared fakes. Single-test

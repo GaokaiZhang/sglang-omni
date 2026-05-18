@@ -24,6 +24,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler as _Upstream
+from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
@@ -454,19 +455,37 @@ class OmniScheduler:
             ):
                 self._deferred_request_payloads[req_id] = payload
                 continue
-            req_data = self._request_builder(payload)
+            try:
+                req_data = self._request_builder(payload)
+            except Exception as exc:
+                logger.exception(f"OmniScheduler: request builder failed for {req_id}")
+                self._pending_stream_done.discard(req_id)
+                self._deferred_request_payloads.pop(req_id, None)
+                self.outbox.put(
+                    OutgoingMessage(request_id=req_id, type="error", data=exc)
+                )
+                continue
             if pending_stream_done:
                 self._pending_stream_done.discard(req_id)
             self._deferred_request_payloads.pop(req_id, None)
             req = req_data.req
             req._omni_data = req_data
             req_id = req.rid
+            if bool(getattr(req_data, "enforce_request_limits", False)):
+                error_msg = self._prepare_request_limits(req_data)
+                if error_msg:
+                    self.outbox.put(
+                        OutgoingMessage(
+                            request_id=req_id,
+                            type="error",
+                            data=ValueError(error_msg),
+                        )
+                    )
+                    continue
             kv_error = self._request_kv_capacity_error(req)
             if kv_error is not None:
                 logger.warning(
-                    "Rejecting request %s before scheduling: %s",
-                    req_id,
-                    kv_error,
+                    f"Rejecting request {req_id} before scheduling: {kv_error}"
                 )
                 self.outbox.put(
                     OutgoingMessage(
@@ -480,6 +499,20 @@ class OmniScheduler:
             if req_id in self._aborted_request_ids:
                 continue
             self.waiting_queue.append(req)
+
+    def _prepare_request_limits(self, req_data: Any) -> str | None:
+        req = req_data.req
+        self.init_req_max_new_tokens(req)
+        error_msg = validate_input_length(
+            req,
+            self.max_req_input_len,
+            allow_auto_truncate=False,
+        )
+        if error_msg:
+            return error_msg
+        if hasattr(req_data, "max_new_tokens"):
+            req_data.max_new_tokens = int(req.sampling_params.max_new_tokens)
+        return None
 
     def _take_deferred_request_payloads(self) -> list[Any]:
         if not self._deferred_request_payloads:

@@ -23,11 +23,13 @@ class VoxtralTTSPipelineConfig(PipelineConfig):
     stages: list[StageConfig] = [
         StageConfig(
             name=PREPROCESSING_STAGE,
+            process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
             next=GENERATION_STAGE,
         ),
         StageConfig(
             name=GENERATION_STAGE,
+            process="pipeline",
             factory=f"{_PKG}.stages.create_generation_executor",
             factory_args={"device": "cuda:0", "max_new_tokens": 4096},
             gpu=0,
@@ -35,6 +37,7 @@ class VoxtralTTSPipelineConfig(PipelineConfig):
         ),
         StageConfig(
             name=VOCODER_STAGE,
+            process="pipeline",
             factory=f"{_PKG}.stages.create_vocoder_executor",
             factory_args={"device": "cuda:0"},
             gpu=0,

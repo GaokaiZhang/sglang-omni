@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from typing import Any
 
 import torch
 
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
-from sglang_omni.models.qwen3_tts.request_builders import build_qwen3_tts_state
+from sglang_omni.models.qwen3_tts.request_builders import (
+    make_qwen3_tts_scheduler_adapters,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
@@ -41,31 +42,6 @@ def _resolve_checkpoint(checkpoint: str) -> str:
     return snapshot_download(checkpoint)
 
 
-def _load_qwen3_tts_model(
-    model_path: str,
-    *,
-    device: str,
-    dtype: str,
-    attn_implementation: str | None,
-):
-    try:
-        from qwen_tts import Qwen3TTSModel
-    except ImportError as exc:
-        raise RuntimeError(_QWEN_TTS_INSTALL_HINT) from exc
-
-    torch_dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
-    kwargs: dict[str, Any] = {
-        "device_map": device,
-        "dtype": torch_dtype,
-    }
-    if attn_implementation is not None:
-        kwargs["attn_implementation"] = attn_implementation
-
-    checkpoint_dir = _resolve_checkpoint(model_path)
-    logger.info(f"Loading Qwen3-TTS model from {checkpoint_dir} on {device}")
-    return Qwen3TTSModel.from_pretrained(checkpoint_dir, **kwargs)
-
-
 def _load_qwen3_tts_tokenizer(
     model_path: str,
     *,
@@ -90,6 +66,40 @@ def _load_qwen3_tts_tokenizer(
 
     logger.info(f"Loading Qwen3-TTS speech tokenizer from {tokenizer_path} on {device}")
     return Qwen3TTSTokenizer.from_pretrained(tokenizer_path, **kwargs)
+
+
+def _register_qwen3_tts_hf_config() -> None:
+    try:
+        from qwen_tts.core.models import Qwen3TTSConfig
+        from transformers import AutoConfig
+    except ImportError as exc:
+        raise RuntimeError(_QWEN_TTS_INSTALL_HINT) from exc
+    if not hasattr(Qwen3TTSConfig, "_sglang_omni_patched"):
+        original_init = Qwen3TTSConfig.__init__
+
+        def _patched_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            talker_config = getattr(self, "talker_config", None)
+            if talker_config is not None:
+                self.text_config = talker_config
+
+        Qwen3TTSConfig.__init__ = _patched_init
+        Qwen3TTSConfig._sglang_omni_patched = True
+    try:
+        AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
+    except ValueError:
+        pass
+
+
+def _load_qwen3_tts_generate_defaults(checkpoint_dir: str) -> dict[str, Any]:
+    import json
+
+    path = os.path.join(checkpoint_dir, "generation_config.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
 
 
 def _audio_to_list(audio: Any) -> list[float]:
@@ -119,85 +129,104 @@ def _build_usage(state: Qwen3TTSState) -> dict[str, Any] | None:
     return usage
 
 
-def _run_voice_clone_generation(model: Any, state: Qwen3TTSState) -> torch.Tensor:
-    prompt_items = model.create_voice_clone_prompt(
-        ref_audio=state.ref_audio,
-        ref_text=state.ref_text,
-        x_vector_only_mode=state.x_vector_only_mode,
-    )
-    if len(prompt_items) != 1:
-        raise ValueError("Qwen3-TTS expected exactly one voice-clone prompt")
-
-    prompt = model._prompt_items_to_voice_clone_prompt(prompt_items)
-    input_ids = model._tokenize_texts([model._build_assistant_text(state.text)])
-
-    ref_text = prompt_items[0].ref_text
-    if ref_text:
-        ref_ids = [model._tokenize_texts([model._build_ref_text(ref_text)])[0]]
-    else:
-        ref_ids = [None]
-
-    gen_kwargs = model._merge_generate_kwargs(**state.generation_kwargs)
-    talker_codes, _ = model.model.generate(
-        input_ids=input_ids,
-        ref_ids=ref_ids,
-        voice_clone_prompt=prompt,
-        languages=[state.language],
-        non_streaming_mode=state.non_streaming_mode,
-        **gen_kwargs,
-    )
-    if not talker_codes:
-        raise RuntimeError("Qwen3-TTS did not return any codec tokens")
-
-    codes = talker_codes[0]
-    ref_codes = prompt.get("ref_code")
-    if ref_codes and ref_codes[0] is not None:
-        ref_code = ref_codes[0].to(codes.device)
-        state.ref_code_len = int(ref_code.shape[0])
-        codes = torch.cat([ref_code, codes], dim=0)
-    else:
-        state.ref_code_len = 0
-    state.completion_tokens = max(int(codes.shape[0]) - state.ref_code_len, 0)
-    state.prompt_tokens = state.ref_code_len
-    return codes
-
-
 def create_preprocessing_executor(model_path: str) -> SimpleScheduler:
     del model_path
 
     def _preprocess(payload: StagePayload) -> StagePayload:
-        state = build_qwen3_tts_state(payload)
-        return store_state(payload, state)
+        return payload
 
     return SimpleScheduler(_preprocess)
 
 
-def create_tts_engine_executor(
+def create_sglang_tts_engine_executor(
     model_path: str,
     *,
     device: str = "cuda:0",
     dtype: str = "bfloat16",
     attn_implementation: str | None = None,
-) -> SimpleScheduler:
-    model = _load_qwen3_tts_model(
-        model_path,
+) -> Any:
+    from qwen_tts import Qwen3TTSModel
+    from transformers import AutoProcessor
+
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+    from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+    from sglang_omni.scheduling.sglang_backend import (
+        SGLangOutputProcessor,
+        build_sglang_server_args,
+    )
+
+    _register_qwen3_tts_hf_config()
+    checkpoint_dir = _resolve_checkpoint(model_path)
+    gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+
+    server_args = build_sglang_server_args(
+        checkpoint_dir,
+        context_length=8192,
+        dtype=dtype,
+        disable_cuda_graph=True,
+        disable_overlap_schedule=True,
+        mem_fraction_static=0.85,
+        max_prefill_tokens=8192,
+        max_running_requests=16,
+        trust_remote_code=True,
+    )
+
+    (
+        model_worker,
+        tree_cache,
+        req_to_token_pool,
+        token_to_kv_pool_allocator,
+        prefill_mgr,
+        decode_mgr,
+        model_config,
+    ) = create_sglang_infrastructure(
+        server_args,
+        gpu_id,
+        model_arch_override="Qwen3TTSTalker",
+    )
+
+    model = model_worker.model_runner.model
+    speech_tokenizer = _load_qwen3_tts_tokenizer(
+        checkpoint_dir,
         device=device,
         dtype=dtype,
         attn_implementation=attn_implementation,
     )
+    model.load_speech_tokenizer(speech_tokenizer)
+    processor = AutoProcessor.from_pretrained(checkpoint_dir, fix_mistral_regex=True)
+    wrapper = Qwen3TTSModel(
+        model=model,
+        processor=processor,
+        generate_defaults=_load_qwen3_tts_generate_defaults(checkpoint_dir),
+    )
 
-    def _generate(payload: StagePayload) -> StagePayload:
-        state = load_state(payload)
-        if state.seed is not None:
-            torch.manual_seed(int(state.seed))
+    output_proc = SGLangOutputProcessor(
+        capture_hidden=False,
+        capture_hidden_layers=None,
+        model=model,
+    )
+    request_builder, result_adapter = make_qwen3_tts_scheduler_adapters(
+        model=model,
+        wrapper=wrapper,
+    )
+    return OmniScheduler(
+        tp_worker=model_worker,
+        tree_cache=tree_cache,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        server_args=server_args,
+        model_config=model_config,
+        prefill_manager=prefill_mgr,
+        decode_manager=decode_mgr,
+        model_runner=Qwen3TTSModelRunner(model_worker, output_proc),
+        request_builder=request_builder,
+        result_adapter=result_adapter,
+    )
 
-        start = time.perf_counter()
-        codes = _run_voice_clone_generation(model, state)
-        state.engine_time_s = time.perf_counter() - start
-        state.audio_codes = codes
-        return store_state(payload, state)
 
-    return SimpleScheduler(_generate)
+def create_tts_engine_executor(*args, **kwargs) -> Any:
+    return create_sglang_tts_engine_executor(*args, **kwargs)
 
 
 def create_vocoder_executor(
