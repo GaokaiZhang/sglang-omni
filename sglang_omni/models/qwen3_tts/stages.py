@@ -164,13 +164,17 @@ def create_sglang_tts_engine_executor(
         checkpoint_dir,
         context_length=8192,
         dtype=dtype,
-        disable_cuda_graph=True,
+        disable_cuda_graph=False,
         disable_overlap_schedule=True,
         mem_fraction_static=0.85,
         max_prefill_tokens=8192,
         max_running_requests=16,
+        sampling_backend="pytorch",
         trust_remote_code=True,
     )
+    want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
+    if want_cuda_graph:
+        server_args.disable_cuda_graph = True
 
     (
         model_worker,
@@ -210,6 +214,10 @@ def create_sglang_tts_engine_executor(
         model=model,
         wrapper=wrapper,
     )
+    if want_cuda_graph:
+        server_args.disable_cuda_graph = False
+        model_worker.model_runner.init_device_graphs()
+
     return OmniScheduler(
         tp_worker=model_worker,
         tree_cache=tree_cache,
@@ -235,6 +243,8 @@ def create_vocoder_executor(
     device: str = "cuda:0",
     dtype: str = "bfloat16",
     attn_implementation: str | None = None,
+    max_batch_size: int = 8,
+    max_batch_wait_ms: int = 2,
 ) -> SimpleScheduler:
     tokenizer = _load_qwen3_tts_tokenizer(
         model_path,
@@ -243,23 +253,33 @@ def create_vocoder_executor(
         attn_implementation=attn_implementation,
     )
 
-    def _vocode(payload: StagePayload) -> StagePayload:
+    def _prepare_vocoder_item(
+        payload: StagePayload,
+    ) -> tuple[Qwen3TTSState, torch.Tensor]:
         state = load_state(payload)
         if state.audio_codes is None:
             raise RuntimeError("Qwen3-TTS vocoder requires audio_codes from tts_engine")
 
         codes = torch.as_tensor(state.audio_codes, dtype=torch.long)
-        wavs, sample_rate = tokenizer.decode([{"audio_codes": codes}])
-        if not wavs:
+        return state, codes
+
+    def _store_vocoder_result(
+        payload: StagePayload,
+        state: Qwen3TTSState,
+        codes: torch.Tensor,
+        wav: Any,
+        sample_rate: int,
+    ) -> StagePayload:
+        if wav is None:
             raise RuntimeError("Qwen3-TTS speech tokenizer did not return audio")
 
-        wav = wavs[0]
         if state.ref_code_len:
             total_len = int(codes.shape[0])
             cut = int(state.ref_code_len / max(total_len, 1) * wav.shape[0])
             wav = wav[cut:]
         state.audio_samples = _audio_to_list(wav)
         state.sample_rate = int(sample_rate)
+        state.audio_codes = None
 
         payload = store_state(payload, state)
         audio = state.audio_samples or []
@@ -271,4 +291,29 @@ def create_vocoder_executor(
             payload.data["usage"] = usage
         return payload
 
-    return SimpleScheduler(_vocode)
+    def _vocode(payload: StagePayload) -> StagePayload:
+        state, codes = _prepare_vocoder_item(payload)
+        wavs, sample_rate = tokenizer.decode([{"audio_codes": codes}])
+        wav = wavs[0] if wavs else None
+        return _store_vocoder_result(payload, state, codes, wav, sample_rate)
+
+    def _vocode_batch(payloads: list[StagePayload]) -> list[StagePayload]:
+        items = [_prepare_vocoder_item(payload) for payload in payloads]
+        wavs, sample_rate = tokenizer.decode(
+            [{"audio_codes": codes} for _, codes in items]
+        )
+        if len(wavs) != len(items):
+            raise RuntimeError(
+                f"Qwen3-TTS speech tokenizer returned {len(wavs)} audios for {len(items)} requests"
+            )
+        return [
+            _store_vocoder_result(payload, state, codes, wav, sample_rate)
+            for payload, (state, codes), wav in zip(payloads, items, wavs)
+        ]
+
+    return SimpleScheduler(
+        _vocode,
+        batch_compute_fn=_vocode_batch,
+        max_batch_size=max_batch_size,
+        max_batch_wait_ms=max_batch_wait_ms,
+    )

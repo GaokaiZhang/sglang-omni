@@ -311,17 +311,17 @@ def apply_sglang_qwen3_tts_result(
     if data.ref_code is not None and data.ref_code_len:
         codes = torch.cat([data.ref_code.to(dtype=torch.long), codes.cpu()], dim=0)
 
-    state = Qwen3TTSState(
-        audio_codes=codes,
-        ref_code_len=data.ref_code_len,
-        prompt_tokens=data.ref_code_len,
-        completion_tokens=len(data.output_codes),
-        engine_time_s=time.perf_counter() - data.engine_start_s,
-    )
     return StagePayload(
         request_id=payload.request_id,
         request=payload.request,
-        data=state.to_dict(),
+        data={
+            "audio_codes": codes,
+            "ref_code_len": data.ref_code_len,
+            "prompt_tokens": data.ref_code_len,
+            "completion_tokens": len(data.output_codes),
+            "engine_time_s": time.perf_counter() - data.engine_start_s,
+            "sample_rate": 24000,
+        },
     )
 
 
