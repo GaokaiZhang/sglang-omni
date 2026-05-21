@@ -12,6 +12,8 @@ import torch
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.models.qwen3_tts.request_builders import (
     make_qwen3_tts_scheduler_adapters,
+    preprocess_qwen3_tts_payload,
+    set_qwen3_tts_preprocessing_context,
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
@@ -131,11 +133,7 @@ def _build_usage(state: Qwen3TTSState) -> dict[str, Any] | None:
 
 def create_preprocessing_executor(model_path: str) -> SimpleScheduler:
     del model_path
-
-    def _preprocess(payload: StagePayload) -> StagePayload:
-        return payload
-
-    return SimpleScheduler(_preprocess)
+    return SimpleScheduler(preprocess_qwen3_tts_payload)
 
 
 def create_sglang_tts_engine_executor(
@@ -164,7 +162,7 @@ def create_sglang_tts_engine_executor(
         checkpoint_dir,
         context_length=8192,
         dtype=dtype,
-        disable_cuda_graph=False,
+        disable_cuda_graph=True,
         disable_overlap_schedule=True,
         mem_fraction_static=0.85,
         max_prefill_tokens=8192,
@@ -172,9 +170,6 @@ def create_sglang_tts_engine_executor(
         sampling_backend="pytorch",
         trust_remote_code=True,
     )
-    want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
-    if want_cuda_graph:
-        server_args.disable_cuda_graph = True
 
     (
         model_worker,
@@ -204,6 +199,7 @@ def create_sglang_tts_engine_executor(
         processor=processor,
         generate_defaults=_load_qwen3_tts_generate_defaults(checkpoint_dir),
     )
+    set_qwen3_tts_preprocessing_context(model=model, wrapper=wrapper)
 
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,
@@ -214,9 +210,6 @@ def create_sglang_tts_engine_executor(
         model=model,
         wrapper=wrapper,
     )
-    if want_cuda_graph:
-        server_args.disable_cuda_graph = False
-        model_worker.model_runner.init_device_graphs()
 
     return OmniScheduler(
         tp_worker=model_worker,

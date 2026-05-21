@@ -9,16 +9,156 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang_omni.models.qwen3_omni.pending_text_queue import PendingTextTensorQueue
+from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_builders
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.models.qwen3_tts.request_builders import (
+    Qwen3TTSPreparedRequest,
     Qwen3TTSSGLangRequestData,
     apply_sglang_qwen3_tts_result,
     build_embedding_cache_key_ids,
     build_qwen3_tts_state,
+    build_sglang_qwen3_tts_request,
 )
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.proto import OmniRequest, StagePayload
+
+
+def install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeReq:
+        def __init__(
+            self,
+            *,
+            rid,
+            origin_input_text,
+            origin_input_ids,
+            sampling_params,
+            eos_token_ids=None,
+            vocab_size=None,
+            **kwargs,
+        ) -> None:
+            del kwargs
+            self.rid = rid
+            self.origin_input_text = origin_input_text
+            self.origin_input_ids = origin_input_ids
+            self.sampling_params = sampling_params
+            self.eos_token_ids = eos_token_ids
+            self.vocab_size = vocab_size
+            self.output_ids = []
+            self.prefix_indices = []
+            self.extend_input_len = len(origin_input_ids)
+
+    class FakeSamplingParams:
+        def __init__(self, **kwargs) -> None:
+            self.__dict__.update(kwargs)
+            self.min_p = kwargs.get("min_p", 0.0)
+
+        def normalize(self, tokenizer) -> None:
+            del tokenizer
+
+        def verify(self, vocab_size) -> None:
+            self.vocab_size = vocab_size
+
+    class FakeGenerationBatchResult:
+        def __init__(self, *, logits_output=None, can_run_cuda_graph=False) -> None:
+            self.logits_output = logits_output
+            self.can_run_cuda_graph = can_run_cuda_graph
+            self.next_token_ids = None
+
+    class FakeLogitsProcessorOutput:
+        def __init__(self, **kwargs) -> None:
+            self.__dict__.update(kwargs)
+
+    class FakeSamplingBatchInfo:
+        def __init__(self, **kwargs) -> None:
+            self.__dict__.update(kwargs)
+
+    def default_weight_loader(*args, **kwargs) -> None:
+        del args, kwargs
+
+    def add_prefix(name: str, prefix: str = "") -> str:
+        return f"{prefix}.{name}" if prefix else name
+
+    modules = {
+        "sglang": types.ModuleType("sglang"),
+        "sglang.srt": types.ModuleType("sglang.srt"),
+        "sglang.srt.managers": types.ModuleType("sglang.srt.managers"),
+        "sglang.srt.managers.schedule_batch": types.ModuleType(
+            "sglang.srt.managers.schedule_batch"
+        ),
+        "sglang.srt.managers.scheduler": types.ModuleType(
+            "sglang.srt.managers.scheduler"
+        ),
+        "sglang.srt.layers": types.ModuleType("sglang.srt.layers"),
+        "sglang.srt.layers.logits_processor": types.ModuleType(
+            "sglang.srt.layers.logits_processor"
+        ),
+        "sglang.srt.model_loader": types.ModuleType("sglang.srt.model_loader"),
+        "sglang.srt.model_loader.weight_utils": types.ModuleType(
+            "sglang.srt.model_loader.weight_utils"
+        ),
+        "sglang.srt.sampling": types.ModuleType("sglang.srt.sampling"),
+        "sglang.srt.sampling.sampling_batch_info": types.ModuleType(
+            "sglang.srt.sampling.sampling_batch_info"
+        ),
+        "sglang.srt.sampling.sampling_params": types.ModuleType(
+            "sglang.srt.sampling.sampling_params"
+        ),
+        "sglang.srt.utils": types.ModuleType("sglang.srt.utils"),
+        "sgl_kernel": types.ModuleType("sgl_kernel"),
+    }
+    for package_name in (
+        "sglang",
+        "sglang.srt",
+        "sglang.srt.managers",
+        "sglang.srt.layers",
+        "sglang.srt.model_loader",
+        "sglang.srt.sampling",
+    ):
+        modules[package_name].__path__ = []
+    modules["sglang"].srt = modules["sglang.srt"]
+    modules["sglang.srt"].managers = modules["sglang.srt.managers"]
+    modules["sglang.srt"].layers = modules["sglang.srt.layers"]
+    modules["sglang.srt"].model_loader = modules["sglang.srt.model_loader"]
+    modules["sglang.srt"].sampling = modules["sglang.srt.sampling"]
+    modules["sglang.srt"].utils = modules["sglang.srt.utils"]
+    modules["sglang.srt.managers"].schedule_batch = modules[
+        "sglang.srt.managers.schedule_batch"
+    ]
+    modules["sglang.srt.managers"].scheduler = modules[
+        "sglang.srt.managers.scheduler"
+    ]
+    modules["sglang.srt.layers"].logits_processor = modules[
+        "sglang.srt.layers.logits_processor"
+    ]
+    modules["sglang.srt.model_loader"].weight_utils = modules[
+        "sglang.srt.model_loader.weight_utils"
+    ]
+    modules["sglang.srt.sampling"].sampling_batch_info = modules[
+        "sglang.srt.sampling.sampling_batch_info"
+    ]
+    modules["sglang.srt.sampling"].sampling_params = modules[
+        "sglang.srt.sampling.sampling_params"
+    ]
+    modules["sgl_kernel"].fused_qk_norm_rope = lambda *args, **kwargs: None
+    modules["sglang.srt.managers.schedule_batch"].Req = FakeReq
+    modules["sglang.srt.managers.scheduler"].GenerationBatchResult = (
+        FakeGenerationBatchResult
+    )
+    modules["sglang.srt.layers.logits_processor"].LogitsProcessorOutput = (
+        FakeLogitsProcessorOutput
+    )
+    modules["sglang.srt.model_loader.weight_utils"].default_weight_loader = (
+        default_weight_loader
+    )
+    modules["sglang.srt.sampling.sampling_batch_info"].SamplingBatchInfo = (
+        FakeSamplingBatchInfo
+    )
+    modules["sglang.srt.sampling.sampling_params"].SamplingParams = FakeSamplingParams
+    modules["sglang.srt.utils"].add_prefix = add_prefix
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
 
 
 def make_payload(
@@ -103,6 +243,25 @@ def test_qwen3_tts_maps_references_and_keeps_upstream_sampling_defaults() -> Non
     assert state.generation_kwargs == {"max_new_tokens": 2048}
 
 
+def test_qwen3_tts_preserves_explicit_default_like_sampling_values() -> None:
+    payload = make_payload(
+        inputs={
+            "text": "target",
+            "references": [{"audio_path": "voice.wav", "text": "reference"}],
+        },
+        params={"temperature": 0.8, "top_k": 30},
+        tts_params={"explicit_generation_params": ["temperature", "top_k"]},
+    )
+
+    state = build_qwen3_tts_state(payload)
+
+    assert state.generation_kwargs == {
+        "max_new_tokens": 2048,
+        "temperature": 0.8,
+        "top_k": 30,
+    }
+
+
 def test_qwen3_tts_ignores_client_sampling_defaults() -> None:
     payload = make_payload(
         inputs="target",
@@ -178,6 +337,7 @@ def test_qwen3_tts_predictor_codec_embeddings_use_talker_hidden_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Protects 1.7B loading where talker and predictor hidden sizes differ."""
+    install_fake_sglang(monkeypatch)
     from torch import nn
 
     from sglang_omni.models.qwen3_tts import sglang_model
@@ -293,21 +453,149 @@ def test_qwen3_tts_result_adapter_keeps_code_handoff_tensor_native() -> None:
     assert result.data["completion_tokens"] == 2
 
 
-def test_qwen3_tts_engine_reenables_cuda_graph_after_bootstrap(
+def test_qwen3_tts_request_data_keeps_decode_tensors_on_prepared_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Protects the SGLang decode path from silently falling back to eager mode."""
+    install_fake_sglang(monkeypatch)
+    dtype = torch.float64
+    payload = make_payload(inputs="target")
+    payload.data = {
+        qwen3_request_builders._QWEN3_TTS_PREPARED_MARKER: payload.request_id
+    }
+    prepared = Qwen3TTSPreparedRequest(
+        state=Qwen3TTSState(seed=123),
+        input_ids_list=[11, 12, 13],
+        input_ids=torch.tensor([11, 12, 13], dtype=torch.long),
+        attention_mask=torch.ones((1, 3), dtype=torch.long),
+        trailing_text_hidden=torch.randn(2, 4, dtype=dtype),
+        ref_code=torch.tensor([[9, 9]], dtype=torch.long),
+        prompt_input_embeds=torch.randn(3, 4, dtype=dtype),
+        tts_pad_embed=torch.randn(4, dtype=dtype),
+        gen_kwargs={"max_new_tokens": 16, "temperature": 0.8, "top_k": 30},
+    )
+    with qwen3_request_builders._PREPARED_REQUESTS_LOCK:
+        qwen3_request_builders._PREPARED_REQUESTS[payload.request_id] = prepared
+
+    data = build_sglang_qwen3_tts_request(
+        payload,
+        model=SimpleNamespace(
+            config=SimpleNamespace(codec_eos_token_id=42, vocab_size=1200)
+        ),
+        wrapper=object(),
+    )
+
+    assert data.prompt_input_embeds is prepared.prompt_input_embeds
+    assert data.ref_code is prepared.ref_code
+    assert data.tts_pad_embed is prepared.tts_pad_embed
+    assert isinstance(data.pending_text_queue, PendingTextTensorQueue)
+    assert data.pending_text_queue.rows is not None
+    assert data.pending_text_queue.rows.device == prepared.trailing_text_hidden.device
+    assert data.pending_text_queue.rows.dtype == prepared.trailing_text_hidden.dtype
+
+
+def test_qwen3_tts_prepared_payload_missing_state_fails_without_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    payload = make_payload(inputs="target")
+    payload.data = {qwen3_request_builders._QWEN3_TTS_PREPARED_MARKER: "missing"}
+
+    with pytest.raises(RuntimeError, match="must not rebuild"):
+        build_sglang_qwen3_tts_request(
+            payload,
+            model=SimpleNamespace(
+                config=SimpleNamespace(codec_eos_token_id=42, vocab_size=1200)
+            ),
+            wrapper=object(),
+        )
+
+
+def test_qwen3_tts_prefill_prepares_subtalker_buffers_before_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    calls: list[str] = []
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    runner.model = SimpleNamespace(
+        prepare_decode_buffers=lambda requests: calls.append("prepare")
+    )
+    runner._build_prefill_input_embeds = (
+        lambda forward_batch, requests: calls.append("embeds") or object()
+    )
+    runner._forward_with_input_embeds = (
+        lambda forward_batch, input_embeds: calls.append("forward") or "result"
+    )
+
+    assert runner.prepare_prefill(object(), object(), [object()]) == "result"
+    assert calls == ["prepare", "embeds", "forward"]
+
+
+def test_qwen3_tts_subtalker_sampling_reuses_request_generator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+
+    talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
+    talker.model = SimpleNamespace(
+        codec_embedding=SimpleNamespace(weight=torch.empty(1))
+    )
+    data = SimpleNamespace(
+        req=SimpleNamespace(
+            sampling_params=SimpleNamespace(sampling_seed=7),
+        )
+    )
+
+    Qwen3TTSTalker.prepare_decode_buffers(talker, [SimpleNamespace(data=data)])
+    generator = data._subtalker_generator
+    Qwen3TTSTalker.prepare_decode_buffers(talker, [SimpleNamespace(data=data)])
+
+    assert data._subtalker_generator is generator
+    assert talker._sub_generators == [generator]
+
+
+def test_qwen3_tts_subtalker_sampling_advances_request_generator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+
+    talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(11)
+    before = generator.get_state().clone()
+    talker._sub_dosample = [True]
+    talker._sub_temperature = [1.0]
+    talker._sub_top_p = [1.0]
+    talker._sub_top_k = [-1]
+    talker._sub_generators = [generator]
+
+    Qwen3TTSTalker._sample_subtalker_token(talker, torch.tensor([[0.2, 0.8]]), 0)
+
+    assert not torch.equal(generator.get_state(), before)
+
+
+def test_qwen3_tts_engine_keeps_cuda_graph_disabled_after_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Qwen3-TTS CUDA graph support remains disabled until a follow-up PR."""
+    install_fake_sglang(monkeypatch)
     from transformers import AutoProcessor
 
     from sglang_omni.models.qwen3_tts import model_runner as model_runner_mod
     from sglang_omni.models.qwen3_tts import stages
+    from sglang_omni.models.qwen3_tts.request_builders import (
+        clear_qwen3_tts_preprocessing_context,
+    )
     from sglang_omni.scheduling import bootstrap as bootstrap_mod
     from sglang_omni.scheduling import omni_scheduler as scheduler_mod
     from sglang_omni.scheduling import sglang_backend
 
     build_kwargs: dict = {}
     infrastructure_saw_graph_disabled: list[bool] = []
-    init_graph_saw_graph_enabled: list[bool] = []
+    init_graph_calls: list[bool] = []
 
     class FakeModel:
         def load_speech_tokenizer(self, tokenizer) -> None:
@@ -319,9 +607,7 @@ def test_qwen3_tts_engine_reenables_cuda_graph_after_bootstrap(
             self.model = FakeModel()
 
         def init_device_graphs(self) -> None:
-            init_graph_saw_graph_enabled.append(
-                not bool(self.server_args.disable_cuda_graph)
-            )
+            init_graph_calls.append(True)
 
     class FakeWorker:
         def __init__(self, server_args) -> None:
@@ -406,8 +692,9 @@ def test_qwen3_tts_engine_reenables_cuda_graph_after_bootstrap(
 
     scheduler = stages.create_sglang_tts_engine_executor("model", device="cuda:0")
 
-    assert build_kwargs["disable_cuda_graph"] is False
+    assert build_kwargs["disable_cuda_graph"] is True
     assert build_kwargs["sampling_backend"] == "pytorch"
     assert infrastructure_saw_graph_disabled == [True]
-    assert init_graph_saw_graph_enabled == [True]
-    assert scheduler.server_args.disable_cuda_graph is False
+    assert init_graph_calls == []
+    assert scheduler.server_args.disable_cuda_graph is True
+    clear_qwen3_tts_preprocessing_context()

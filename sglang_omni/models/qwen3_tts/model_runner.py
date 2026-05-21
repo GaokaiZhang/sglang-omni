@@ -22,6 +22,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         requests: list,
     ) -> GenerationBatchResult | None:
         del schedule_batch
+        self.model.prepare_decode_buffers(requests)
         input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
         return self._forward_with_input_embeds(
             forward_batch,
