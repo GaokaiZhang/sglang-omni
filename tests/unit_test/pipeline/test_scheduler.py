@@ -127,6 +127,36 @@ def test_omni_scheduler_default_stream_done_sets_generic_flag() -> None:
     assert req_data.stream_done is True
 
 
+def test_stage_output_cache_eviction_uses_lru_order() -> None:
+    cache = StageOutputCache(max_size=2)
+
+    cache.put("a", torch.tensor([1]))
+    cache.put("b", torch.tensor([2]))
+    assert torch.equal(cache.get("a"), torch.tensor([1]))
+
+    cache.put("c", torch.tensor([3]))
+
+    assert cache.get("b") is None
+    assert torch.equal(cache.get("a"), torch.tensor([1]))
+    assert torch.equal(cache.get("c"), torch.tensor([3]))
+
+
+def test_stage_output_cache_tracks_bytes_and_detaches() -> None:
+    cache = StageOutputCache(max_bytes=8, cache_device="cpu")
+
+    cache.put("fit", {"x": torch.ones(2, dtype=torch.float32, requires_grad=True)})
+    cached = cache.get("fit")
+
+    assert cache.current_bytes == 8
+    assert cached["x"].device.type == "cpu"
+    assert cached["x"].requires_grad is False
+
+    cache.put("too-large", torch.ones(3, dtype=torch.float32))
+
+    assert cache.get("too-large") is None
+    assert cache.current_bytes == 8
+
+
 def test_omni_scheduler_request_builder_errors_do_not_stop_loop() -> None:
     """Covers per-request build errors before an SGLang Req exists."""
     scheduler = object.__new__(OmniScheduler)
@@ -242,33 +272,3 @@ def test_omni_scheduler_leaves_request_budget_unchanged_without_opt_in() -> None
     assert req.sampling_params.max_new_tokens == 3
     assert req_data.max_new_tokens == 3
     assert scheduler.outbox.empty()
-
-
-def test_stage_output_cache_eviction_uses_lru_order() -> None:
-    cache = StageOutputCache(max_size=2)
-
-    cache.put("a", torch.tensor([1]))
-    cache.put("b", torch.tensor([2]))
-    assert torch.equal(cache.get("a"), torch.tensor([1]))
-
-    cache.put("c", torch.tensor([3]))
-
-    assert cache.get("b") is None
-    assert torch.equal(cache.get("a"), torch.tensor([1]))
-    assert torch.equal(cache.get("c"), torch.tensor([3]))
-
-
-def test_stage_output_cache_tracks_bytes_and_detaches() -> None:
-    cache = StageOutputCache(max_bytes=8, cache_device="cpu")
-
-    cache.put("fit", {"x": torch.ones(2, dtype=torch.float32, requires_grad=True)})
-    cached = cache.get("fit")
-
-    assert cache.current_bytes == 8
-    assert cached["x"].device.type == "cpu"
-    assert cached["x"].requires_grad is False
-
-    cache.put("too-large", torch.ones(3, dtype=torch.float32))
-
-    assert cache.get("too-large") is None
-    assert cache.current_bytes == 8
