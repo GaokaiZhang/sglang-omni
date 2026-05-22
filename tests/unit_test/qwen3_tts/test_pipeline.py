@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
 import types
+from queue import Queue
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +26,8 @@ from sglang_omni.models.qwen3_tts.request_builders import (
 )
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling.messages import IncomingMessage
+from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 
 
 def install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -515,6 +520,111 @@ def test_qwen3_tts_prepared_payload_missing_state_fails_without_rebuild(
             ),
             wrapper=object(),
         )
+
+
+def test_qwen3_tts_preprocessing_abort_cleans_prepared_state() -> None:
+    """Aborting after preprocessing stored tensors must release the handoff."""
+    from sglang_omni.models.qwen3_tts import stages
+
+    request_id = "req-prepared-abort"
+    try:
+        with qwen3_request_builders._PREPARED_REQUESTS_LOCK:
+            qwen3_request_builders._PREPARED_REQUESTS[request_id] = object()
+
+        scheduler = stages.create_preprocessing_executor("model")
+        scheduler.abort(request_id)
+
+        with qwen3_request_builders._PREPARED_REQUESTS_LOCK:
+            assert request_id not in qwen3_request_builders._PREPARED_REQUESTS
+    finally:
+        qwen3_request_builders.cleanup_prepared_qwen3_tts_request(request_id)
+
+
+def test_qwen3_tts_preprocessing_abort_race_cleans_late_prepared_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If preprocessing finishes after abort, its late prepared tensors are dropped."""
+    from sglang_omni.models.qwen3_tts import stages
+
+    request_id = "req-preprocess-race"
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_preprocess(payload: StagePayload) -> StagePayload:
+        started.set()
+        assert release.wait(timeout=2.0)
+        with qwen3_request_builders._PREPARED_REQUESTS_LOCK:
+            qwen3_request_builders._PREPARED_REQUESTS[payload.request_id] = object()
+        return payload
+
+    monkeypatch.setattr(stages, "preprocess_qwen3_tts_payload", fake_preprocess)
+    scheduler = stages.create_preprocessing_executor("model")
+    payload = make_payload(inputs="target")
+    payload.request_id = request_id
+    loop = asyncio.new_event_loop()
+    errors: list[BaseException] = []
+
+    def run_compute() -> None:
+        try:
+            scheduler._run_single(
+                IncomingMessage(
+                    request_id=request_id,
+                    type="new_request",
+                    data=payload,
+                ),
+                loop,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_compute)
+    try:
+        thread.start()
+        assert started.wait(timeout=2.0)
+
+        scheduler.abort(request_id)
+        release.set()
+        thread.join(timeout=2.0)
+
+        assert not thread.is_alive()
+        assert errors == []
+        assert scheduler.outbox.empty()
+        with qwen3_request_builders._PREPARED_REQUESTS_LOCK:
+            assert request_id not in qwen3_request_builders._PREPARED_REQUESTS
+    finally:
+        release.set()
+        thread.join(timeout=2.0)
+        loop.close()
+        qwen3_request_builders.cleanup_prepared_qwen3_tts_request(request_id)
+
+
+def test_qwen3_tts_ar_scheduler_abort_cleans_prepared_state() -> None:
+    """The AR scheduler abort path also owns the prepared handoff cleanup."""
+    request_id = "req-ar-abort"
+    try:
+        with qwen3_request_builders._PREPARED_REQUESTS_LOCK:
+            qwen3_request_builders._PREPARED_REQUESTS[request_id] = object()
+
+        scheduler = object.__new__(OmniScheduler)
+        scheduler._abort_callback = (
+            qwen3_request_builders.cleanup_prepared_qwen3_tts_request
+        )
+        scheduler._aborted_request_ids = set()
+        scheduler._pending_stream_chunks = {}
+        scheduler._pending_stream_done = set()
+        scheduler._deferred_request_payloads = {}
+        scheduler.waiting_queue = []
+        scheduler.running_batch = SimpleNamespace(reqs=[], batch_is_full=False)
+        scheduler.cur_batch = None
+        scheduler.last_batch = None
+        scheduler.inbox = Queue()
+
+        scheduler.abort(request_id)
+
+        with qwen3_request_builders._PREPARED_REQUESTS_LOCK:
+            assert request_id not in qwen3_request_builders._PREPARED_REQUESTS
+    finally:
+        qwen3_request_builders.cleanup_prepared_qwen3_tts_request(request_id)
 
 
 def test_qwen3_tts_prefill_prepares_subtalker_buffers_before_forward(

@@ -129,6 +129,13 @@ def pop_prepared_qwen3_tts_request(
     return prepared
 
 
+def cleanup_prepared_qwen3_tts_request(request_id: str) -> None:
+    """Drop any prepared Qwen3-TTS handoff state for an aborted request."""
+
+    with _PREPARED_REQUESTS_LOCK:
+        _PREPARED_REQUESTS.pop(str(request_id), None)
+
+
 def build_qwen3_tts_state(payload: StagePayload) -> Qwen3TTSState:
     inputs = payload.request.inputs or {}
     params = payload.request.params or {}

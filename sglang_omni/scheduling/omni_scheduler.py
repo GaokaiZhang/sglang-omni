@@ -102,6 +102,7 @@ class OmniScheduler:
         stream_output_builder: Callable | None = None,
         stream_chunk_handler: Callable | None = None,
         stream_done_handler: Callable | None = None,
+        abort_callback: Callable[[str], None] | None = None,
         enable_overlap: bool = False,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
@@ -114,6 +115,7 @@ class OmniScheduler:
         self._stream_output_builder = stream_output_builder
         self._stream_chunk_handler = stream_chunk_handler
         self._stream_done_handler = stream_done_handler
+        self._abort_callback = abort_callback
 
         # --- Core scheduling state (read/written by upstream methods) -----
         self.server_args = server_args
@@ -684,6 +686,13 @@ class OmniScheduler:
         self._running = False
 
     def abort(self, request_id: str) -> None:
+        if self._abort_callback is not None:
+            try:
+                self._abort_callback(request_id)
+            except Exception:
+                logger.exception(
+                    "OmniScheduler: abort cleanup failed for %s", request_id
+                )
         self._aborted_request_ids.add(request_id)
         self._pending_stream_chunks.pop(request_id, None)
         self._pending_stream_done.discard(request_id)

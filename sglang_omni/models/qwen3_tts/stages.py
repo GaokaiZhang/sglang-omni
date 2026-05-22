@@ -11,6 +11,7 @@ import torch
 
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.models.qwen3_tts.request_builders import (
+    cleanup_prepared_qwen3_tts_request,
     make_qwen3_tts_scheduler_adapters,
     preprocess_qwen3_tts_payload,
     set_qwen3_tts_preprocessing_context,
@@ -133,7 +134,10 @@ def _build_usage(state: Qwen3TTSState) -> dict[str, Any] | None:
 
 def create_preprocessing_executor(model_path: str) -> SimpleScheduler:
     del model_path
-    return SimpleScheduler(preprocess_qwen3_tts_payload)
+    return SimpleScheduler(
+        preprocess_qwen3_tts_payload,
+        abort_callback=cleanup_prepared_qwen3_tts_request,
+    )
 
 
 def create_sglang_tts_engine_executor(
@@ -223,6 +227,7 @@ def create_sglang_tts_engine_executor(
         model_runner=Qwen3TTSModelRunner(model_worker, output_proc),
         request_builder=request_builder,
         result_adapter=result_adapter,
+        abort_callback=cleanup_prepared_qwen3_tts_request,
     )
 
 
