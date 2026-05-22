@@ -26,6 +26,15 @@ from sglang_omni.proto import OmniRequest, StagePayload
 
 
 def install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
+    try:
+        import sglang.srt.managers.schedule_batch  # noqa: F401
+        import sglang.srt.managers.scheduler  # noqa: F401
+        import sglang.srt.sampling.sampling_params  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+
     class FakeReq:
         def __init__(
             self,
