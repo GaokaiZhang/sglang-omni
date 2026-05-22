@@ -316,15 +316,23 @@ def _prepare_qwen3_tts_request(
         )
 
     feedback_buffer = model.model._feedback_buffer
-    prompt_input_embeds = input_embeds.squeeze(0).detach().to(
-        device=feedback_buffer.device,
-        dtype=feedback_buffer.dtype,
+    prompt_input_embeds = (
+        input_embeds.squeeze(0)
+        .detach()
+        .to(
+            device=feedback_buffer.device,
+            dtype=feedback_buffer.dtype,
+        )
     )
     input_ids_list = build_embedding_cache_key_ids(prompt_input_embeds)
     input_ids = torch.tensor(input_ids_list, dtype=torch.long)
-    trailing_text_hidden = trailing_text_hidden.squeeze(0).detach().to(
-        device=feedback_buffer.device,
-        dtype=feedback_buffer.dtype,
+    trailing_text_hidden = (
+        trailing_text_hidden.squeeze(0)
+        .detach()
+        .to(
+            device=feedback_buffer.device,
+            dtype=feedback_buffer.dtype,
+        )
     )
     if ref_code is not None:
         ref_code = ref_code.detach().to(device=feedback_buffer.device)
