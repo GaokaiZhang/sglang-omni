@@ -120,12 +120,32 @@ class Qwen3TTSTalkerTextModel(nn.Module):
             dtype=torch.bool,
             device=self.codec_embedding.weight.device,
         )
+        self._decode_feedback_embedding = nn.Embedding(
+            max_batch_size,
+            config.hidden_size,
+            device=self.codec_embedding.weight.device,
+            dtype=self.codec_embedding.weight.dtype,
+        )
+        self._decode_feedback_embedding.weight.requires_grad_(False)
 
     def get_input_embeddings(self):
         return self.codec_embedding
 
     def get_text_embeddings(self):
         return self.text_embedding
+
+    def _build_input_hidden_states(
+        self,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states = self.codec_embedding(input_ids)
+        bs = hidden_states.shape[0]
+        feedback_mask = self._feedback_mask[:bs]
+        return torch.where(
+            feedback_mask.unsqueeze(-1),
+            self._feedback_buffer[:bs].to(hidden_states.dtype),
+            hidden_states,
+        )
 
     def forward(
         self,
@@ -134,22 +154,26 @@ class Qwen3TTSTalkerTextModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        is_decode = forward_mode is not None and forward_mode.is_decode()
         if input_embeds is None:
-            hidden_states = self.codec_embedding(input_ids)
-            bs = hidden_states.shape[0]
-            feedback_mask = self._feedback_mask[:bs]
-            hidden_states = torch.where(
-                feedback_mask.unsqueeze(-1),
-                self._feedback_buffer[:bs].to(hidden_states.dtype),
-                hidden_states,
-            )
-            self._feedback_mask[:bs] = False
+            if is_decode:
+                row_ids = input_ids.clamp(
+                    min=0,
+                    max=self._decode_feedback_embedding.num_embeddings - 1,
+                )
+                hidden_states = self._decode_feedback_embedding(row_ids)
+            else:
+                hidden_states = self._build_input_hidden_states(input_ids)
         else:
             hidden_states = input_embeds
 
         residual = None
+        layers = self.layers
+        if is_decode:
+            layers = getattr(self, "_compiled_decode_layers", self.layers)
         for idx in range(self.start_layer, self.end_layer):
-            hidden_states, residual = self.layers[idx](
+            hidden_states, residual = layers[idx](
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
@@ -267,6 +291,7 @@ class Qwen3TTSTalker(nn.Module):
         dtype = self.model.codec_embedding.weight.dtype
         self._feedback_buffer = self.model._feedback_buffer
         self._feedback_mask = self.model._feedback_mask
+        self._decode_feedback_embedding = self.model._decode_feedback_embedding
         self._predictor_input_buffer = torch.zeros(
             max_batch_size,
             predictor_len,

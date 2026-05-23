@@ -969,6 +969,147 @@ def test_qwen3_tts_collect_codes_excludes_semantic_eos(
     assert len(requests[0].data.output_codes) == 1
 
 
+def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decode should use SGLang's graph-capable forward result."""
+    install_fake_sglang(monkeypatch)
+    from sglang.srt.model_executor import forward_batch_info
+
+    from sglang_omni.models.qwen3_omni.talker_model_runner import (
+        QwenTalkerModelRunner,
+    )
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    fake_forward_batch = SimpleNamespace(
+        input_ids=torch.tensor([1]),
+        positions=torch.tensor([0]),
+        mrope_positions=None,
+    )
+    monkeypatch.setattr(
+        forward_batch_info.ForwardBatch,
+        "init_new",
+        staticmethod(lambda model_worker_batch, model_runner: fake_forward_batch),
+    )
+    monkeypatch.setattr(
+        QwenTalkerModelRunner,
+        "_take_next_decode_input_embed",
+        staticmethod(
+            lambda *, sched_req, device, dtype: torch.ones(
+                4, device=device, dtype=dtype
+            )
+        ),
+    )
+
+    class FakeQwenModel:
+        config = SimpleNamespace(codec_eos_token_id=-1)
+
+        def __init__(self) -> None:
+            self._feedback_buffer = torch.zeros(1, 4)
+            self._feedback_mask = torch.zeros(1, dtype=torch.bool)
+            self._decode_feedback_embedding = torch.nn.Embedding(1, 4)
+            self._output_codes = torch.ones(1, 2)
+            self._output_embeds = torch.ones(1, 4)
+            self.prepare_calls = 0
+
+        def prepare_decode_buffers(self, requests) -> None:
+            del requests
+            self.prepare_calls += 1
+
+        def code_predictor_forward(self, layer0_codes, hidden) -> None:
+            del layer0_codes, hidden
+
+    class FakeTPWorker:
+        gpu_id = 0
+        model_runner = SimpleNamespace(model=FakeQwenModel())
+
+        def forward_batch_generation(self, forward_batch):
+            del forward_batch
+            return SimpleNamespace(
+                logits_output=SimpleNamespace(hidden_states=torch.ones(1, 4)),
+                next_token_ids=torch.tensor([7]),
+                can_run_cuda_graph=True,
+            )
+
+    class FakeOutputProcessor:
+        _capture_hidden = False
+
+        def process(self, model_output, scheduler_output):
+            del model_output
+            return {
+                req.request_id: SimpleNamespace(extra={})
+                for req in scheduler_output.requests
+            }
+
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    runner.tp_worker = FakeTPWorker()
+    runner.output_processor = FakeOutputProcessor()
+    runner.device = torch.device("cpu")
+    runner.model = runner.tp_worker.model_runner.model
+
+    data = SimpleNamespace(
+        req=SimpleNamespace(sampling_params=SimpleNamespace(repetition_penalty=1.0)),
+        output_codes=[],
+        pending_feedback_queue=[],
+        generation_steps=0,
+        extra_model_outputs={},
+    )
+    request = SimpleNamespace(request_id="req", data=data)
+    schedule_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_extend=lambda: False),
+        is_prefill_only=False,
+        output_ids=None,
+        get_model_worker_batch=lambda: SimpleNamespace(),
+    )
+
+    output = runner.execute(
+        SimpleNamespace(requests=[request], batch_data=schedule_batch)
+    )
+
+    assert output.can_run_cuda_graph is True
+    assert schedule_batch.output_ids.tolist() == [7]
+    assert runner.model.prepare_calls == 1
+    assert fake_forward_batch.input_ids.tolist() == [0]
+
+
+def test_qwen3_tts_decode_forward_does_not_clear_feedback_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalkerTextModel
+
+    class IdentityNorm(torch.nn.Module):
+        def forward(self, hidden_states, residual=None):
+            if residual is None:
+                return hidden_states
+            return hidden_states, residual
+
+    model = Qwen3TTSTalkerTextModel.__new__(Qwen3TTSTalkerTextModel)
+    torch.nn.Module.__init__(model)
+    model.codec_embedding = torch.nn.Embedding(8, 4)
+    model.layers = torch.nn.ModuleList([])
+    model.start_layer = 0
+    model.end_layer = 0
+    model.norm = IdentityNorm()
+    model._feedback_buffer = torch.full((1, 4), 5.0)
+    model._feedback_mask = torch.tensor([True])
+    model._decode_feedback_embedding = torch.nn.Embedding(1, 4)
+    model._decode_feedback_embedding.weight.requires_grad_(False)
+    with torch.no_grad():
+        model._decode_feedback_embedding.weight[0].fill_(7.0)
+
+    output = model.forward(
+        input_ids=torch.tensor([1]),
+        positions=torch.tensor([0]),
+        forward_batch=SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: True),
+        ),
+    )
+
+    assert torch.equal(output, model._decode_feedback_embedding.weight[:1])
+    assert bool(model._feedback_mask[0]) is True
+
+
 def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1163,10 +1304,10 @@ def test_qwen3_tts_sampled_subtalker_requires_semantic_positions(
         )
 
 
-def test_qwen3_tts_engine_keeps_cuda_graph_disabled_after_bootstrap(
+def test_qwen3_tts_engine_reenables_cuda_graph_after_bootstrap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Qwen3-TTS CUDA graph support remains disabled until a follow-up PR."""
+    """Qwen3-TTS defers graph capture until custom buffers are ready."""
     install_fake_sglang(monkeypatch)
     from transformers import AutoProcessor
 
@@ -1278,9 +1419,10 @@ def test_qwen3_tts_engine_keeps_cuda_graph_disabled_after_bootstrap(
 
     scheduler = stages.create_sglang_tts_engine_executor("model", device="cuda:0")
 
-    assert build_kwargs["disable_cuda_graph"] is True
+    assert build_kwargs["disable_cuda_graph"] is False
+    assert build_kwargs["enable_torch_compile"] is True
     assert build_kwargs["sampling_backend"] == "pytorch"
     assert infrastructure_saw_graph_disabled == [True]
-    assert init_graph_calls == []
-    assert scheduler.server_args.disable_cuda_graph is True
+    assert init_graph_calls == [True]
+    assert scheduler.server_args.disable_cuda_graph is False
     clear_qwen3_tts_preprocessing_context()
