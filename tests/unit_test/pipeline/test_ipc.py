@@ -56,7 +56,7 @@ class _FakeCoordinator:
         self.stopped = True
 
 
-def _make_config(base_path: Path, *, scheme: str = "ipc") -> PipelineConfig:
+def _make_config(base_path: Path) -> PipelineConfig:
     return PipelineConfig(
         model_path="Qwen/Qwen3-Omni-30B-A3B-Instruct",
         entry_stage="preprocessing",
@@ -68,7 +68,7 @@ def _make_config(base_path: Path, *, scheme: str = "ipc") -> PipelineConfig:
                 terminal=True,
             )
         ],
-        endpoints=EndpointsConfig(scheme=scheme, base_path=str(base_path)),
+        endpoints=EndpointsConfig(base_path=str(base_path)),
     )
 
 
@@ -84,9 +84,6 @@ def _fake_stage_relay(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_ipc_runtime_dir_creation_and_close_contracts(tmp_path: Path) -> None:
     """Preserves IPC runtime directory creation, uniqueness, and idempotent cleanup."""
     ipc_config = _make_config(tmp_path)
-    tcp_config = _make_config(tmp_path, scheme="tcp")
-
-    assert runtime_config.create_ipc_runtime_dir(tcp_config) is None
 
     runtime_a = runtime_config.create_ipc_runtime_dir(ipc_config)
     runtime_b = runtime_config.create_ipc_runtime_dir(ipc_config)
@@ -297,7 +294,7 @@ async def test_mp_runner_startup_failure_includes_child_factory_traceback(
                 terminal=True,
             )
         ],
-        endpoints=EndpointsConfig(scheme="ipc", base_path=str(tmp_path)),
+        endpoints=EndpointsConfig(base_path=str(tmp_path)),
     )
     runner = mp_runner.MultiProcessPipelineRunner(config)
 
