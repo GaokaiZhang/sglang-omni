@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLang AR per-request data — bridges StagePayload and SGLang Req."""
+"""SGLang per-request data — bridges StagePayload and SGLang Req."""
 
 from __future__ import annotations
 
@@ -31,3 +31,13 @@ class SGLangARRequestData(ARRequestData):
     tts_pad_embed: Any = None
     tts_eos_embed: Any = None
     thinker_chunks_done: bool = True
+
+
+@dataclass
+class SGLangDLLMRequestData:
+    """Per-request state for SGLang-backed dLLM stages."""
+
+    output_ids: list[int] = field(default_factory=list)
+    req: Any = None
+    stage_payload: Any = None
+    finish_reason: str | None = None
