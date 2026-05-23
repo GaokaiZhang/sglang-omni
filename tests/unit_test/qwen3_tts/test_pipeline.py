@@ -976,9 +976,7 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     install_fake_sglang(monkeypatch)
     from sglang.srt.model_executor import forward_batch_info
 
-    from sglang_omni.models.qwen3_omni.talker_model_runner import (
-        QwenTalkerModelRunner,
-    )
+    from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
     from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
 
     fake_forward_batch = SimpleNamespace(

@@ -224,9 +224,7 @@ def test_voxtral_decode_writes_feedback_buffer_for_standard_forward() -> None:
     )
     first = SimpleNamespace(
         data=SimpleNamespace(
-            pending_feedback_queue=collections.deque(
-                [torch.tensor([1.0, 2.0, 3.0])]
-            )
+            pending_feedback_queue=collections.deque([torch.tensor([1.0, 2.0, 3.0])])
         )
     )
     second = SimpleNamespace(
