@@ -387,6 +387,8 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
             self.model = FakeModel()
 
         def init_device_graphs(self) -> None:
+            assert self.server_args.enable_torch_compile is True
+            assert self.server_args.torch_compile_max_bs == 16
             init_graph_calls.append(True)
 
     class FakeWorker:
@@ -416,10 +418,12 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
         return SimpleNamespace(
             disable_cuda_graph=kwargs["disable_cuda_graph"],
             disable_overlap_schedule=kwargs["disable_overlap_schedule"],
+            enable_torch_compile=kwargs["enable_torch_compile"],
             page_size=1,
             chunked_prefill_size=0,
             max_prefill_tokens=kwargs["max_prefill_tokens"],
             max_running_requests=kwargs["max_running_requests"],
+            torch_compile_max_bs=kwargs["torch_compile_max_bs"],
         )
 
     def fake_create_sglang_infrastructure(server_args, gpu_id, **kwargs):
@@ -466,6 +470,9 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     assert build_kwargs["disable_cuda_graph"] is False
     assert build_kwargs["enable_torch_compile"] is True
     assert build_kwargs["sampling_backend"] == "pytorch"
+    assert build_kwargs["torch_compile_max_bs"] == 16
     assert infrastructure_saw_graph_disabled == [True]
     assert init_graph_calls == [True]
     assert scheduler.server_args.disable_cuda_graph is False
+    assert scheduler.server_args.enable_torch_compile is True
+    assert scheduler.server_args.torch_compile_max_bs == 16
