@@ -158,11 +158,7 @@ class Qwen3TTSTalkerTextModel(nn.Module):
         is_decode = forward_mode is not None and forward_mode.is_decode()
         if input_embeds is None:
             if is_decode:
-                row_ids = input_ids.clamp(
-                    min=0,
-                    max=self._decode_feedback_embedding.num_embeddings - 1,
-                )
-                hidden_states = self._decode_feedback_embedding(row_ids)
+                hidden_states = self._decode_feedback_embedding(input_ids)
             else:
                 hidden_states = self._build_input_hidden_states(input_ids)
         else:
@@ -171,7 +167,7 @@ class Qwen3TTSTalkerTextModel(nn.Module):
         residual = None
         layers = self.layers
         if is_decode:
-            layers = getattr(self, "_compiled_decode_layers", self.layers)
+            layers = self._compiled_decode_layers
         for idx in range(self.start_layer, self.end_layer):
             hidden_states, residual = layers[idx](
                 positions=positions,

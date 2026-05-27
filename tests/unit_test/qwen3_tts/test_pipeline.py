@@ -1070,6 +1070,20 @@ def test_qwen3_tts_steady_decode_reports_cuda_graph_ready(
     assert fake_forward_batch.input_ids.tolist() == [0]
 
 
+def test_qwen3_tts_decode_feedback_empty_batch_noops() -> None:
+    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
+
+    runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
+    runner.model = SimpleNamespace(
+        _decode_feedback_embedding=torch.nn.Embedding(1, 4),
+    )
+    forward_batch = SimpleNamespace(input_ids=torch.empty(0, dtype=torch.long))
+
+    runner._write_feedback_buffers(forward_batch, [])
+
+    assert forward_batch.input_ids.numel() == 0
+
+
 def test_qwen3_tts_decode_forward_does_not_clear_feedback_mask(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1086,6 +1100,7 @@ def test_qwen3_tts_decode_forward_does_not_clear_feedback_mask(
     torch.nn.Module.__init__(model)
     model.codec_embedding = torch.nn.Embedding(8, 4)
     model.layers = torch.nn.ModuleList([])
+    model._compiled_decode_layers = model.layers
     model.start_layer = 0
     model.end_layer = 0
     model.norm = IdentityNorm()
@@ -1097,7 +1112,7 @@ def test_qwen3_tts_decode_forward_does_not_clear_feedback_mask(
         model._decode_feedback_embedding.weight[0].fill_(7.0)
 
     output = model.forward(
-        input_ids=torch.tensor([1]),
+        input_ids=torch.tensor([0]),
         positions=torch.tensor([0]),
         forward_batch=SimpleNamespace(
             forward_mode=SimpleNamespace(is_decode=lambda: True),
@@ -1106,6 +1121,32 @@ def test_qwen3_tts_decode_forward_does_not_clear_feedback_mask(
 
     assert torch.equal(output, model._decode_feedback_embedding.weight[:1])
     assert bool(model._feedback_mask[0]) is True
+
+
+def test_qwen3_tts_decode_forward_rejects_invalid_feedback_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalkerTextModel
+
+    model = Qwen3TTSTalkerTextModel.__new__(Qwen3TTSTalkerTextModel)
+    torch.nn.Module.__init__(model)
+    model.codec_embedding = torch.nn.Embedding(8, 4)
+    model.layers = torch.nn.ModuleList([])
+    model._compiled_decode_layers = model.layers
+    model.start_layer = 0
+    model.end_layer = 0
+    model.norm = torch.nn.Identity()
+    model._decode_feedback_embedding = torch.nn.Embedding(1, 4)
+
+    with pytest.raises(IndexError):
+        model.forward(
+            input_ids=torch.tensor([1]),
+            positions=torch.tensor([0]),
+            forward_batch=SimpleNamespace(
+                forward_mode=SimpleNamespace(is_decode=lambda: True),
+            ),
+        )
 
 
 def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
@@ -1300,6 +1341,52 @@ def test_qwen3_tts_sampled_subtalker_requires_semantic_positions(
             torch.tensor([[0.0, 0.0]]),
             0,
         )
+
+
+def test_qwen3_tts_compile_backbone_requires_text_layers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.stages import _compile_qwen3_tts_backbone
+
+    with pytest.raises(AttributeError):
+        _compile_qwen3_tts_backbone(SimpleNamespace())
+
+
+def test_qwen3_tts_compile_backbone_compiles_every_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    from sglang_omni.models.qwen3_tts.stages import _compile_qwen3_tts_backbone
+
+    set_config_calls = []
+    compiled = []
+    cuda_graph_runner = types.ModuleType("sglang.srt.model_executor.cuda_graph_runner")
+    cuda_graph_runner.set_torch_compile_config = lambda: set_config_calls.append(True)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.model_executor.cuda_graph_runner",
+        cuda_graph_runner,
+    )
+
+    def fake_compile(layer, *, mode):
+        compiled.append((layer, mode))
+        return f"compiled-{len(compiled)}"
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    layers = [object(), object(), object()]
+    text_model = SimpleNamespace(layers=layers)
+    model = SimpleNamespace(model=text_model)
+
+    _compile_qwen3_tts_backbone(model)
+
+    assert set_config_calls == [True]
+    assert compiled == [(layer, "max-autotune-no-cudagraphs") for layer in layers]
+    assert text_model._compiled_decode_layers == [
+        "compiled-1",
+        "compiled-2",
+        "compiled-3",
+    ]
 
 
 def test_qwen3_tts_engine_reenables_cuda_graph_after_bootstrap(

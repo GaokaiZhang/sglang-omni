@@ -213,6 +213,7 @@ def create_generation_executor(
     voice_embeddings = _load_voxtral_voice_embeddings(checkpoint_dir, device)
     model = model_worker.model_runner.model
     if want_cuda_graph:
+        # Voxtral uses SGLang's native compile path during graph capture.
         model_worker.model_runner.init_device_graphs()
 
     request_builder, result_adapter = make_voxtral_scheduler_adapters(

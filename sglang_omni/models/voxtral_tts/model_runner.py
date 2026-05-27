@@ -43,6 +43,8 @@ class VoxtralTTSModelRunner(ModelRunner):
 
     def _write_decode_input_embed_buffer(self, requests: list) -> None:
         batch_size = len(requests)
+        if batch_size == 0:
+            return
         buffer = self.model._decode_input_embed_buffer
         rows = []
         for sched_req in requests:

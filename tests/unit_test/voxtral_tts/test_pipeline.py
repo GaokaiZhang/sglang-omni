@@ -244,6 +244,24 @@ def test_voxtral_decode_writes_feedback_buffer_for_standard_forward() -> None:
     )
 
 
+def test_voxtral_decode_empty_batch_keeps_feedback_buffer() -> None:
+    from sglang_omni.models.voxtral_tts.model_runner import VoxtralTTSModelRunner
+
+    runner = VoxtralTTSModelRunner.__new__(VoxtralTTSModelRunner)
+    runner.model = SimpleNamespace(
+        hidden_size=3,
+        _decode_input_embed_buffer=torch.ones(1, 3, dtype=torch.float16),
+    )
+
+    result = runner.prepare_decode(object(), object(), [])
+
+    assert result is None
+    assert torch.equal(
+        runner.model._decode_input_embed_buffer,
+        torch.ones(1, 3, dtype=torch.float16),
+    )
+
+
 def test_voxtral_steady_decode_reports_cuda_graph_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
