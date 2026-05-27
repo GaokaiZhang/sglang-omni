@@ -233,11 +233,12 @@ that happened to contain an older version of the test.
   - Bailing tokenizer loader fallback for vocab compatibility
   - TP topology validation (rank-specific stage specs, talker/thinker GPU collision detection, server_args alignment before infra init).
 
-- `unit_test/qwen3_tts/`: Qwen3-TTS Base unit tests:
+- `unit_test/qwen3_tts/`: Qwen3-TTS unit tests:
   - pipeline config and registry contracts
   - OmniScheduler-backed AR stage factory wiring
   - request mapping for `ref_audio` / `ref_text` and `references`
   - model-owned default preservation for language and sampling parameters
+  - Base, CustomVoice, and VoiceDesign request validation
   - voice-clone reference validation
   - pipeline payload state serialization.
 

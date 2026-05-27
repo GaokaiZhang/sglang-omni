@@ -313,7 +313,7 @@ def test_voxtral_steady_decode_reports_cuda_graph_ready(
         def process(self, model_output, scheduler_output):
             del model_output
             return {
-                req.request_id: SimpleNamespace(extra={})
+                req.request_id: RequestOutput(req.request_id, data=5)
                 for req in scheduler_output.requests
             }
 
