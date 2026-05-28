@@ -4,17 +4,7 @@ This guide uses [Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Inst
 
 ## Prerequisites
 
-```bash
-docker pull frankleeeee/sglang-omni:dev
-docker run -it --shm-size 32g --gpus all frankleeeee/sglang-omni:dev /bin/zsh
-```
-
-```bash
-git clone https://github.com/sgl-project/sglang-omni.git
-cd sglang-omni
-uv venv .venv -p 3.12 && source .venv/bin/activate
-uv pip install -v .
-```
+Install `sglang-omni` by following [Installation](../get_started/installation.md).
 
 ## Text-Only Mode
 
@@ -25,6 +15,18 @@ Text-only mode runs the thinker pipeline on a single GPU. It accepts multi-modal
 ```bash
 sgl-omni serve \
   --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --text-only \
+  --port 8008
+```
+
+For MMSU-style audio-input / text-output benchmarks with short requests, use
+the fused text-path config so the full text path stays inside one worker
+process:
+
+```bash
+sgl-omni serve \
+  --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --config examples/configs/qwen3_omni_mmsu.yaml \
   --text-only \
   --port 8008
 ```
@@ -159,7 +161,19 @@ Speech mode runs the full 9-stage pipeline across multiple GPUs. It produces bot
 
 ### Launch the Server
 
-Speech mode requires multiple GPUs. Use the example script with GPU placement control:
+Speech mode can run as a colocated one-GPU worker using the colocated config:
+
+```bash
+sgl-omni serve \
+  --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --config examples/configs/qwen3_omni_colocated_h20.yaml \
+  --colocate \
+  --port 8008
+```
+
+Use `examples/configs/qwen3_omni_colocated_h200.yaml` on single-H200 workers.
+
+For manual multi-GPU placement, use the example script:
 
 ```bash
 python examples/run_qwen3_omni_speech_server.py \
@@ -171,7 +185,7 @@ python examples/run_qwen3_omni_speech_server.py \
   --port 8008
 ```
 
-Or use the CLI without `--text-only` (defaults to speech mode):
+Or use the CLI without `--text-only` for the standard speech pipeline:
 
 ```bash
 sgl-omni serve \
@@ -217,6 +231,42 @@ python examples/run_qwen3_omni_speech_server.py \
 `--mem-fraction-static` applies to both Qwen AR stages. Per-stage flags override
 the global value for that stage. Values must be greater than `0` and less than
 `1`.
+
+## Single-GPU FP8 on H100/H20
+
+SGLang-Omni can also serve native FP8 Qwen3-Omni checkpoints. Native FP8 uses
+the checkpoint quantization config when loading the thinker and talker AR stages,
+while keeping the same Qwen3-Omni request format shown below.
+
+For one-GPU H100/H20 colocated launch, use the FP8 colocated config:
+
+```bash
+sgl-omni serve \
+  --config examples/configs/qwen3_omni_fp8_colocated.yaml \
+  --colocate \
+  --model-name qwen3-omni \
+  --port 8008
+```
+
+The config file contains the FP8 checkpoint path:
+`marksverdhei/Qwen3-Omni-30B-A3B-FP8`. You can still pass `--model-path` to
+override the config value.
+
+The FP8 path keeps dense FP8 GEMM on SGLang `auto` and defaults native FP8 MoE
+to CUTLASS when supported. For Qwen3-Omni pipeline launches,
+`SGLANG_JIT_DEEPGEMM_PRECOMPILE=0` is set as a default unless the operator has
+already set that environment variable. This disables SGLang's all-M DeepGEMM
+precompile session while keeping DeepGEMM available for dense FP8 GEMMs.
+
+To opt back into SGLang's all-M DeepGEMM precompile behavior:
+
+```bash
+SGLANG_JIT_DEEPGEMM_PRECOMPILE=1 sgl-omni serve \
+  --config examples/configs/qwen3_omni_fp8_colocated.yaml \
+  --colocate \
+  --model-name qwen3-omni \
+  --port 8008
+```
 
 ### Image and Text Input
 

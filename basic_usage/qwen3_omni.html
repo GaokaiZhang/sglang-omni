@@ -50,15 +50,16 @@
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
     <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'basic_usage/qwen3_omni';</script>
-    <link rel="icon" href="https://docs.sglang.io/_static/logo.ico"/>
+    <script src="../_static/js/qwen3_omni_server_generator.js?v=621ec60e"></script>
+    <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="TTS Model Usage" href="tts_s2pro.html" />
-    <link rel="prev" title="🚀 Get Started" href="../get_started/installation.html" />
+    <link rel="next" title="TTS Model Usage" href="tts.html" />
+    <link rel="prev" title="Qwen3-Omni" href="../cookbook/qwen3_omni.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.0" />
-    <meta name="docbuild:last-update" content="May 15, 2026"/>
+    <meta name="docbuild:last-update" content="May 28, 2026"/>
   </head>
   
   
@@ -137,8 +138,8 @@
       
     
     
-    <img src="https://docs.sglang.io/_static/logo.png" class="logo__image only-light" alt="SGLang - Home"/>
-    <img src="https://docs.sglang.io/_static/logo.png" class="logo__image only-dark pst-js-only" alt="SGLang - Home"/>
+    <img src="../_static/logo.png" class="logo__image only-light" alt="SGLang - Home"/>
+    <img src="../_static/logo.png" class="logo__image only-dark pst-js-only" alt="SGLang - Home"/>
   
   
 </a></div>
@@ -153,12 +154,19 @@
     <div class="bd-toc-item navbar-nav active">
         <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Get Started</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Installation</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/higgs_tts.html">Higgs TTS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/voxtral_tts.html">Voxtral TTS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_tts.html">Qwen3 TTS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_omni.html">Qwen3-Omni</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Basic Usage</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Omni Model Usage</a></li>
-<li class="toctree-l1"><a class="reference internal" href="tts_s2pro.html">TTS Model Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tts.html">TTS Model Usage</a></li>
 <li class="toctree-l1"><a class="reference internal" href="omni_router.html">Omni Router Usage</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
@@ -172,6 +180,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/pipeline.html">Pipeline Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/config.html">Config</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/communication.html">Communication</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/profiler.html">Request-level profiler</a></li>
 </ul>
 
     </div>
@@ -408,6 +417,9 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#speech-mode">Speech Mode</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Launch the Server</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#single-gpu-fp8-on-h100-h20">Single-GPU FP8 on H100/H20</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Image and Text Input</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">Audio and Image Input</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id4">Video and Audio Input</a></li>
@@ -430,16 +442,7 @@
 <p>This guide uses <a class="reference external" href="https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct">Qwen3-Omni</a> as an example omni model with SGLang-Omni and the OpenAI-compatible API. Qwen3-Omni supports multi-modal input (text, image, audio) and can produce text-only or text + audio output depending on the mode.</p>
 <section id="prerequisites">
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>pull<span class="w"> </span>frankleeeee/sglang-omni:dev
-docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </span>--shm-size<span class="w"> </span>32g<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>frankleeeee/sglang-omni:dev<span class="w"> </span>/bin/zsh
-</pre></div>
-</div>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/sgl-project/sglang-omni.git
-<span class="nb">cd</span><span class="w"> </span>sglang-omni
-uv<span class="w"> </span>venv<span class="w"> </span>.venv<span class="w"> </span>-p<span class="w"> </span><span class="m">3</span>.12<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">source</span><span class="w"> </span>.venv/bin/activate
-uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-v<span class="w"> </span>.
-</pre></div>
-</div>
+<p>Install <code class="docutils literal notranslate"><span class="pre">sglang-omni</span></code> by following <a class="reference internal" href="../get_started/installation.html"><span class="std std-doc">Installation</span></a>.</p>
 </section>
 <section id="text-only-mode">
 <h2>Text-Only Mode<a class="headerlink" href="#text-only-mode" title="Link to this heading">#</a></h2>
@@ -448,6 +451,16 @@ uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </s
 <h3>Launch the Server<a class="headerlink" href="#launch-the-server" title="Link to this heading">#</a></h3>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--text-only<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
+</pre></div>
+</div>
+<p>For MMSU-style audio-input / text-output benchmarks with short requests, use
+the fused text-path config so the full text path stays inside one worker
+process:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/qwen3_omni_mmsu.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--text-only<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
 </pre></div>
@@ -571,7 +584,16 @@ instructions in the text message.</p>
 <p>Speech mode runs the full 9-stage pipeline across multiple GPUs. It produces both text (from the thinker) and audio (from the talker) output.</p>
 <section id="id1">
 <h3>Launch the Server<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
-<p>Speech mode requires multiple GPUs. Use the example script with GPU placement control:</p>
+<p>Speech mode can run as a colocated one-GPU worker using the colocated config:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/qwen3_omni_colocated_h20.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--colocate<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
+</pre></div>
+</div>
+<p>Use <code class="docutils literal notranslate"><span class="pre">examples/configs/qwen3_omni_colocated_h200.yaml</span></code> on single-H200 workers.</p>
+<p>For manual multi-GPU placement, use the example script:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>examples/run_qwen3_omni_speech_server.py<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--gpu-thinker<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
@@ -581,7 +603,7 @@ instructions in the text message.</p>
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
 </pre></div>
 </div>
-<p>Or use the CLI without <code class="docutils literal notranslate"><span class="pre">--text-only</span></code> (defaults to speech mode):</p>
+<p>Or use the CLI without <code class="docutils literal notranslate"><span class="pre">--text-only</span></code> for the standard speech pipeline:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model-path<span class="w"> </span>Qwen/Qwen3-Omni-30B-A3B-Instruct<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
@@ -620,6 +642,36 @@ the value globally or per AR stage:</p>
 the global value for that stage. Values must be greater than <code class="docutils literal notranslate"><span class="pre">0</span></code> and less than
 <code class="docutils literal notranslate"><span class="pre">1</span></code>.</p>
 </section>
+</section>
+<section id="single-gpu-fp8-on-h100-h20">
+<h2>Single-GPU FP8 on H100/H20<a class="headerlink" href="#single-gpu-fp8-on-h100-h20" title="Link to this heading">#</a></h2>
+<p>SGLang-Omni can also serve native FP8 Qwen3-Omni checkpoints. Native FP8 uses
+the checkpoint quantization config when loading the thinker and talker AR stages,
+while keeping the same Qwen3-Omni request format shown below.</p>
+<p>For one-GPU H100/H20 colocated launch, use the FP8 colocated config:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/qwen3_omni_fp8_colocated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--colocate<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-name<span class="w"> </span>qwen3-omni<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
+</pre></div>
+</div>
+<p>The config file contains the FP8 checkpoint path:
+<code class="docutils literal notranslate"><span class="pre">marksverdhei/Qwen3-Omni-30B-A3B-FP8</span></code>. You can still pass <code class="docutils literal notranslate"><span class="pre">--model-path</span></code> to
+override the config value.</p>
+<p>The FP8 path keeps dense FP8 GEMM on SGLang <code class="docutils literal notranslate"><span class="pre">auto</span></code> and defaults native FP8 MoE
+to CUTLASS when supported. For Qwen3-Omni pipeline launches,
+<code class="docutils literal notranslate"><span class="pre">SGLANG_JIT_DEEPGEMM_PRECOMPILE=0</span></code> is set as a default unless the operator has
+already set that environment variable. This disables SGLang’s all-M DeepGEMM
+precompile session while keeping DeepGEMM available for dense FP8 GEMMs.</p>
+<p>To opt back into SGLang’s all-M DeepGEMM precompile behavior:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">SGLANG_JIT_DEEPGEMM_PRECOMPILE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/qwen3_omni_fp8_colocated.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--colocate<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-name<span class="w"> </span>qwen3-omni<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8008</span>
+</pre></div>
+</div>
 <section id="id2">
 <h3>Image and Text Input<a class="headerlink" href="#id2" title="Link to this heading">#</a></h3>
 <p>Send an image with a text question to get both text and audio responses. Set <code class="docutils literal notranslate"><span class="pre">&quot;modalities&quot;:</span> <span class="pre">[&quot;text&quot;,</span> <span class="pre">&quot;audio&quot;]</span></code> to enable audio output.</p>
@@ -853,16 +905,16 @@ the global value for that stage. Values must be greater than <code class="docuti
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="../get_started/installation.html"
+       href="../cookbook/qwen3_omni.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">🚀 Get Started</p>
+        <p class="prev-next-title">Qwen3-Omni</p>
       </div>
     </a>
     <a class="right-next"
-       href="tts_s2pro.html"
+       href="tts.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
@@ -898,6 +950,9 @@ the global value for that stage. Values must be greater than <code class="docuti
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#speech-mode">Speech Mode</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Launch the Server</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#single-gpu-fp8-on-h100-h20">Single-GPU FP8 on H100/H20</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id2">Image and Text Input</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id3">Audio and Image Input</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id4">Video and Audio Input</a></li>
@@ -937,7 +992,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on May 15, 2026.
+  Last updated on May 28, 2026.
   <br/>
 </p>
   </div>

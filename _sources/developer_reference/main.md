@@ -20,6 +20,7 @@ HTTP API -> Client -> Coordinator -> Stage -> Scheduler -> ModelRunner -> model 
 | [Scheduler](./pipeline.md)        | Per-stage execution loop and failure propagation to stage outbox                       |
 | [ModelRunner](./pipeline.md)      | AR forward preparation, model forward dispatch, output extraction                      |
 | [Communication](./communication.md) | Control-plane messages and relay data transfer between stages                         |
+| [TTS Integration](./tts_model_integration.md) | Checklist and lifecycle rules for adding TTS model families                         |
 
 Refer to the layer-specific document for specific design details.
 
@@ -31,7 +32,7 @@ sglang_omni/
 |-- scheduling/     # Scheduler loops and inbox/outbox message types
 |-- model_runner/   # Shared model runner abstractions for AR stages
 |-- models/         # Model-specific configs, stages, request builders, modules
-|-- config/         # PipelineConfig, StageConfig, config manager, compiler
+|-- config/         # PipelineConfig, StageConfig, config manager, topology
 |-- relay/          # Data transfer backends
 |-- serve/          # HTTP server and OpenAI-compatible API adapter
 |-- client/         # Internal client used by API adapters
@@ -56,5 +57,5 @@ models/<model>/
 ```
 
 Only model-local behavior belongs here. The framework-owned layers are still
-`Stage`, `Coordinator`, schedulers, model-runner bases, relay, compiler, and
+`Stage`, `Coordinator`, schedulers, model-runner bases, relay, runtime prep, and
 runners.
