@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -203,6 +203,8 @@ class PipelineConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    architecture_aliases: ClassVar[tuple[str, ...]] = ()
+
     model_path: str
     stages: list[StageConfig]
     name: str | None = None
@@ -237,6 +239,36 @@ class PipelineConfig(BaseModel):
     @classmethod
     def mem_fraction_role_to_stage(cls) -> dict[str, str]:
         """Class-level public role map for SGLang mem_fraction_static overrides."""
+        return {}
+
+    @classmethod
+    def encoder_mem_reserve_role_to_stage(cls) -> dict[str, str]:
+        """Class-level public role map for encoder memory reserve overrides."""
+        return {}
+
+    @classmethod
+    def talker_role_to_stage(cls) -> dict[str, str]:
+        """Class-level public role map for talker placement overrides."""
+        return {}
+
+    @classmethod
+    def talker_sglang_role_to_stage(cls) -> dict[str, str]:
+        """Class-level public role map for talker SGLang ServerArgs overrides."""
+        return {}
+
+    @classmethod
+    def code2wav_stage(cls) -> str | None:
+        """Return the code2wav stage name when the pipeline supports it."""
+        return None
+
+    @classmethod
+    def tensor_parallel_server_args_overrides(
+        cls,
+        *,
+        stage_name: str,
+        tp_size: int,
+    ) -> dict[str, object]:
+        """Return SGLang ServerArgs overrides implied by stage TP settings."""
         return {}
 
     @property
