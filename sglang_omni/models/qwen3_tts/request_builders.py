@@ -226,6 +226,10 @@ def build_qwen3_tts_state(payload: StagePayload) -> Qwen3TTSState:
                 "x_vector_only_mode is enabled"
             )
     elif task_type == QWEN3_TTS_TASK_CUSTOM_VOICE:
+        if has_param(tts_params, params, "ref_audio") or references_contain_audio(
+            references
+        ):
+            raise ValueError("Qwen3-TTS CustomVoice does not accept ref_audio")
         if has_param(tts_params, params, "ref_text") or references_contain_text(
             references
         ):
@@ -235,6 +239,10 @@ def build_qwen3_tts_state(payload: StagePayload) -> Qwen3TTSState:
         voice = voice or QWEN3_TTS_DEFAULT_CUSTOM_VOICE
         non_streaming_mode = True
     elif task_type == QWEN3_TTS_TASK_VOICE_DESIGN:
+        if has_param(tts_params, params, "ref_audio") or references_contain_audio(
+            references
+        ):
+            raise ValueError("Qwen3-TTS VoiceDesign does not accept ref_audio")
         if has_param(tts_params, params, "ref_text") or references_contain_text(
             references
         ):
@@ -305,16 +313,19 @@ def has_voice_clone_reference(
     references: list[dict[str, Any]],
     tts_params: dict[str, Any],
 ) -> bool:
-    if references:
-        reference = references[0]
-        if any(
-            reference.get(key) is not None
-            for key in ("audio_path", "ref_audio", "audio", "text")
-        ):
-            return True
+    if references_contain_audio(references) or references_contain_text(references):
+        return True
     return (
         tts_params.get("ref_audio") is not None
         or tts_params.get("ref_text") is not None
+    )
+
+
+def references_contain_audio(references: list[dict[str, Any]]) -> bool:
+    return any(
+        reference.get(key) is not None
+        for reference in references
+        for key in ("audio_path", "ref_audio", "audio")
     )
 
 

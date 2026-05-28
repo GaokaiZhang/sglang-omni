@@ -476,6 +476,46 @@ def test_qwen3_tts_custom_voice_rejects_base_only_fields() -> None:
         build_qwen3_tts_state(payload)
 
 
+@pytest.mark.parametrize(
+    ("task_type", "extra_tts_params", "match"),
+    [
+        ("CustomVoice", {}, "CustomVoice does not accept ref_audio"),
+        (
+            "VoiceDesign",
+            {"instructions": "A warm adult voice."},
+            "VoiceDesign does not accept ref_audio",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("inputs", "tts_params"),
+    [
+        ("target", {"ref_audio": "voice.wav"}),
+        ({"text": "target", "references": [{"audio_path": "voice.wav"}]}, {}),
+        ({"text": "target", "references": [{"ref_audio": "voice.wav"}]}, {}),
+        ({"text": "target", "references": [{"audio": "voice.wav"}]}, {}),
+    ],
+)
+def test_qwen3_tts_non_base_tasks_reject_audio_references(
+    task_type: str,
+    extra_tts_params: dict[str, str],
+    match: str,
+    inputs: object,
+    tts_params: dict[str, str],
+) -> None:
+    payload = make_payload(
+        inputs=inputs,
+        tts_params={
+            "task_type": task_type,
+            **extra_tts_params,
+            **tts_params,
+        },
+    )
+
+    with pytest.raises(ValueError, match=match):
+        build_qwen3_tts_state(payload)
+
+
 def test_qwen3_tts_voice_design_requires_instructions() -> None:
     payload = make_payload(
         inputs="target",
