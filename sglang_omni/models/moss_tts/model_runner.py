@@ -206,8 +206,13 @@ class MossTTSModelRunner(ModelRunner):
             n_vq=n_vq,
         )
         sampling_audio_mask = self._sampling_audio_mask(data, n_vq=n_vq, device=device)
+        # Materialize the mask once (single host sync) instead of one .item()
+        # per codebook, and only rebuild the per-head history when the
+        # repetition penalty is actually active (it is 1.0 by default).
+        active = sampling_audio_mask.tolist()
+        rep_penalty = float(data.audio_repetition_penalty)
         for vq_idx in range(n_vq):
-            if not bool(sampling_audio_mask[vq_idx].item()):
+            if not active[vq_idx]:
                 continue
             logits = channel_logits[vq_idx + 1][row_idx].clone()
             logits[int(cfg.audio_pad_code)] = float("-inf")
@@ -216,8 +221,12 @@ class MossTTSModelRunner(ModelRunner):
                 temperature=float(data.audio_temperature),
                 top_p=float(data.audio_top_p),
                 top_k=int(data.audio_top_k),
-                repetition_penalty=float(data.audio_repetition_penalty),
-                prev_tokens=self._previous_audio_tokens(data, vq_idx),
+                repetition_penalty=rep_penalty,
+                prev_tokens=(
+                    self._previous_audio_tokens(data, vq_idx)
+                    if rep_penalty != 1.0
+                    else None
+                ),
             )
 
         self._update_delay_state(data, int(text_token), n_vq=n_vq)

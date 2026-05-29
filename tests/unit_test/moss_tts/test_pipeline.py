@@ -172,8 +172,11 @@ def test_moss_tts_maps_references_token_count_and_deterministic_defaults() -> No
     assert state.language == "en"
     assert state.token_count == 120
     assert state.generation_kwargs["max_new_tokens"] == 4096
-    assert state.generation_kwargs["text_temperature"] == 0.0
-    assert state.generation_kwargs["audio_temperature"] == 0.0
+    # Defaults follow the upstream checkpoint's generate() (sampling), not greedy.
+    assert state.generation_kwargs["text_temperature"] == 1.5
+    assert state.generation_kwargs["audio_temperature"] == 1.7
+    assert state.generation_kwargs["audio_top_p"] == 0.8
+    assert state.generation_kwargs["audio_top_k"] == 25
 
 
 def test_moss_tts_benchmark_auto_token_count_uses_openmoss_estimate() -> None:

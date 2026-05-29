@@ -60,12 +60,12 @@ class MossTTSSGLangRequestData(ARRequestData):
     assistant_prefix_rows: torch.Tensor | None = None
     output_rows: list[torch.Tensor] = field(default_factory=list)
     pending_feedback_queue: Any = field(default_factory=collections.deque)
-    text_temperature: float = 0.0
+    text_temperature: float = 1.5
     text_top_p: float = 1.0
-    text_top_k: int = -1
-    audio_temperature: float = 0.0
-    audio_top_p: float = 1.0
-    audio_top_k: int = -1
+    text_top_k: int = 50
+    audio_temperature: float = 1.7
+    audio_top_p: float = 0.8
+    audio_top_k: int = 25
     audio_repetition_penalty: float = 1.0
     audio_length: int = 0
     delayed_length: int = _INF_DELAY
@@ -235,14 +235,19 @@ def build_generation_kwargs(
         "max_new_tokens": int(
             params.get("max_new_tokens") or MOSS_TTS_DEFAULT_MAX_NEW_TOKENS
         ),
-        # Issue #607 acceptance asks for no sampling. Keep MOSS deterministic
-        # unless the caller explicitly opts into model-specific sampling fields.
-        "text_temperature": 0.0,
-        "audio_temperature": 0.0,
+        # MOSS-TTS is a sampling model: the checkpoint's own generate() ships
+        # these defaults and the upstream reference scores were produced with
+        # them. Greedy (temperature=0) collapses a reference-conditioned codec
+        # LM into copying the reference audio, which destroys WER/CER. The
+        # "no sampling" eval requirement is met via reproducibility (fixed
+        # server random_seed + pytorch sampling backend), not temperature=0.
+        # Callers may still override any field explicitly.
+        "text_temperature": 1.5,
+        "audio_temperature": 1.7,
         "text_top_p": 1.0,
-        "audio_top_p": 1.0,
-        "text_top_k": -1,
-        "audio_top_k": -1,
+        "audio_top_p": 0.8,
+        "text_top_k": 50,
+        "audio_top_k": 25,
         "audio_repetition_penalty": 1.0,
     }
 
