@@ -351,6 +351,156 @@ def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
     assert data.audio_length == 2
 
 
+def test_moss_decode_feedback_uses_row_id_embedding() -> None:
+    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
+
+    runner = MossTTSModelRunner.__new__(MossTTSModelRunner)
+    embedding = torch.nn.Embedding(4, 3)
+    runner.model = SimpleNamespace(
+        hidden_size=3,
+        _decode_input_embedding=embedding,
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=torch.full((2,), 99, dtype=torch.long),
+    )
+    requests = [
+        SimpleNamespace(data=SimpleNamespace(pending_feedback_queue=[torch.ones(3)])),
+        SimpleNamespace(
+            data=SimpleNamespace(pending_feedback_queue=[torch.full((3,), 2.0)])
+        ),
+    ]
+
+    runner._write_decode_input_embedding(forward_batch, requests)
+
+    assert forward_batch.input_ids.tolist() == [0, 1]
+    assert torch.equal(embedding.weight[0].detach(), torch.ones(3))
+    assert torch.equal(embedding.weight[1].detach(), torch.full((3,), 2.0))
+    assert requests[0].data.pending_feedback_queue == []
+    assert requests[1].data.pending_feedback_queue == []
+
+
+def test_moss_channel_logits_fallback_uses_hidden_states() -> None:
+    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.seen_hidden = None
+            self.seen_forward_batch = None
+
+        def compute_channel_logits(self, hidden_states, forward_batch):
+            self.seen_hidden = hidden_states
+            self.seen_forward_batch = forward_batch
+            return [hidden_states + 1, hidden_states + 2]
+
+    runner = MossTTSModelRunner.__new__(MossTTSModelRunner)
+    runner.model = FakeModel()
+    forward_batch = object()
+    hidden = torch.arange(6, dtype=torch.float32).view(2, 1, 3)
+    result = SimpleNamespace(
+        logits_output=SimpleNamespace(
+            customized_info=None,
+            hidden_states=hidden,
+        )
+    )
+
+    logits = runner._channel_logits_from_result(result, forward_batch)
+
+    expected_hidden = hidden[:, -1, :]
+    assert torch.equal(runner.model.seen_hidden, expected_hidden)
+    assert runner.model.seen_forward_batch is forward_batch
+    assert torch.equal(logits[0], expected_hidden + 1)
+    assert torch.equal(logits[1], expected_hidden + 2)
+
+
+def test_moss_forward_ignores_graph_mrope_placeholder() -> None:
+    from sglang_omni.models.moss_tts.sglang_model import MossTTSDelaySGLangModel
+
+    class FakeBackbone:
+        def __init__(self) -> None:
+            self.positions = None
+
+        def __call__(
+            self,
+            *,
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors,
+        ):
+            del input_ids, forward_batch, pp_proxy_tensors
+            self.positions = positions
+            return input_embeds
+
+    backbone = FakeBackbone()
+    model = SimpleNamespace(
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        model=backbone,
+        _prepare_multi_modal_inputs=lambda input_ids: torch.ones(input_ids.shape[0], 3),
+        _select_sample_hidden_states=lambda hidden_states, forward_batch: hidden_states,
+    )
+    positions = torch.arange(2, dtype=torch.long)
+    forward_batch = SimpleNamespace(
+        mrope_positions=torch.zeros((3, 2), dtype=torch.long),
+        forward_mode=SimpleNamespace(is_decode=lambda: False),
+    )
+
+    MossTTSDelaySGLangModel.forward(
+        model,
+        input_ids=torch.arange(2, dtype=torch.long),
+        positions=positions,
+        forward_batch=forward_batch,
+    )
+
+    assert backbone.positions is positions
+
+
+def test_moss_channel_logits_use_decode_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    from sglang_omni.models.moss_tts import sglang_model
+    from sglang_omni.models.moss_tts.sglang_model import MossTTSDelaySGLangModel
+
+    metadata = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        next_token_logits_buffer=object(),
+    )
+    monkeypatch.setattr(
+        sglang_model.LogitsMetadata,
+        "from_forward_batch",
+        classmethod(lambda cls, forward_batch: metadata),
+    )
+
+    class FakeProcessor:
+        def __init__(self) -> None:
+            self.seen_metadata = None
+
+        def __call__(self, input_ids, *, hidden_states, lm_head, logits_metadata):
+            del input_ids, lm_head
+            self.seen_metadata = logits_metadata
+            return SimpleNamespace(next_token_logits=hidden_states)
+
+    processor = FakeProcessor()
+    model = SimpleNamespace(
+        logits_processors=[processor],
+        lm_heads=[object()],
+    )
+    hidden_states = torch.ones(2, 3)
+
+    outputs = MossTTSDelaySGLangModel.compute_channel_outputs(
+        model,
+        hidden_states,
+        forward_batch=object(),
+    )
+
+    assert outputs[0].next_token_logits is hidden_states
+    assert processor.seen_metadata is metadata
+    assert metadata.forward_mode is ForwardMode.DECODE
+    assert metadata.next_token_logits_buffer is None
+
+
 def test_moss_post_process_outputs_skips_im_end() -> None:
     from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
 

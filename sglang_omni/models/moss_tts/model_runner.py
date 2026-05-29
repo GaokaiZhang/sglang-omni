@@ -39,8 +39,8 @@ class MossTTSModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        del forward_batch, schedule_batch
-        self._write_decode_input_embed_buffer(requests)
+        del schedule_batch
+        self._write_decode_input_embedding(forward_batch, requests)
         return None
 
     def post_prefill(
@@ -50,10 +50,9 @@ class MossTTSModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        del forward_batch
         if bool(getattr(schedule_batch, "is_prefill_only", False)):
             return
-        self._collect_moss_step(result, schedule_batch, requests)
+        self._collect_moss_step(result, forward_batch, schedule_batch, requests)
 
     def post_decode(
         self,
@@ -62,8 +61,7 @@ class MossTTSModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        del forward_batch
-        self._collect_moss_step(result, schedule_batch, requests)
+        self._collect_moss_step(result, forward_batch, schedule_batch, requests)
 
     def _build_prefill_input_embeds(
         self,
@@ -95,31 +93,45 @@ class MossTTSModelRunner(ModelRunner):
             dtype=self.model.dtype,
         )
 
-    def _write_decode_input_embed_buffer(self, requests: list) -> None:
+    def _write_decode_input_embedding(
+        self,
+        forward_batch: Any,
+        requests: list,
+    ) -> None:
         batch_size = len(requests)
         if batch_size == 0:
             return
-        buffer = self.model._decode_input_embed_buffer
+        embedding = self.model._decode_input_embedding
+        weight = embedding.weight
         rows = []
         for sched_req in requests:
             queue = sched_req.data.pending_feedback_queue
             if not queue:
-                rows.append(torch.zeros(self.model.hidden_size, device=buffer.device))
+                rows.append(torch.zeros(self.model.hidden_size, device=weight.device))
                 continue
             if hasattr(queue, "popleft"):
                 rows.append(queue.popleft())
             else:
                 rows.append(queue.pop(0))
-        stacked = torch.stack(rows, dim=0).to(device=buffer.device, dtype=buffer.dtype)
-        buffer[:batch_size].copy_(stacked)
+        stacked = torch.stack(rows, dim=0).to(device=weight.device, dtype=weight.dtype)
+        with torch.no_grad():
+            weight[:batch_size].copy_(stacked)
+
+        row_ids = torch.arange(
+            batch_size,
+            dtype=torch.long,
+            device=forward_batch.input_ids.device,
+        )
+        forward_batch.input_ids[:batch_size].copy_(row_ids)
 
     def _collect_moss_step(
         self,
         result: Any,
+        forward_batch: Any,
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        channel_logits = self._channel_logits_from_result(result)
+        channel_logits = self._channel_logits_from_result(result, forward_batch)
         n_vq = len(channel_logits) - 1
         if n_vq <= 0:
             raise RuntimeError("MOSS-TTS requires at least one audio codebook head")
@@ -153,14 +165,22 @@ class MossTTSModelRunner(ModelRunner):
         self._pending_rows = torch.stack(rows, dim=0)
         self._pending_embeds = torch.stack(embeds, dim=0)
 
-    @staticmethod
-    def _channel_logits_from_result(result: Any) -> list[torch.Tensor]:
+    def _channel_logits_from_result(
+        self,
+        result: Any,
+        forward_batch: Any,
+    ) -> list[torch.Tensor]:
         logits_output = result.logits_output
         customized = getattr(logits_output, "customized_info", None)
         if isinstance(customized, dict):
             values = customized.get("moss_tts_channel_logits")
             if isinstance(values, list) and values:
                 return values
+        hidden_states = getattr(logits_output, "hidden_states", None)
+        if isinstance(hidden_states, torch.Tensor):
+            if hidden_states.ndim == 3:
+                hidden_states = hidden_states[:, -1, :]
+            return self.model.compute_channel_logits(hidden_states, forward_batch)
         raise RuntimeError("MOSS-TTS model output did not include channel logits")
 
     def _sample_next_row(

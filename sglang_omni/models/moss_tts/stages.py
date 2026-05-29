@@ -192,15 +192,22 @@ def create_sglang_tts_engine_executor(
         checkpoint_dir,
         context_length=8192,
         dtype=dtype,
-        disable_cuda_graph=True,
+        cuda_graph_bs=[1, 2, 4, 8, 16],
+        cuda_graph_max_bs=16,
+        disable_cuda_graph=False,
         disable_overlap_schedule=True,
-        enable_torch_compile=False,
-        mem_fraction_static=0.85,
+        enable_torch_compile=True,
+        mem_fraction_static=0.70,
         max_prefill_tokens=8192,
         max_running_requests=16,
         sampling_backend="pytorch",
+        torch_compile_max_bs=16,
         trust_remote_code=True,
     )
+
+    want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
+    if want_cuda_graph:
+        server_args.disable_cuda_graph = True
 
     (
         model_worker,
@@ -216,7 +223,13 @@ def create_sglang_tts_engine_executor(
         model_arch_override="MossTTSDelaySGLangModel",
     )
 
+    if want_cuda_graph:
+        server_args.disable_cuda_graph = False
+
     model = model_worker.model_runner.model
+    if want_cuda_graph:
+        model_worker.model_runner.init_device_graphs()
+
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,
         capture_hidden_layers=None,

@@ -8,14 +8,22 @@ from typing import Any, Iterable, Optional, Tuple
 
 import torch
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
@@ -115,12 +123,13 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
         except Exception:
             max_batch_size = max_batch_size or 1
         weight = self._first_embedding_weight()
-        self._decode_input_embed_buffer = torch.zeros(
+        self._decode_input_embedding = torch.nn.Embedding(
             int(max_batch_size or 1),
             self.hidden_size,
             device=weight.device,
             dtype=weight.dtype,
         )
+        self._decode_input_embedding.weight.requires_grad_(False)
 
     @staticmethod
     def _normalize_config(config: Any) -> Any:
@@ -248,9 +257,6 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
         input_embeds_are_projected: bool = False,
     ) -> LogitsProcessorOutput:
         del input_embeds_are_projected
-        if forward_batch.mrope_positions is not None:
-            positions = forward_batch.mrope_positions
-
         if input_embeds is None:
             forward_mode = getattr(forward_batch, "forward_mode", None)
             is_decode = (
@@ -259,9 +265,7 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
                 and bool(forward_mode.is_decode())
             )
             if is_decode:
-                input_embeds = self._decode_input_embed_buffer[
-                    : int(input_ids.shape[0])
-                ]
+                input_embeds = self._decode_input_embedding(input_ids)
             elif self.pp_group.is_first_rank:
                 input_embeds = self._prepare_multi_modal_inputs(input_ids)
             else:
@@ -277,32 +281,48 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
         if not self.pp_group.is_last_rank:
             return hidden_states
 
-        channel_outputs = self.compute_channel_outputs(hidden_states, forward_batch)
-        text_output = channel_outputs[0]
-        text_output.hidden_states = self._select_sample_hidden_states(
+        sample_hidden_states = self._select_sample_hidden_states(
             hidden_states,
             forward_batch,
         )
-        text_output.customized_info = {
-            "moss_tts_channel_logits": [
-                output.next_token_logits for output in channel_outputs
-            ]
-        }
-        return text_output
+        # The MOSS runner samples 33 channels from hidden states after the
+        # graph-captured backbone returns. Keeping logits outside model.forward
+        # avoids SGLang graph replay dropping customized_info and avoids reusing
+        # the text-vocab graph logits buffer for small audio heads.
+        dummy_logits = sample_hidden_states.new_empty(
+            (sample_hidden_states.shape[0], 1)
+        )
+        return LogitsProcessorOutput(
+            next_token_logits=dummy_logits,
+            hidden_states=sample_hidden_states,
+        )
 
     def compute_channel_outputs(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> list[LogitsProcessorOutput]:
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        logits_metadata.next_token_logits_buffer = None
+        logits_metadata.forward_mode = ForwardMode.DECODE
         return [
             processor(
                 None,
                 hidden_states=hidden_states,
                 lm_head=self.lm_heads[idx],
-                logits_metadata=forward_batch,
+                logits_metadata=logits_metadata,
             )
             for idx, processor in enumerate(self.logits_processors)
+        ]
+
+    def compute_channel_logits(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> list[torch.Tensor]:
+        return [
+            output.next_token_logits
+            for output in self.compute_channel_outputs(hidden_states, forward_batch)
         ]
 
     @staticmethod
