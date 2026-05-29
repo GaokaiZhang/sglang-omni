@@ -54,8 +54,8 @@ def _torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
 
 def _patch_moss_transformers_processor_compat() -> None:
     """Patch small Transformers API drifts used by MOSS remote processor code."""
-    from transformers import PreTrainedModel, processing_utils
     import transformers.configuration_utils as configuration_utils
+    from transformers import PreTrainedModel, processing_utils
 
     if not hasattr(configuration_utils, "PreTrainedConfig"):
         configuration_utils.PreTrainedConfig = configuration_utils.PretrainedConfig

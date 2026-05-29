@@ -9,12 +9,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from benchmarks.dataset.seedtts import SampleInput
 from benchmarks.tasks.tts import (
     MOSS_TTS_TOKEN_COUNT_AUTO,
     _build_tts_payload,
     estimate_moss_tts_duration_tokens,
 )
-from benchmarks.dataset.seedtts import SampleInput
 from sglang_omni.models.moss_tts.codec import split_moss_audio_segments
 from sglang_omni.models.moss_tts.config import MossTTSPipelineConfig
 from sglang_omni.models.moss_tts.payload_types import MossTTSState

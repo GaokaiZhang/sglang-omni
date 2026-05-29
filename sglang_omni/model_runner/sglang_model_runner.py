@@ -91,9 +91,7 @@ class SGLModelRunner(ModelRunner):
             register_ming_hf_config,
             register_ming_model_registry,
         )
-        from sglang_omni.models.moss_tts.sglang_model import (
-            MossTTSDelaySGLangModel,
-        )
+        from sglang_omni.models.moss_tts.sglang_model import MossTTSDelaySGLangModel
         from sglang_omni.models.qwen3_omni.components.sglang_thinker import (
             Qwen3OmniThinkerForCausalLM,
         )

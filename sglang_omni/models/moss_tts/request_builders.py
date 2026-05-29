@@ -119,7 +119,9 @@ def cleanup_prepared_moss_tts_request(request_id: str) -> None:
         _PREPARED_REQUESTS.pop(str(request_id), None)
 
 
-def pop_prepared_moss_tts_request(payload: StagePayload) -> MossTTSPreparedRequest | None:
+def pop_prepared_moss_tts_request(
+    payload: StagePayload,
+) -> MossTTSPreparedRequest | None:
     data = payload.data if isinstance(payload.data, dict) else {}
     marker = data.get(_MOSS_TTS_PREPARED_MARKER)
     if marker is None:
@@ -334,7 +336,9 @@ def _prepare_moss_tts_request(
     batch = processor([[message]], mode="generation")
     input_rows = batch["input_ids"]
     if input_rows.ndim != 3 or int(input_rows.shape[0]) != 1:
-        raise ValueError("MOSS-TTS processor must return input_ids with shape [1, T, C]")
+        raise ValueError(
+            "MOSS-TTS processor must return input_ids with shape [1, T, C]"
+        )
     prompt_rows = input_rows[0].detach().to(dtype=torch.long, device="cpu")
     input_ids_list = build_row_cache_key_ids(prompt_rows)
     return MossTTSPreparedRequest(
@@ -363,7 +367,9 @@ def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
 
     data = prepared.state.to_dict()
     data[_MOSS_TTS_PREPARED_MARKER] = payload.request_id
-    return StagePayload(request_id=payload.request_id, request=payload.request, data=data)
+    return StagePayload(
+        request_id=payload.request_id, request=payload.request, data=data
+    )
 
 
 def _last_equal(rows: torch.Tensor, value: int) -> int:
@@ -373,13 +379,15 @@ def _last_equal(rows: torch.Tensor, value: int) -> int:
     return int(matches[-1].item())
 
 
-def _resolve_audio_payload_bounds(rows: torch.Tensor, cfg: Any) -> tuple[int, int] | None:
+def _resolve_audio_payload_bounds(
+    rows: torch.Tensor, cfg: Any
+) -> tuple[int, int] | None:
     text = rows[:, 0].to(dtype=torch.long)
     bos_pos = (text == int(cfg.audio_start_token_id)).nonzero(as_tuple=False)
     if bos_pos.numel() == 0:
-        gen_pos = (
-            text == int(cfg.audio_assistant_gen_slot_token_id)
-        ).nonzero(as_tuple=False)
+        gen_pos = (text == int(cfg.audio_assistant_gen_slot_token_id)).nonzero(
+            as_tuple=False
+        )
         if gen_pos.numel() == 0:
             return None
         start = int(gen_pos[0].item())
@@ -487,9 +495,7 @@ def build_sglang_moss_tts_request(
         audio_temperature=float(gen_kwargs.get("audio_temperature", 0.0)),
         audio_top_p=float(gen_kwargs.get("audio_top_p", 1.0)),
         audio_top_k=int(gen_kwargs.get("audio_top_k", -1)),
-        audio_repetition_penalty=float(
-            gen_kwargs.get("audio_repetition_penalty", 1.0)
-        ),
+        audio_repetition_penalty=float(gen_kwargs.get("audio_repetition_penalty", 1.0)),
         engine_start_s=time.perf_counter(),
     )
     data.input_embeds_are_projected = True

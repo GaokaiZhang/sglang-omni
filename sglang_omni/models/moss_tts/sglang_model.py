@@ -136,9 +136,9 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
         config.channels = int(getattr(config, "channels", config.n_vq + 1))
         audio_vocab_size = int(getattr(config, "audio_vocab_size", 1024))
         if not getattr(config, "vocab_size_list", None):
-            config.vocab_size_list = [config.vocab_size] + [
-                audio_vocab_size + 1
-            ] * (config.channels - 1)
+            config.vocab_size_list = [config.vocab_size] + [audio_vocab_size + 1] * (
+                config.channels - 1
+            )
         if not getattr(config, "pad_token", None):
             text_pad = int(getattr(config, "pad_token_id", 0) or 0)
             audio_pad = int(getattr(config, "audio_pad_code", audio_vocab_size))
@@ -321,9 +321,12 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
         extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
         if extend_seq_lens is None:
             return hidden_states[-1:].contiguous()
-        last_index = torch.cumsum(
-            extend_seq_lens.to(device=hidden_states.device, dtype=torch.long), dim=0
-        ) - 1
+        last_index = (
+            torch.cumsum(
+                extend_seq_lens.to(device=hidden_states.device, dtype=torch.long), dim=0
+            )
+            - 1
+        )
         return hidden_states[last_index]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:

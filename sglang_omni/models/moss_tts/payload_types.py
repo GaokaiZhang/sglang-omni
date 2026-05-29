@@ -77,7 +77,9 @@ class MossTTSState:
             language=data.get("language"),
             instructions=data.get("instructions"),
             token_count=(
-                int(data["token_count"]) if data.get("token_count") is not None else None
+                int(data["token_count"])
+                if data.get("token_count") is not None
+                else None
             ),
             generation_kwargs=(
                 dict(generation_kwargs) if isinstance(generation_kwargs, dict) else {}

@@ -350,9 +350,8 @@ class MossTTSModelRunner(ModelRunner):
             data.is_audio = False
 
         delayed = self._delayed_length_value(data.delayed_length)
-        if (
-            delayed is None
-            and text_token == int(cfg.audio_assistant_delay_slot_token_id)
+        if delayed is None and text_token == int(
+            cfg.audio_assistant_delay_slot_token_id
         ):
             delayed = 0
         if delayed is not None:
