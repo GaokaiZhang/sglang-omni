@@ -194,6 +194,8 @@ class CreateSpeechRequest(BaseModel):
     ref_audio: str | None = None  # path or URL to reference audio
     ref_text: str | None = None  # transcript of reference audio
     references: list[SpeechReference] | None = None  # S2-Pro-style refs
+    token_count: int | None = None  # MOSS-TTS duration token target
+    duration_tokens: int | None = None  # alias for token_count
 
     # Generation parameters
     max_new_tokens: int | None = None

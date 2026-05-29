@@ -26,6 +26,7 @@ _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "Qwen3OmniTalker": ("talker_config", "text_config"),
     "Qwen3OmniThinkerForCausalLM": ("thinker_config", "text_config"),
     "Qwen3TTSTalker": ("talker_config", None),
+    "MossTTSDelaySGLangModel": ("language_config", None),
 }
 
 

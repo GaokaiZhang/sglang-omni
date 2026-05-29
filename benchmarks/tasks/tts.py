@@ -57,6 +57,10 @@ logger = logging.getLogger(__name__)
 
 TEXT_PREVIEW_LENGTH = 60
 SPEAKER_SIMILARITY_BATCH_SIZE = 8
+MOSS_TTS_TOKEN_COUNT_AUTO = "auto"
+MOSS_TTS_ZH_TOKENS_PER_CHAR = 3.098411951313033
+MOSS_TTS_EN_TOKENS_PER_CHAR = 0.8673376262755219
+MOSS_TTS_MIN_AUTO_TOKEN_COUNT = 32
 UTMOS_BATCH_SIZE = 8
 
 
@@ -1338,12 +1342,44 @@ def _build_tts_payload(
         payload["task_type"] = task_type
     if instructions is not None:
         payload["instructions"] = instructions
-    for key, value in gen_kwargs.items():
+    resolved_gen_kwargs = _resolve_tts_generation_kwargs(sample, gen_kwargs)
+    for key, value in resolved_gen_kwargs.items():
         if value is not None:
             payload[key] = value
     if stream:
         payload["stream"] = True
     return payload
+
+
+def estimate_moss_tts_duration_tokens(text: str) -> int:
+    """Estimate MOSS-TTS duration tokens using OpenMOSS app defaults."""
+    normalized = text or ""
+    effective_len = max(len(normalized), 1)
+    zh_chars = sum(1 for ch in normalized if "\u4e00" <= ch <= "\u9fff")
+    en_chars = sum(1 for ch in normalized if ("A" <= ch <= "Z") or ("a" <= ch <= "z"))
+    factor = (
+        MOSS_TTS_ZH_TOKENS_PER_CHAR
+        if zh_chars and zh_chars >= en_chars
+        else MOSS_TTS_EN_TOKENS_PER_CHAR
+    )
+    return max(MOSS_TTS_MIN_AUTO_TOKEN_COUNT, int(effective_len * factor))
+
+
+def _resolve_tts_generation_kwargs(
+    sample: SampleInput,
+    gen_kwargs: dict,
+) -> dict:
+    token_count = gen_kwargs.get("token_count")
+    if not isinstance(token_count, str):
+        return gen_kwargs
+
+    normalized = token_count.strip().lower()
+    if normalized != MOSS_TTS_TOKEN_COUNT_AUTO:
+        return gen_kwargs
+
+    resolved = dict(gen_kwargs)
+    resolved["token_count"] = estimate_moss_tts_duration_tokens(sample.target_text)
+    return resolved
 
 
 def _parse_response_headers(result: RequestResult, headers: dict) -> None:

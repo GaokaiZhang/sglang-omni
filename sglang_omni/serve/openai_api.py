@@ -671,6 +671,10 @@ def build_speech_generate_request(
         tts_params["ref_audio"] = req.ref_audio
     if req.ref_text is not None:
         tts_params["ref_text"] = req.ref_text
+    if req.token_count is not None:
+        tts_params["token_count"] = req.token_count
+    if req.duration_tokens is not None:
+        tts_params["duration_tokens"] = req.duration_tokens
     if req.seed is not None:
         tts_params["seed"] = req.seed
 

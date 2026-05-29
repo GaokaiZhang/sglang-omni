@@ -155,6 +155,7 @@ from benchmarks.metrics.performance import (
     print_speed_summary,
 )
 from benchmarks.tasks.tts import (
+    MOSS_TTS_TOKEN_COUNT_AUTO,
     build_base_url,
     make_tts_send_fn,
     run_seedtts_similarity,
@@ -195,6 +196,7 @@ class TtsSeedttsBenchmarkConfig:
     output_dir: str = "results/tts_seedtts"
     max_samples: int | None = None
     max_new_tokens: int | None = 2048
+    token_count: int | str | None = None
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -215,6 +217,8 @@ def _build_generation_kwargs(config: TtsSeedttsBenchmarkConfig) -> dict:
     generation_kwargs: dict = {}
     if config.max_new_tokens is not None:
         generation_kwargs["max_new_tokens"] = config.max_new_tokens
+    if config.token_count is not None:
+        generation_kwargs["token_count"] = config.token_count
     if config.temperature is not None:
         generation_kwargs["temperature"] = config.temperature
     if config.top_p is not None:
@@ -246,6 +250,7 @@ def _build_results_config(
         "max_samples": config.max_samples,
         "max_new_tokens": config.max_new_tokens,
         "seed": config.seed,
+        "token_count": config.token_count,
         "warmup": config.warmup,
         "concurrency": config.concurrency,
         "request_rate": config.request_rate,
@@ -321,6 +326,7 @@ def run_tts_seedtts_transcribe(
         "task_type": config.task_type,
         "instructions": config.instructions,
         "max_new_tokens": config.max_new_tokens,
+        "token_count": config.token_count,
         "temperature": config.temperature,
         "max_samples": config.max_samples,
         "stream": config.stream,
@@ -352,6 +358,7 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         output_dir=args.output_dir,
         max_samples=args.max_samples,
         max_new_tokens=args.max_new_tokens,
+        token_count=args.token_count,
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
@@ -366,6 +373,21 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         device=args.device,
         similarity_checkpoint=args.similarity_checkpoint,
     )
+
+
+def _parse_token_count(value: str) -> int | str:
+    normalized = value.strip().lower()
+    if normalized == MOSS_TTS_TOKEN_COUNT_AUTO:
+        return MOSS_TTS_TOKEN_COUNT_AUTO
+    try:
+        token_count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "token count must be a positive integer or 'auto'"
+        ) from exc
+    if token_count <= 0:
+        raise argparse.ArgumentTypeError("token count must be positive")
+    return token_count
 
 
 async def benchmark(config: TtsSeedttsBenchmarkConfig) -> dict:
@@ -443,6 +465,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=str, default="results/tts_seedtts")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--token-count",
+        type=_parse_token_count,
+        default=None,
+        help=(
+            "MOSS-TTS duration token target forwarded as token_count. Pass "
+            "'auto' to estimate per sample using OpenMOSS app defaults."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)

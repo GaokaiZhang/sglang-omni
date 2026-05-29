@@ -298,3 +298,11 @@ def test_transcription_endpoint_returns_text_json() -> None:
     assert request.model == "openai/whisper-large-v3"
     assert request.prompt["filename"] == "sample.wav"
     assert request.extra_params["language"] == "en"
+
+
+def test_speech_request_passes_moss_token_count() -> None:
+    req = CreateSpeechRequest(input="hello", token_count=180)
+
+    gen_req = build_speech_generate_request(req, "moss-tts")
+
+    assert gen_req.metadata["tts_params"]["token_count"] == 180
