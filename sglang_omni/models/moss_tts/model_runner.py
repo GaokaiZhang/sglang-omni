@@ -38,7 +38,10 @@ class MossTTSModelRunner(ModelRunner):
         forward_batch: Any,
         schedule_batch: Any,
         requests: list,
+        *,
+        is_lookahead: bool = False,
     ) -> None:
+        del is_lookahead
         del schedule_batch
         self._write_decode_input_embedding(forward_batch, requests)
         return None
