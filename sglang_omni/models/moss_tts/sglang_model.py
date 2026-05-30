@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from copy import copy
 from typing import Any, Iterable, Optional, Tuple
 
 import torch
@@ -111,7 +112,10 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
                 self.lm_heads.append(PPMissingLayer())
 
         self.logits_processors = torch.nn.ModuleList(
-            [LogitsProcessor(self.config) for _ in range(self.config.channels)]
+            [
+                self._make_logits_processor(self.config, idx)
+                for idx in range(self.config.channels)
+            ]
         )
         self._pad_token_per_channel = self._compute_pad_token_per_channel()
 
@@ -296,6 +300,21 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
             next_token_logits=dummy_logits,
             hidden_states=sample_hidden_states,
         )
+
+    @staticmethod
+    def _make_logits_processor(config: Any, channel: int) -> LogitsProcessor:
+        """Per-channel LogitsProcessor sized to that channel's own vocab.
+
+        sglang's ``_get_logits`` slices the head output to ``config.vocab_size``
+        to strip the ParallelLMHead vocab padding (1025 -> 1088 for the audio
+        heads). Sharing the text config (vocab 152k) for the audio heads leaves
+        the padding columns 1025..1087 in the audio logits; with the padding
+        weights ~0 they get sampled at the audio temperature as out-of-range
+        codes, which corrupt frames and drive the high-WER failure tail.
+        """
+        channel_config = copy(config)
+        channel_config.vocab_size = int(config.vocab_size_list[channel])
+        return LogitsProcessor(channel_config)
 
     def compute_channel_outputs(
         self,

@@ -311,7 +311,9 @@ class MossTTSModelRunner(ModelRunner):
                 [cl.to(torch.float32) for cl in channel_logits[1:]], dim=1
             )  # [batch, n_vq, vocab_audio]
             if 0 <= audio_pad_code < audio_logits.shape[-1]:
-                audio_logits[..., audio_pad_code] = _NEG_INF
+                # Mask the pad code and any vocab padding columns beyond it so
+                # out-of-range codes can never be sampled.
+                audio_logits[..., audio_pad_code:] = _NEG_INF
             if audio_rep != 1.0:
                 self._apply_audio_repetition_penalty(
                     audio_logits, datas, n_vq=n_vq, penalty=audio_rep
