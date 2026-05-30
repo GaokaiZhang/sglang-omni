@@ -311,6 +311,9 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
         the padding columns 1025..1087 in the audio logits; with the padding
         weights ~0 they get sampled at the audio temperature as out-of-range
         codes, which corrupt frames and drive the high-WER failure tail.
+
+        Per-channel sizing referenced from
+        https://github.com/sgl-project/sglang-omni/pull/608.
         """
         channel_config = copy(config)
         channel_config.vocab_size = int(config.vocab_size_list[channel])

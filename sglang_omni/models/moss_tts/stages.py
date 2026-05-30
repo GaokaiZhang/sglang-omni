@@ -160,7 +160,7 @@ def _build_usage(state: MossTTSState) -> dict[str, Any] | None:
 
 
 def create_preprocessing_executor(
-    model_path: str, *, max_concurrency: int = 8
+    model_path: str, *, max_concurrency: int = 16
 ) -> SimpleScheduler:
     processor = _load_moss_processor(model_path, device="cpu", dtype="float32")
     set_moss_tts_preprocessing_context(processor=processor)
