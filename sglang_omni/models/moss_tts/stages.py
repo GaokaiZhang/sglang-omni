@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -52,25 +53,68 @@ def _torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
     return getattr(torch, dtype) if isinstance(dtype, str) else dtype
 
 
-def _patch_moss_transformers_processor_compat() -> None:
-    """Patch small Transformers API drifts used by MOSS remote processor code."""
+@contextmanager
+def _moss_transformers_processor_compat():
+    """Temporarily patch Transformers API drifts only while loading the MOSS
+    processor, restoring the globals afterwards.
+
+    All three drifts are load-time only (they are consulted by
+    ``ProcessorMixin.from_pretrained`` / the remote config code, not at runtime):
+    - the remote config references the renamed ``PreTrainedConfig``;
+    - ``MODALITY_TO_BASE_CLASS_MAPPING`` / the ``AutoModel`` entry must exist for
+      the optional audio-tokenizer branch;
+    - Transformers 4.57's ``ProcessorMixin`` rejects the AutoModel-loaded
+      MOSS-Audio-Tokenizer unless ``PreTrainedAudioTokenizerBase`` accepts a
+      plain ``PreTrainedModel``.
+    Leaking these into the global namespace can mask drift in unrelated models,
+    so they are scoped and reverted here.
+    """
     import transformers.configuration_utils as configuration_utils
     from transformers import PreTrainedModel, processing_utils
 
-    if not hasattr(configuration_utils, "PreTrainedConfig"):
-        configuration_utils.PreTrainedConfig = configuration_utils.PretrainedConfig
+    missing = object()
+    undo: list[tuple[str, Any, str, Any]] = []
 
-    auto_mapping = getattr(processing_utils, "AUTO_TO_BASE_CLASS_MAPPING", None)
-    if isinstance(auto_mapping, dict):
-        auto_mapping.setdefault("AutoModel", "PreTrainedModel")
-        if not hasattr(processing_utils, "MODALITY_TO_BASE_CLASS_MAPPING"):
-            processing_utils.MODALITY_TO_BASE_CLASS_MAPPING = auto_mapping
+    def patch_attr(obj: Any, name: str, value: Any) -> None:
+        undo.append(("attr", obj, name, getattr(obj, name, missing)))
+        setattr(obj, name, value)
 
-    # MOSS-Audio-Tokenizer is loaded through AutoModel and is a PreTrainedModel.
-    # Transformers 4.57 otherwise rejects it in ProcessorMixin's optional
-    # audio_tokenizer branch before the model can be moved to the vocoder stage.
-    if hasattr(processing_utils, "PreTrainedAudioTokenizerBase"):
-        processing_utils.PreTrainedAudioTokenizerBase = PreTrainedModel
+    def patch_item(mapping: dict, key: str, value: Any) -> None:
+        undo.append(("item", mapping, key, mapping.get(key, missing)))
+        mapping[key] = value
+
+    try:
+        if not hasattr(configuration_utils, "PreTrainedConfig"):
+            patch_attr(
+                configuration_utils,
+                "PreTrainedConfig",
+                configuration_utils.PretrainedConfig,
+            )
+        auto_mapping = getattr(processing_utils, "AUTO_TO_BASE_CLASS_MAPPING", None)
+        if isinstance(auto_mapping, dict):
+            if "AutoModel" not in auto_mapping:
+                patch_item(auto_mapping, "AutoModel", "PreTrainedModel")
+            if not hasattr(processing_utils, "MODALITY_TO_BASE_CLASS_MAPPING"):
+                patch_attr(
+                    processing_utils, "MODALITY_TO_BASE_CLASS_MAPPING", auto_mapping
+                )
+        if hasattr(processing_utils, "PreTrainedAudioTokenizerBase"):
+            patch_attr(
+                processing_utils, "PreTrainedAudioTokenizerBase", PreTrainedModel
+            )
+        yield
+    finally:
+        for kind, obj, key, old in reversed(undo):
+            if kind == "attr":
+                if old is missing:
+                    if hasattr(obj, key):
+                        delattr(obj, key)
+                else:
+                    setattr(obj, key, old)
+            elif old is missing:
+                obj.pop(key, None)
+            else:
+                obj[key] = old
 
 
 def _load_moss_processor_class(checkpoint_dir: str) -> type:
@@ -117,19 +161,17 @@ def _load_moss_processor(
     device: str = "cpu",
     dtype: str | torch.dtype = "float32",
 ) -> Any:
-    try:
-        _patch_moss_transformers_processor_compat()
-    except ImportError as exc:
-        raise RuntimeError(_MOSS_TTS_INSTALL_HINT) from exc
-
     checkpoint_dir = _resolve_checkpoint(model_path)
     logger.info("Loading MOSS-TTS processor from %s on %s", checkpoint_dir, device)
     try:
-        processor_cls = _load_moss_processor_class(checkpoint_dir)
-        processor = processor_cls.from_pretrained(
-            checkpoint_dir,
-            trust_remote_code=True,
-        )
+        with _moss_transformers_processor_compat():
+            processor_cls = _load_moss_processor_class(checkpoint_dir)
+            processor = processor_cls.from_pretrained(
+                checkpoint_dir,
+                trust_remote_code=True,
+            )
+    except ImportError as exc:
+        raise RuntimeError(_MOSS_TTS_INSTALL_HINT) from exc
     except Exception as exc:
         raise RuntimeError(_MOSS_TTS_INSTALL_HINT) from exc
 
@@ -160,7 +202,7 @@ def _build_usage(state: MossTTSState) -> dict[str, Any] | None:
 
 
 def create_preprocessing_executor(
-    model_path: str, *, max_concurrency: int = 16
+    model_path: str, *, max_concurrency: int = 8
 ) -> SimpleScheduler:
     processor = _load_moss_processor(model_path, device="cpu", dtype="float32")
     set_moss_tts_preprocessing_context(processor=processor)

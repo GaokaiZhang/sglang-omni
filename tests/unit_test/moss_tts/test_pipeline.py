@@ -166,7 +166,10 @@ def test_moss_tts_maps_references_token_count_and_deterministic_defaults() -> No
 
     state = build_moss_tts_state(payload)
 
-    assert state.text.startswith("${token:120}hello")
+    # ${token:N} is stripped from the text (it becomes the processor's tokens=
+    # field), while [pause Xs], pinyin, and IPA markup pass through unchanged.
+    assert state.text == "hello [pause 0.5s] ni3 hao3 /hello/"
+    assert "${token" not in state.text
     assert state.ref_audio == "voice.wav"
     assert state.ref_text == "reference"
     assert state.language == "en"
@@ -553,3 +556,72 @@ def test_moss_delay_codec_splits_non_pad_segments() -> None:
     segments = split_moss_audio_segments(delayed, audio_pad_code=1024)
 
     assert [segment.tolist() for segment in segments] == [[[1, 3], [2, 4]]]
+
+
+def test_moss_sample_tokens_uses_per_row_top_k() -> None:
+    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
+
+    # Identical logits for both rows; row 0 uses top_k=1 (locked to its argmax),
+    # row 1 uses top_k=4. If the sampler reused row 0's params for the whole
+    # batch (the datas[0] bug), row 1 would also be locked to the argmax.
+    logits = torch.tensor(
+        [
+            [3.0, 2.0, 1.0, 0.0, float("-inf")],
+            [3.0, 2.0, 1.0, 0.0, float("-inf")],
+        ]
+    )
+    temperature = torch.tensor([2.0, 2.0])
+    top_p = torch.tensor([1.0, 1.0])
+    top_k = torch.tensor([1, 4])
+
+    row0_vals: set[int] = set()
+    row1_vals: set[int] = set()
+    for seed in range(64):
+        torch.manual_seed(seed)
+        out = MossTTSModelRunner._sample_tokens(
+            logits, temperature=temperature, top_p=top_p, top_k=top_k
+        )
+        row0_vals.add(int(out[0]))
+        row1_vals.add(int(out[1]))
+
+    assert row0_vals == {0}  # top_k=1 -> always the argmax
+    assert row1_vals - {0}  # top_k=4 -> reaches beyond the argmax
+    assert row1_vals <= {0, 1, 2, 3}  # never the -inf-masked token
+
+
+def test_moss_tts_rejects_nonpositive_token_count() -> None:
+    with pytest.raises(ValueError):
+        build_moss_tts_state(make_payload(inputs={"text": "${token:0}hi"}))
+    with pytest.raises(ValueError):
+        build_moss_tts_state(
+            make_payload(inputs={"text": "hi"}, tts_params={"token_count": 0})
+        )
+
+
+def test_moss_preprocess_discards_handoff_after_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.moss_tts import request_builders as rb
+
+    payload = make_payload(inputs="hello", request_id="abort-me")
+
+    def fake_prepare(pl, *, processor):
+        # The abort fires while preprocessing is still running.
+        rb.cleanup_prepared_moss_tts_request(pl.request_id)
+        return rb.MossTTSPreparedRequest(
+            state=MossTTSState(),
+            input_ids_list=[],
+            input_ids=torch.zeros(0, dtype=torch.long),
+            prompt_rows=torch.zeros((0, 0), dtype=torch.long),
+            gen_kwargs={},
+        )
+
+    monkeypatch.setattr(rb, "_prepare_moss_tts_request", fake_prepare)
+    try:
+        rb.set_moss_tts_preprocessing_context(processor=object())
+        rb.preprocess_moss_tts_payload(payload)
+        with rb._PREPARED_REQUESTS_LOCK:
+            assert "abort-me" not in rb._PREPARED_REQUESTS
+            assert not rb._PREPARED_REQUESTS
+    finally:
+        rb.clear_moss_tts_preprocessing_context()

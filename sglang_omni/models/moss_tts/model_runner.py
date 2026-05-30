@@ -234,11 +234,23 @@ class MossTTSModelRunner(ModelRunner):
             dtype=torch.float32,
             device=device,
         )
-        text_top_p = float(datas[0].text_top_p)
-        text_top_k = int(datas[0].text_top_k)
-        audio_top_p = float(datas[0].audio_top_p)
-        audio_top_k = int(datas[0].audio_top_k)
-        audio_rep = float(datas[0].audio_repetition_penalty)
+        text_top_p = torch.tensor(
+            [float(d.text_top_p) for d in datas], dtype=torch.float32, device=device
+        )
+        text_top_k = torch.tensor(
+            [int(d.text_top_k) for d in datas], dtype=torch.long, device=device
+        )
+        audio_top_p = torch.tensor(
+            [float(d.audio_top_p) for d in datas], dtype=torch.float32, device=device
+        )
+        audio_top_k = torch.tensor(
+            [int(d.audio_top_k) for d in datas], dtype=torch.long, device=device
+        )
+        audio_rep = torch.tensor(
+            [float(d.audio_repetition_penalty) for d in datas],
+            dtype=torch.float32,
+            device=device,
+        )
 
         # --- text channel ---
         text_logits = channel_logits[0].to(torch.float32)
@@ -291,8 +303,8 @@ class MossTTSModelRunner(ModelRunner):
             next_text[idx] = self._sample_tokens(
                 text_logits[idx],
                 temperature=text_temp[idx],
-                top_p=text_top_p,
-                top_k=text_top_k,
+                top_p=text_top_p[idx],
+                top_k=text_top_k[idx],
             )
         is_audio = is_audio | (next_text == audio_start)
         is_audio = is_audio & (next_text != im_end)
@@ -314,16 +326,16 @@ class MossTTSModelRunner(ModelRunner):
                 # Mask the pad code and any vocab padding columns beyond it so
                 # out-of-range codes can never be sampled.
                 audio_logits[..., audio_pad_code:] = _NEG_INF
-            if audio_rep != 1.0:
-                self._apply_audio_repetition_penalty(
-                    audio_logits, datas, n_vq=n_vq, penalty=audio_rep
-                )
+            if bool((audio_rep != 1.0).any()):
+                self._apply_audio_repetition_penalty(audio_logits, datas, n_vq=n_vq)
             audio_temp_full = audio_temp.unsqueeze(1).expand(batch_size, n_vq)
+            audio_top_p_full = audio_top_p.unsqueeze(1).expand(batch_size, n_vq)
+            audio_top_k_full = audio_top_k.unsqueeze(1).expand(batch_size, n_vq)
             next_audio[sampling_audio_mask] = self._sample_tokens(
                 audio_logits[sampling_audio_mask],
                 temperature=audio_temp_full[sampling_audio_mask],
-                top_p=audio_top_p,
-                top_k=audio_top_k,
+                top_p=audio_top_p_full[sampling_audio_mask],
+                top_k=audio_top_k_full[sampling_audio_mask],
             )
 
         # --- advance delay state (matches upstream update order) ---
@@ -356,41 +368,69 @@ class MossTTSModelRunner(ModelRunner):
         return rows
 
     @staticmethod
+    def _as_row_tensor(
+        value: torch.Tensor | float | int,
+        num_rows: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Broadcast a scalar to a per-row tensor, or move an existing one."""
+        if isinstance(value, torch.Tensor):
+            return value.to(dtype=dtype, device=device)
+        return torch.full((num_rows,), value, dtype=dtype, device=device)
+
+    @staticmethod
     def _sample_tokens(
         logits: torch.Tensor,
         *,
         temperature: torch.Tensor | float,
-        top_p: float,
-        top_k: int,
+        top_p: torch.Tensor | float,
+        top_k: torch.Tensor | int,
     ) -> torch.Tensor:
         """Batched temperature / top-k / top-p sampling for ``[N, vocab]`` logits.
 
+        ``temperature``/``top_p``/``top_k`` may be scalars or per-row tensors of
+        length N; rows sharing the same ``(top_k, top_p)`` are filtered together
+        so each request's own parameters are applied (never the first request's).
         Faithful to upstream ``sample_token``: temperature scaling, then top-k,
         then top-p, then multinomial. Rows with temperature <= 0 fall back to
-        greedy argmax. ``logits`` is assumed float32 with disallowed tokens
-        already masked to ``-inf``.
+        greedy argmax. ``logits`` is float32 with disallowed tokens masked to
+        ``-inf``.
         """
         num_rows, vocab = logits.shape
         if num_rows == 0:
             return torch.empty(0, dtype=torch.long, device=logits.device)
+        device = logits.device
 
-        if isinstance(temperature, torch.Tensor):
-            temp = temperature.to(dtype=torch.float32, device=logits.device)
-        else:
-            temp = torch.full(
-                (num_rows,),
-                float(temperature),
-                dtype=torch.float32,
-                device=logits.device,
-            )
+        temp = MossTTSModelRunner._as_row_tensor(
+            temperature, num_rows, torch.float32, device
+        )
+        top_p_row = MossTTSModelRunner._as_row_tensor(
+            top_p, num_rows, torch.float32, device
+        )
+        top_k_row = MossTTSModelRunner._as_row_tensor(
+            top_k, num_rows, torch.long, device
+        )
         do_sample = temp > 0
         safe_temp = torch.where(do_sample, temp, torch.ones_like(temp))
         scores = logits / safe_temp.unsqueeze(1)
 
-        if top_k and 0 < int(top_k) < vocab:
-            scores = MossTTSModelRunner._apply_top_k(scores, int(top_k))
-        if top_p is not None and 0.0 < float(top_p) < 1.0:
-            scores = MossTTSModelRunner._apply_top_p(scores, float(top_p))
+        # Apply top-k / top-p per (k, p) group so each row's own params are used.
+        groups: dict[tuple[int, float], list[int]] = {}
+        for row, (k, p) in enumerate(zip(top_k_row.tolist(), top_p_row.tolist())):
+            groups.setdefault((int(k), float(p)), []).append(row)
+        for (k, p), row_list in groups.items():
+            use_k = bool(k) and 0 < k < vocab
+            use_p = 0.0 < p < 1.0
+            if not (use_k or use_p):
+                continue
+            ridx = torch.tensor(row_list, dtype=torch.long, device=device)
+            sub = scores.index_select(0, ridx)
+            if use_k:
+                sub = MossTTSModelRunner._apply_top_k(sub, k)
+            if use_p:
+                sub = MossTTSModelRunner._apply_top_p(sub, p)
+            scores.index_copy_(0, ridx, sub)
 
         probs = torch.softmax(scores, dim=-1)
         probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
@@ -439,16 +479,20 @@ class MossTTSModelRunner(ModelRunner):
         datas: list,
         *,
         n_vq: int,
-        penalty: float,
     ) -> None:
-        """In-place delay-pattern repetition penalty per request/codebook.
+        """In-place delay-pattern repetition penalty, per request and codebook.
 
-        Only invoked when ``audio_repetition_penalty != 1.0`` (off by default),
-        so the per-request loop here is not on the hot path.
+        Each request's own ``audio_repetition_penalty`` is applied (requests with
+        a unit penalty are skipped). Only invoked when at least one request has a
+        non-unit penalty (off by default), so this per-request loop is off the
+        hot path.
         """
         device = audio_logits.device
         vocab = audio_logits.shape[-1]
         for i, data in enumerate(datas):
+            penalty = float(data.audio_repetition_penalty)
+            if penalty == 1.0:
+                continue
             parts = []
             prompt_rows = getattr(data, "prompt_rows", None)
             if prompt_rows is not None and prompt_rows.numel() > 0:

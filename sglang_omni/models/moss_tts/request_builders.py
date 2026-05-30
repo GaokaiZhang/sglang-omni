@@ -91,6 +91,10 @@ class MossTTSPreprocessingContext:
 
 _PREPROCESSING_CONTEXT: MossTTSPreprocessingContext | None = None
 _PREPARED_REQUESTS: dict[str, MossTTSPreparedRequest] = {}
+# Requests aborted before/while their handoff was published. The compute
+# function checks this under the lock so a late insert is dropped instead of
+# leaking a never-consumed prepared request into _PREPARED_REQUESTS.
+_ABORTED_REQUESTS: set[str] = set()
 _PREPARED_REQUESTS_LOCK = threading.Lock()
 
 
@@ -101,6 +105,7 @@ def set_moss_tts_preprocessing_context(*, processor: Any) -> None:
     with _PREPARED_REQUESTS_LOCK:
         _PREPROCESSING_CONTEXT = MossTTSPreprocessingContext(processor=processor)
         _PREPARED_REQUESTS.clear()
+        _ABORTED_REQUESTS.clear()
 
 
 def clear_moss_tts_preprocessing_context() -> None:
@@ -110,13 +115,21 @@ def clear_moss_tts_preprocessing_context() -> None:
     with _PREPARED_REQUESTS_LOCK:
         _PREPROCESSING_CONTEXT = None
         _PREPARED_REQUESTS.clear()
+        _ABORTED_REQUESTS.clear()
 
 
 def cleanup_prepared_moss_tts_request(request_id: str) -> None:
-    """Drop any prepared MOSS-TTS handoff state for an aborted request."""
+    """Drop any prepared MOSS-TTS handoff state for an aborted request.
 
+    If the handoff has not been published yet (abort raced ahead of
+    ``preprocess_moss_tts_payload``), record the id so the pending insert is
+    discarded rather than leaking.
+    """
+
+    rid = str(request_id)
     with _PREPARED_REQUESTS_LOCK:
-        _PREPARED_REQUESTS.pop(str(request_id), None)
+        if _PREPARED_REQUESTS.pop(rid, None) is None:
+            _ABORTED_REQUESTS.add(rid)
 
 
 def pop_prepared_moss_tts_request(
@@ -175,19 +188,34 @@ def _resolve_token_count(
     text: str,
     params: dict[str, Any],
     tts_params: dict[str, Any],
-) -> int | None:
+) -> tuple[str, int | None]:
+    """Resolve the duration token count and return ``(clean_text, count)``.
+
+    The upstream v1.5 processor takes the duration via ``build_user_message(
+    text=..., tokens=...)`` and writes it into the ``- Tokens:`` field, so the
+    inline ``${token:N}`` prefix must be stripped out of ``text`` while its value
+    becomes ``tokens``. Explicit ``token_count`` / ``duration_tokens`` / ``tokens``
+    params and the ``${token:N}`` prefix are all validated as ``> 0``. Other
+    markup ([pause Xs], pinyin, IPA, ...) is passed through unchanged.
+    """
     for source in (tts_params, params):
         for key in ("token_count", "duration_tokens", "tokens"):
             if source.get(key) is not None:
                 value = source[key]
                 if isinstance(value, bool):
                     raise ValueError("MOSS-TTS token_count must be an integer")
-                return int(value)
+                count = int(value)
+                if count <= 0:
+                    raise ValueError("MOSS-TTS token_count must be > 0")
+                return text, count
 
     match = _TOKEN_PREFIX_RE.match(text)
     if match:
-        return int(match.group(1))
-    return None
+        count = int(match.group(1))
+        if count <= 0:
+            raise ValueError("MOSS-TTS ${token:N} count must be > 0")
+        return text[match.end() :].lstrip(), count
+    return text, None
 
 
 def build_moss_tts_state(payload: StagePayload) -> MossTTSState:
@@ -209,13 +237,14 @@ def build_moss_tts_state(payload: StagePayload) -> MossTTSState:
         or params.get("instructions")
         or params.get("instruct")
     )
+    text, token_count = _resolve_token_count(text, params, tts_params)
     return MossTTSState(
         text=text,
         ref_audio=ref_audio,
         ref_text=ref_text,
         language=language,
         instructions=instructions,
-        token_count=_resolve_token_count(text, params, tts_params),
+        token_count=token_count,
         generation_kwargs=build_generation_kwargs(params, tts_params=tts_params),
     )
 
@@ -367,8 +396,14 @@ def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
         )
 
     prepared = _prepare_moss_tts_request(payload, processor=context.processor)
+    rid = str(payload.request_id)
     with _PREPARED_REQUESTS_LOCK:
-        _PREPARED_REQUESTS[payload.request_id] = prepared
+        if rid in _ABORTED_REQUESTS:
+            # Aborted while we were preprocessing: drop the handoff so it does
+            # not linger unconsumed.
+            _ABORTED_REQUESTS.discard(rid)
+        else:
+            _PREPARED_REQUESTS[rid] = prepared
 
     data = prepared.state.to_dict()
     data[_MOSS_TTS_PREPARED_MARKER] = payload.request_id

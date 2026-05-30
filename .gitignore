@@ -46,5 +46,3 @@ results/
 benchmarks/eval/*.edit.lock
 .claude/*
 !.claude/skills/
-PR.md
-comment1.md
