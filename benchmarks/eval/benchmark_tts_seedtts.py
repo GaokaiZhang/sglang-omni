@@ -118,6 +118,9 @@ outlier-excluded 1.27%; ZH: 3 samples, outlier-excluded 1.22%).
 Note: MOSS-TTS raw corpus WER includes outliers above 50% WER (EN: 4 samples,
 outlier-excluded 1.32%; ZH: 2 samples, outlier-excluded 1.27%).
 
+Note: Qwen3-TTS-1.7B EN raw corpus WER includes 1 sample above 50% WER; outlier-excluded corpus WER is 0.91%.
+Qwen3-TTS is run at c=4 (0.6B) / c=8 (1.7B): higher concurrency regresses WER.
+
 | Model  | Config           | wer_corpus | wer_per_sample_mean | wer_per_sample_median | wer_per_sample_std | evaluated | skipped | Source                         |
 | ------ | ---------------- | ---------- | ------------------- | --------------------- | ------------------ | --------- | ------- | ------------------------------ |
 | S2-Pro | EN, stream=False | 1.07%      | 1.03%               | 0.00%                 | 3.6%               | 1088/1088 | 0       | PR #411 [H200, full-set, c=16] |
@@ -136,7 +139,11 @@ outlier-excluded 1.32%; ZH: 2 samples, outlier-excluded 1.27%).
 | Higgs TTS | ZH, stream=False | 1.85%   | 1.69%               | 0.00%                 | 21.0%              | 2020/2020 | 0       | PR #534 [H200, full-set, c=16] |
 | MOSS-TTS | EN, stream=False | 1.68%   | 1.74%               | 0.00%                 | 8.6%               | 1088/1088 | 0       | PR #609 [H200, full-set, c=8, token-count=auto] |
 | MOSS-TTS | ZH, stream=False | 1.36%   | 1.31%               | 0.00%                 | 3.9%               | 2020/2020 | 0       | PR #609 [H200, full-set, c=8, token-count=auto] |
-| Voxtral | EN, stream=False | 1.19%   | 1.19%               | 0.00%                 | 4.0%               | 1088/1088 | 0       | PR #527 [H200, full-set, c=16, no-ref-audio, voice=cheerful_female]      |
+| Voxtral | EN, stream=False | 1.19%   | 1.19%               | 0.00%                 | 4.0%               | 1088/1088 | 0       | PR #527 [H200, full-set, c=16, no-ref-audio, voice=cheerful_female] |
+| Qwen3-TTS-0.6B | EN, stream=False | 1.26%   | 1.23%               | 0.00%                 | 4.1%               | 1088/1088 | 0       | PR #527 [H200, full-set, c=4]  |
+| Qwen3-TTS-0.6B | ZH, stream=False | 1.17%   | 1.13%               | 0.00%                 | 3.0%               | 2020/2020 | 0       | PR #527 [H200, full-set, c=4]  |
+| Qwen3-TTS-1.7B | EN, stream=False | 2.68%   | 2.27%               | 0.00%                 | 4576%              | 1088/1088 | 0       | PR #527 [H200, full-set, c=8]  |
+| Qwen3-TTS-1.7B | ZH, stream=False | 1.04%   | 0.99%               | 0.00%                 | 2.6%               | 2020/2020 | 0       | PR #527 [H200, full-set, c=8]  |
 
 Generation speed (generation.speed)
 
@@ -159,6 +166,10 @@ Generation speed (generation.speed)
 | MOSS-TTS | EN, stream=False | 3.449       | 4.141         | 0.811    | 2.312          | 75.2                           | PR #609 [H200, full-set, c=8, token-count=auto] |
 | MOSS-TTS | ZH, stream=False | 3.608       | 4.153         | 0.635    | 2.213          | 77.8                           | PR #609 [H200, full-set, c=8, token-count=auto] |
 | Voxtral | EN, stream=False | 1.630       | 2.410         | 0.286    | 9.706          | n/a                            | PR #527 [H200, full-set, c=16, no-ref-audio, voice=cheerful_female] |
+| Qwen3-TTS-0.6B | EN, stream=False | 2.897       | 4.141         | 0.696    | 1.379          | 20.0                           | PR #527 [H200, full-set, c=4] |
+| Qwen3-TTS-0.6B | ZH, stream=False | 3.957       | 4.977         | 0.637    | 1.010          | 21.1                           | PR #527 [H200, full-set, c=4] |
+| Qwen3-TTS-1.7B | EN, stream=False | 3.374       | 4.886         | 0.817    | 2.367          | 16.7                           | PR #527 [H200, full-set, c=8] |
+| Qwen3-TTS-1.7B | ZH, stream=False | 4.479       | 5.725         | 0.758    | 1.783          | 17.5                           | PR #527 [H200, full-set, c=8] |
 
 Note (Chenyang): output-token rates here count S2-Pro's codec tokens. They are not
 comparable to Qwen3-Omni rates in benchmark_omni_seedtts.py, whose tokens are
@@ -177,6 +188,10 @@ ASR speed (accuracy.asr_speed) — Whisper-large-v3 for EN, FunASR paraformer-zh
 | MOSS-TTS  | EN   | 0.370              | 0.0854       | 2.70                         | PR #609 [H200, from MOSS-TTS EN stream=False run] |
 | MOSS-TTS  | ZH   | 0.109              | 0.0192       | 9.18                         | PR #609 [H200, from MOSS-TTS ZH stream=False run] |
 | Voxtral   | EN   | 0.360              | 0.0665       | 2.77                         | PR #527 [H200, from Voxtral EN stream=False run] |
+| Qwen3-TTS-0.6B | EN | 0.361          | 0.0892       | 2.77                         | PR #527 [H200, from Qwen3-TTS-0.6B EN stream=False run] |
+| Qwen3-TTS-0.6B | ZH | 0.116          | 0.0193       | 8.61                         | PR #527 [H200, from Qwen3-TTS-0.6B ZH stream=False run] |
+| Qwen3-TTS-1.7B | EN | 0.366          | 0.0910       | 2.73                         | PR #527 [H200, from Qwen3-TTS-1.7B EN stream=False run] |
+| Qwen3-TTS-1.7B | ZH | 0.108          | 0.0186       | 9.30                         | PR #527 [H200, from Qwen3-TTS-1.7B ZH stream=False run] |
 """
 
 from __future__ import annotations
