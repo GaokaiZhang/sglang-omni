@@ -327,12 +327,13 @@ def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
     audio0_logits = torch.tensor([[-1.0, 0.0, 5.0, 1.0, -100.0]])
     audio1_logits = torch.tensor([[-1.0, 6.0, 0.0, 1.0, -100.0]])
 
-    text_token, audio_tokens = runner._sample_next_row(
+    rows = runner._sample_rows(
         [text_logits, audio0_logits, audio1_logits],
-        row_idx=0,
-        data=data,
+        [data],
         n_vq=2,
     )
+    text_token = int(rows[0, 0].item())
+    audio_tokens = rows[0, 1:]
 
     assert text_token == cfg.audio_start_token_id
     assert audio_tokens.tolist() == [cfg.audio_pad_code, cfg.audio_pad_code]
@@ -342,12 +343,13 @@ def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
     data.generation_steps = 1
     text_logits[0] = -100.0
     text_logits[0, cfg.audio_assistant_gen_slot_token_id] = 10.0
-    text_token, audio_tokens = runner._sample_next_row(
+    rows = runner._sample_rows(
         [text_logits, audio0_logits, audio1_logits],
-        row_idx=0,
-        data=data,
+        [data],
         n_vq=2,
     )
+    text_token = int(rows[0, 0].item())
+    audio_tokens = rows[0, 1:]
 
     assert text_token == cfg.audio_assistant_gen_slot_token_id
     assert audio_tokens.tolist() == [2, cfg.audio_pad_code]

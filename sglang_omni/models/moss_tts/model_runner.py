@@ -11,6 +11,9 @@ from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.request_builders import _INF_DELAY
 from sglang_omni.scheduling.types import RequestOutput
 
+_NEG_INF = float("-inf")
+_INT64_MAX = torch.iinfo(torch.int64).max
+
 
 class MossTTSModelRunner(ModelRunner):
     """Samples MOSS-TTS text/audio channels and maintains delay-pattern state."""
@@ -138,35 +141,20 @@ class MossTTSModelRunner(ModelRunner):
         n_vq = len(channel_logits) - 1
         if n_vq <= 0:
             raise RuntimeError("MOSS-TTS requires at least one audio codebook head")
+        if not requests:
+            return
 
-        device = channel_logits[0].device
-        rows = []
-        embeds = []
-        text_tokens = []
-        for row_idx, sched_req in enumerate(requests):
-            data = sched_req.data
-            text_token, audio_tokens = self._sample_next_row(
-                channel_logits,
-                row_idx=row_idx,
-                data=data,
-                n_vq=n_vq,
-            )
-            row = torch.empty(n_vq + 1, dtype=torch.long, device=device)
-            row[0] = int(text_token)
-            row[1:] = audio_tokens
-            rows.append(row)
-            text_tokens.append(int(text_token))
-            embeds.append(
-                self.model._prepare_multi_modal_inputs(
-                    row.unsqueeze(0).to(device=self.model.device)
-                )[0].detach()
-            )
+        datas = [sched_req.data for sched_req in requests]
+        rows = self._sample_rows(channel_logits, datas, n_vq=n_vq)
 
-        next_token_ids = torch.tensor(text_tokens, dtype=torch.long, device=device)
+        next_token_ids = rows[:, 0].contiguous()
         result.next_token_ids = next_token_ids
         schedule_batch.output_ids = next_token_ids
-        self._pending_rows = torch.stack(rows, dim=0)
-        self._pending_embeds = torch.stack(embeds, dim=0)
+        embeds = self.model._prepare_multi_modal_inputs(
+            rows.to(device=self.model.device)
+        )
+        self._pending_rows = rows
+        self._pending_embeds = embeds.detach()
 
     def _channel_logits_from_result(
         self,
@@ -186,211 +174,300 @@ class MossTTSModelRunner(ModelRunner):
             return self.model.compute_channel_logits(hidden_states, forward_batch)
         raise RuntimeError("MOSS-TTS model output did not include channel logits")
 
-    def _sample_next_row(
+    def _sample_rows(
         self,
         channel_logits: list[torch.Tensor],
+        datas: list,
         *,
-        row_idx: int,
-        data: Any,
         n_vq: int,
-    ) -> tuple[int, torch.Tensor]:
+    ) -> torch.Tensor:
+        """Vectorized MOSS-TTS delay-pattern step over the whole batch.
+
+        Mirrors one step of the upstream ``MossTTSDelayModel.generate`` loop but
+        as batched tensor ops, so a decode step issues a couple of sampling
+        kernels instead of ``batch * (1 + n_vq)`` Python-level samples (the old
+        per-row/per-codebook loop was ~490 ms/step and dominated RTF). Per-request
+        delay state (audio_length / delayed_length / is_audio) is gathered from
+        the scheduler ``data`` objects and scattered back at the end.
+        """
         cfg = self.model.config
         device = channel_logits[0].device
-        audio_tokens = torch.full(
-            (n_vq,),
-            int(cfg.audio_pad_code),
+        batch_size = len(datas)
+
+        pad_token_id = int(cfg.pad_token_id)
+        gen_slot = int(cfg.audio_assistant_gen_slot_token_id)
+        delay_slot = int(cfg.audio_assistant_delay_slot_token_id)
+        audio_start = int(cfg.audio_start_token_id)
+        audio_end = int(cfg.audio_end_token_id)
+        im_end = int(cfg.im_end_token_id)
+        audio_pad_code = int(cfg.audio_pad_code)
+
+        # --- gather per-request delay state ---
+        audio_lengths = torch.tensor(
+            [int(d.audio_length) for d in datas], dtype=torch.long, device=device
+        )
+        delayed = torch.tensor(
+            [
+                (
+                    _INT64_MAX
+                    if int(d.delayed_length) == _INF_DELAY
+                    else int(d.delayed_length)
+                )
+                for d in datas
+            ],
             dtype=torch.long,
             device=device,
         )
-
-        text_token = self._next_text_token(
-            channel_logits[0][row_idx],
-            data=data,
-            n_vq=n_vq,
+        is_audio = torch.tensor(
+            [bool(d.is_audio) for d in datas], dtype=torch.bool, device=device
         )
-        sampling_audio_mask = self._sampling_audio_mask(data, n_vq=n_vq, device=device)
-        # Materialize the mask once (single host sync) instead of one .item()
-        # per codebook, and only rebuild the per-head history when the
-        # repetition penalty is actually active (it is 1.0 by default).
-        active = sampling_audio_mask.tolist()
-        rep_penalty = float(data.audio_repetition_penalty)
-        for vq_idx in range(n_vq):
-            if not active[vq_idx]:
-                continue
-            logits = channel_logits[vq_idx + 1][row_idx].clone()
-            logits[int(cfg.audio_pad_code)] = float("-inf")
-            audio_tokens[vq_idx] = self._sample_logits(
-                logits,
-                temperature=float(data.audio_temperature),
-                top_p=float(data.audio_top_p),
-                top_k=int(data.audio_top_k),
-                repetition_penalty=rep_penalty,
-                prev_tokens=(
-                    self._previous_audio_tokens(data, vq_idx)
-                    if rep_penalty != 1.0
-                    else None
-                ),
+        gen_steps = torch.tensor(
+            [int(d.generation_steps) for d in datas], dtype=torch.long, device=device
+        )
+        text_temp = torch.tensor(
+            [float(d.text_temperature) for d in datas],
+            dtype=torch.float32,
+            device=device,
+        )
+        audio_temp = torch.tensor(
+            [float(d.audio_temperature) for d in datas],
+            dtype=torch.float32,
+            device=device,
+        )
+        text_top_p = float(datas[0].text_top_p)
+        text_top_k = int(datas[0].text_top_k)
+        audio_top_p = float(datas[0].audio_top_p)
+        audio_top_k = int(datas[0].audio_top_k)
+        audio_rep = float(datas[0].audio_repetition_penalty)
+
+        # --- text channel ---
+        text_logits = channel_logits[0].to(torch.float32)
+        vocab = text_logits.shape[-1]
+
+        next_text = torch.full(
+            (batch_size,), pad_token_id, dtype=torch.long, device=device
+        )
+        next_text[delayed < n_vq] = delay_slot
+        is_audio_eos = delayed == n_vq
+        next_text[is_audio_eos] = audio_end
+        is_audio = is_audio & ~is_audio_eos
+        # delayed == INF (> n_vq) is the only state where the text head is sampled.
+        sampling_text_mask = delayed > n_vq
+
+        not_audio = ~is_audio
+        if bool(not_audio.any()):
+            exclude = torch.tensor(
+                [
+                    t
+                    for t in (pad_token_id, gen_slot, delay_slot, audio_end)
+                    if 0 <= t < vocab
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+            text_logits[not_audio] = text_logits[not_audio].index_fill(
+                -1, exclude, _NEG_INF
+            )
+        if bool(is_audio.any()):
+            allow_only = torch.ones(vocab, dtype=torch.bool, device=device)
+            for token_id in (gen_slot, delay_slot):
+                if 0 <= token_id < vocab:
+                    allow_only[token_id] = False
+            text_logits[is_audio] = text_logits[is_audio].masked_fill(
+                allow_only, _NEG_INF
             )
 
-        self._update_delay_state(data, int(text_token), n_vq=n_vq)
-        return int(text_token), audio_tokens
+        if 0 <= delay_slot < vocab:
+            step0 = gen_steps == 0
+            if bool(step0.any()):
+                text_logits[step0, delay_slot] = _NEG_INF
+        if 0 <= im_end < vocab:
+            step_le_nvq = gen_steps <= n_vq
+            if bool(step_le_nvq.any()):
+                text_logits[step_le_nvq, im_end] = _NEG_INF
 
-    def _next_text_token(self, logits: torch.Tensor, *, data: Any, n_vq: int) -> int:
-        cfg = self.model.config
-        delayed_length = self._delayed_length_value(data.delayed_length)
-        if delayed_length is not None and delayed_length < n_vq:
-            return int(cfg.audio_assistant_delay_slot_token_id)
-        if delayed_length == n_vq:
-            data.is_audio = False
-            return int(cfg.audio_end_token_id)
-
-        masked = logits.clone()
-        if bool(data.is_audio):
-            disallow = torch.ones(
-                masked.shape[-1],
-                dtype=torch.bool,
-                device=masked.device,
+        if bool(sampling_text_mask.any()):
+            idx = sampling_text_mask.nonzero(as_tuple=False).squeeze(1)
+            next_text[idx] = self._sample_tokens(
+                text_logits[idx],
+                temperature=text_temp[idx],
+                top_p=text_top_p,
+                top_k=text_top_k,
             )
-            for token_id in (
-                int(cfg.audio_assistant_gen_slot_token_id),
-                int(cfg.audio_assistant_delay_slot_token_id),
-            ):
-                if 0 <= token_id < masked.shape[-1]:
-                    disallow[token_id] = False
-            masked[disallow] = float("-inf")
-        else:
-            for token_id in (
-                int(cfg.pad_token_id),
-                int(cfg.audio_assistant_gen_slot_token_id),
-                int(cfg.audio_assistant_delay_slot_token_id),
-                int(cfg.audio_end_token_id),
-            ):
-                if 0 <= token_id < masked.shape[-1]:
-                    masked[token_id] = float("-inf")
-        if int(data.generation_steps) == 0:
-            token_id = int(cfg.audio_assistant_delay_slot_token_id)
-            if 0 <= token_id < masked.shape[-1]:
-                masked[token_id] = float("-inf")
-        if int(data.generation_steps) <= n_vq:
-            token_id = int(cfg.im_end_token_id)
-            if 0 <= token_id < masked.shape[-1]:
-                masked[token_id] = float("-inf")
+        is_audio = is_audio | (next_text == audio_start)
+        is_audio = is_audio & (next_text != im_end)
 
-        return int(
-            self._sample_logits(
-                masked,
-                temperature=float(data.text_temperature),
-                top_p=float(data.text_top_p),
-                top_k=int(data.text_top_k),
-            ).item()
+        # --- audio channels ---
+        next_audio = torch.full(
+            (batch_size, n_vq), audio_pad_code, dtype=torch.long, device=device
         )
+        channel_idx = torch.arange(n_vq, device=device)
+        pre_audio = audio_lengths.unsqueeze(1) > channel_idx.unsqueeze(0)
+        post_audio = channel_idx.unsqueeze(0) > (delayed.unsqueeze(1) - 1)
+        post_audio = post_audio | (delayed == _INT64_MAX).unsqueeze(1)
+        sampling_audio_mask = pre_audio & post_audio
+        if bool(sampling_audio_mask.any()):
+            audio_logits = torch.stack(
+                [cl.to(torch.float32) for cl in channel_logits[1:]], dim=1
+            )  # [batch, n_vq, vocab_audio]
+            if 0 <= audio_pad_code < audio_logits.shape[-1]:
+                audio_logits[..., audio_pad_code] = _NEG_INF
+            if audio_rep != 1.0:
+                self._apply_audio_repetition_penalty(
+                    audio_logits, datas, n_vq=n_vq, penalty=audio_rep
+                )
+            audio_temp_full = audio_temp.unsqueeze(1).expand(batch_size, n_vq)
+            next_audio[sampling_audio_mask] = self._sample_tokens(
+                audio_logits[sampling_audio_mask],
+                temperature=audio_temp_full[sampling_audio_mask],
+                top_p=audio_top_p,
+                top_k=audio_top_k,
+            )
 
-    @staticmethod
-    def _delayed_length_value(delayed_length: int) -> int | None:
-        delayed = int(delayed_length)
-        return None if delayed == _INF_DELAY else delayed
-
-    @staticmethod
-    def _sampling_audio_mask(
-        data: Any,
-        *,
-        n_vq: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        delayed = MossTTSModelRunner._delayed_length_value(data.delayed_length)
-        indices = torch.arange(n_vq, dtype=torch.long, device=device)
-        pre_audio = int(data.audio_length) > indices
-        if delayed is None:
-            post_audio = torch.ones(n_vq, dtype=torch.bool, device=device)
-        else:
-            post_audio = indices > delayed - 1
-        return pre_audio & post_audio
-
-    def _previous_audio_tokens(self, data: Any, vq_idx: int) -> torch.Tensor | None:
-        parts = []
-        if data.prompt_rows is not None and data.prompt_rows.numel() > 0:
-            parts.append(data.prompt_rows[:, vq_idx + 1])
-        if data.output_rows:
-            parts.append(torch.stack(data.output_rows, dim=0)[:, vq_idx + 1])
-        if not parts:
-            return None
-        return torch.cat(
-            [part.to(dtype=torch.long, device=self.model.device) for part in parts]
+        # --- advance delay state (matches upstream update order) ---
+        increment = (
+            (next_text == audio_start)
+            | (next_text == gen_slot)
+            | (next_text == delay_slot)
         )
+        audio_lengths = audio_lengths + increment.long()
+        audio_lengths[next_text == audio_end] = 0
+        delayed[(delayed == _INT64_MAX) & (next_text == delay_slot)] = 0
+        not_inf = delayed != _INT64_MAX
+        delayed[not_inf] = delayed[not_inf] + 1
+        delayed[delayed > n_vq] = _INT64_MAX
+
+        # --- scatter state back to per-request data ---
+        audio_lengths_l = audio_lengths.tolist()
+        delayed_l = delayed.tolist()
+        is_audio_l = is_audio.tolist()
+        for i, data in enumerate(datas):
+            data.audio_length = int(audio_lengths_l[i])
+            data.delayed_length = (
+                _INF_DELAY if delayed_l[i] == _INT64_MAX else int(delayed_l[i])
+            )
+            data.is_audio = bool(is_audio_l[i])
+
+        rows = torch.empty((batch_size, n_vq + 1), dtype=torch.long, device=device)
+        rows[:, 0] = next_text
+        rows[:, 1:] = next_audio
+        return rows
 
     @staticmethod
-    def _sample_logits(
+    def _sample_tokens(
         logits: torch.Tensor,
         *,
-        temperature: float,
+        temperature: torch.Tensor | float,
         top_p: float,
         top_k: int,
-        repetition_penalty: float = 1.0,
-        prev_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        scores = logits.to(dtype=torch.float32).clone()
-        if prev_tokens is not None and repetition_penalty != 1.0:
-            valid = prev_tokens[(prev_tokens >= 0) & (prev_tokens < scores.shape[-1])]
-            if valid.numel() > 0:
-                unique = torch.unique(valid)
-                prior = scores[unique]
-                penalty = torch.tensor(
-                    float(repetition_penalty),
-                    dtype=prior.dtype,
-                    device=prior.device,
-                )
-                scores[unique] = torch.where(
-                    prior > 0,
-                    prior / penalty,
-                    prior * penalty,
-                )
+        """Batched temperature / top-k / top-p sampling for ``[N, vocab]`` logits.
 
-        if not torch.isfinite(scores).any():
-            return torch.zeros((), dtype=torch.long, device=logits.device)
-        if temperature <= 0:
-            return torch.argmax(scores, dim=-1).to(dtype=torch.long)
+        Faithful to upstream ``sample_token``: temperature scaling, then top-k,
+        then top-p, then multinomial. Rows with temperature <= 0 fall back to
+        greedy argmax. ``logits`` is assumed float32 with disallowed tokens
+        already masked to ``-inf``.
+        """
+        num_rows, vocab = logits.shape
+        if num_rows == 0:
+            return torch.empty(0, dtype=torch.long, device=logits.device)
 
-        scores = scores / float(temperature)
-        if top_k is not None and int(top_k) > 0 and int(top_k) < scores.shape[-1]:
-            kth = torch.topk(scores, int(top_k)).values[-1]
-            scores[scores < kth] = float("-inf")
+        if isinstance(temperature, torch.Tensor):
+            temp = temperature.to(dtype=torch.float32, device=logits.device)
+        else:
+            temp = torch.full(
+                (num_rows,),
+                float(temperature),
+                dtype=torch.float32,
+                device=logits.device,
+            )
+        do_sample = temp > 0
+        safe_temp = torch.where(do_sample, temp, torch.ones_like(temp))
+        scores = logits / safe_temp.unsqueeze(1)
+
+        if top_k and 0 < int(top_k) < vocab:
+            scores = MossTTSModelRunner._apply_top_k(scores, int(top_k))
         if top_p is not None and 0.0 < float(top_p) < 1.0:
-            sorted_scores, sorted_idx = torch.sort(scores, descending=True)
-            probs = torch.softmax(sorted_scores, dim=-1)
-            remove = torch.cumsum(probs, dim=-1) > float(top_p)
-            remove[1:] = remove[:-1].clone()
-            remove[0] = False
-            scores[sorted_idx[remove]] = float("-inf")
+            scores = MossTTSModelRunner._apply_top_p(scores, float(top_p))
+
         probs = torch.softmax(scores, dim=-1)
-        if not torch.isfinite(probs).all() or float(probs.sum().item()) <= 0.0:
-            return torch.argmax(logits, dim=-1).to(dtype=torch.long)
-        return torch.multinomial(probs, 1).squeeze(0).to(dtype=torch.long)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        row_sums = probs.sum(dim=-1)
 
-    def _update_delay_state(self, data: Any, text_token: int, *, n_vq: int) -> None:
-        cfg = self.model.config
-        if text_token in (
-            int(cfg.audio_start_token_id),
-            int(cfg.audio_assistant_gen_slot_token_id),
-            int(cfg.audio_assistant_delay_slot_token_id),
-        ):
-            data.audio_length = int(data.audio_length) + 1
-        if text_token == int(cfg.audio_end_token_id):
-            data.audio_length = 0
-        if text_token == int(cfg.audio_start_token_id):
-            data.is_audio = True
-        if text_token == int(cfg.im_end_token_id):
-            data.is_audio = False
+        sampled = torch.empty(num_rows, dtype=torch.long, device=logits.device)
+        valid = row_sums > 0
+        if bool(valid.all()):
+            sampled = torch.multinomial(probs, 1).squeeze(1)
+        else:
+            if bool(valid.any()):
+                sampled[valid] = torch.multinomial(probs[valid], 1).squeeze(1)
+            invalid = ~valid
+            if bool(invalid.any()):
+                sampled[invalid] = torch.argmax(logits[invalid], dim=-1)
 
-        delayed = self._delayed_length_value(data.delayed_length)
-        if delayed is None and text_token == int(
-            cfg.audio_assistant_delay_slot_token_id
-        ):
-            delayed = 0
-        if delayed is not None:
-            delayed += 1
-            if delayed > n_vq:
-                delayed = None
-        data.delayed_length = _INF_DELAY if delayed is None else int(delayed)
+        if bool((~do_sample).any()):
+            greedy = ~do_sample
+            sampled[greedy] = torch.argmax(logits[greedy], dim=-1)
+        return sampled.to(torch.long)
+
+    @staticmethod
+    def _apply_top_k(logits: torch.Tensor, top_k: int) -> torch.Tensor:
+        top_k = min(top_k, logits.shape[-1])
+        values, indices = torch.topk(logits, top_k, dim=-1)
+        filtered = torch.full_like(logits, _NEG_INF)
+        filtered.scatter_(-1, indices, values)
+        return filtered
+
+    @staticmethod
+    def _apply_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative = torch.cumsum(probs, dim=-1)
+        remove = cumulative > top_p
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        remove_scattered = torch.zeros_like(logits, dtype=torch.bool).scatter_(
+            -1, sorted_indices, remove
+        )
+        return logits.masked_fill(remove_scattered, _NEG_INF)
+
+    @staticmethod
+    def _apply_audio_repetition_penalty(
+        audio_logits: torch.Tensor,
+        datas: list,
+        *,
+        n_vq: int,
+        penalty: float,
+    ) -> None:
+        """In-place delay-pattern repetition penalty per request/codebook.
+
+        Only invoked when ``audio_repetition_penalty != 1.0`` (off by default),
+        so the per-request loop here is not on the hot path.
+        """
+        device = audio_logits.device
+        vocab = audio_logits.shape[-1]
+        for i, data in enumerate(datas):
+            parts = []
+            prompt_rows = getattr(data, "prompt_rows", None)
+            if prompt_rows is not None and prompt_rows.numel() > 0:
+                parts.append(prompt_rows[:, 1:])
+            output_rows = getattr(data, "output_rows", None)
+            if output_rows:
+                parts.append(torch.stack(output_rows, dim=0)[:, 1:])
+            if not parts:
+                continue
+            history = torch.cat(
+                [part.to(device=device, dtype=torch.long) for part in parts], dim=0
+            )
+            for channel in range(n_vq):
+                tokens = torch.unique(history[:, channel])
+                tokens = tokens[(tokens >= 0) & (tokens < vocab)]
+                if tokens.numel() == 0:
+                    continue
+                scores = audio_logits[i, channel, tokens]
+                audio_logits[i, channel, tokens] = torch.where(
+                    scores > 0, scores / penalty, scores * penalty
+                )
 
     def post_process_outputs(
         self,
