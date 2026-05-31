@@ -67,6 +67,7 @@ class MossTTSSGLangRequestData(ARRequestData):
     audio_top_p: float = 0.8
     audio_top_k: int = 25
     audio_repetition_penalty: float = 1.0
+    seed: int | None = None
     audio_length: int = 0
     delayed_length: int = _INF_DELAY
     is_audio: bool = False
@@ -91,9 +92,10 @@ class MossTTSPreprocessingContext:
 
 _PREPROCESSING_CONTEXT: MossTTSPreprocessingContext | None = None
 _PREPARED_REQUESTS: dict[str, MossTTSPreparedRequest] = {}
-# Requests aborted before/while their handoff was published. The compute
-# function checks this under the lock so a late insert is dropped instead of
-# leaking a never-consumed prepared request into _PREPARED_REQUESTS.
+# Request ids currently inside preprocess_moss_tts_payload.
+_INFLIGHT_REQUESTS: set[str] = set()
+# In-flight requests whose abort arrived before the handoff was published, so
+# compute drops the pending insert instead of leaking it into _PREPARED_REQUESTS.
 _ABORTED_REQUESTS: set[str] = set()
 _PREPARED_REQUESTS_LOCK = threading.Lock()
 
@@ -105,6 +107,7 @@ def set_moss_tts_preprocessing_context(*, processor: Any) -> None:
     with _PREPARED_REQUESTS_LOCK:
         _PREPROCESSING_CONTEXT = MossTTSPreprocessingContext(processor=processor)
         _PREPARED_REQUESTS.clear()
+        _INFLIGHT_REQUESTS.clear()
         _ABORTED_REQUESTS.clear()
 
 
@@ -115,20 +118,23 @@ def clear_moss_tts_preprocessing_context() -> None:
     with _PREPARED_REQUESTS_LOCK:
         _PREPROCESSING_CONTEXT = None
         _PREPARED_REQUESTS.clear()
+        _INFLIGHT_REQUESTS.clear()
         _ABORTED_REQUESTS.clear()
 
 
 def cleanup_prepared_moss_tts_request(request_id: str) -> None:
-    """Drop any prepared MOSS-TTS handoff state for an aborted request.
+    """Drop any prepared MOSS-TTS handoff for an aborted request.
 
-    If the handoff has not been published yet (abort raced ahead of
-    ``preprocess_moss_tts_payload``), record the id so the pending insert is
-    discarded rather than leaking.
+    Only tombstone (so a pending insert is later dropped) when preprocessing is
+    actually in flight; an abort for a request that is not being preprocessed
+    leaves nothing behind.
     """
 
     rid = str(request_id)
     with _PREPARED_REQUESTS_LOCK:
-        if _PREPARED_REQUESTS.pop(rid, None) is None:
+        if _PREPARED_REQUESTS.pop(rid, None) is not None:
+            return
+        if rid in _INFLIGHT_REQUESTS:
             _ABORTED_REQUESTS.add(rid)
 
 
@@ -264,13 +270,9 @@ def build_generation_kwargs(
         "max_new_tokens": int(
             params.get("max_new_tokens") or MOSS_TTS_DEFAULT_MAX_NEW_TOKENS
         ),
-        # MOSS-TTS is a sampling model: the checkpoint's own generate() ships
-        # these defaults and the upstream reference scores were produced with
-        # them. Greedy (temperature=0) collapses a reference-conditioned codec
-        # LM into copying the reference audio, which destroys WER/CER. The
-        # "no sampling" eval requirement is met via reproducibility (fixed
-        # server random_seed + pytorch sampling backend), not temperature=0.
-        # Callers may still override any field explicitly.
+        # note (chenyang): the checkpoint's own generate() defaults; greedy
+        # (temperature=0) collapses the codec LM into copying the reference
+        # audio. Callers may override any field.
         "text_temperature": 1.5,
         "audio_temperature": 1.7,
         "text_top_p": 1.0,
@@ -312,7 +314,41 @@ def build_generation_kwargs(
                 generation_kwargs[field] = (
                     int(value) if field.endswith("top_k") else float(value)
                 )
+
+    seed = tts_params.get("seed")
+    if seed is None:
+        seed = params.get("seed")
+    if seed is not None:
+        generation_kwargs["seed"] = seed
+
+    _validate_moss_tts_generation_kwargs(generation_kwargs)
     return generation_kwargs
+
+
+def _validate_moss_tts_generation_kwargs(kwargs: dict[str, Any]) -> None:
+    """Validate public sampling fields (MOSS uses a custom sampler that bypasses
+    SGLang's SamplingParams.verify), raising ValueError on out-of-range values."""
+    for field in ("text_temperature", "audio_temperature"):
+        if float(kwargs[field]) < 0:
+            raise ValueError(f"MOSS-TTS {field} must be >= 0, got {kwargs[field]!r}")
+    for field in ("text_top_p", "audio_top_p"):
+        if not 0.0 < float(kwargs[field]) <= 1.0:
+            raise ValueError(
+                f"MOSS-TTS {field} must be in (0, 1], got {kwargs[field]!r}"
+            )
+    for field in ("text_top_k", "audio_top_k"):
+        if int(kwargs[field]) < -1:
+            raise ValueError(f"MOSS-TTS {field} must be >= -1, got {kwargs[field]!r}")
+    if float(kwargs["audio_repetition_penalty"]) <= 0:
+        raise ValueError(
+            "MOSS-TTS audio_repetition_penalty must be > 0, got "
+            f"{kwargs['audio_repetition_penalty']!r}"
+        )
+    seed = kwargs.get("seed")
+    if seed is not None and (
+        isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
+    ):
+        raise ValueError(f"MOSS-TTS seed must be a non-negative integer, got {seed!r}")
 
 
 def build_row_cache_key_ids(rows: torch.Tensor) -> list[int]:
@@ -387,22 +423,30 @@ def _prepare_moss_tts_request(
 def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
     """Run MOSS-TTS prompt/reference preprocessing outside the AR scheduler."""
 
+    rid = str(payload.request_id)
     with _PREPARED_REQUESTS_LOCK:
         context = _PREPROCESSING_CONTEXT
+        if context is not None:
+            _INFLIGHT_REQUESTS.add(rid)
     if context is None:
         raise RuntimeError(
             "MOSS-TTS preprocessing context is not initialized; "
             "create_preprocessing_executor must register it before requests run"
         )
 
-    prepared = _prepare_moss_tts_request(payload, processor=context.processor)
-    rid = str(payload.request_id)
-    with _PREPARED_REQUESTS_LOCK:
-        if rid in _ABORTED_REQUESTS:
-            # Aborted while we were preprocessing: drop the handoff so it does
-            # not linger unconsumed.
+    try:
+        prepared = _prepare_moss_tts_request(payload, processor=context.processor)
+    except BaseException:
+        with _PREPARED_REQUESTS_LOCK:
+            _INFLIGHT_REQUESTS.discard(rid)
             _ABORTED_REQUESTS.discard(rid)
-        else:
+        raise
+    with _PREPARED_REQUESTS_LOCK:
+        _INFLIGHT_REQUESTS.discard(rid)
+        aborted = rid in _ABORTED_REQUESTS
+        _ABORTED_REQUESTS.discard(rid)
+        if not aborted:
+            # Aborted-while-preprocessing drops the handoff so it never lingers.
             _PREPARED_REQUESTS[rid] = prepared
 
     data = prepared.state.to_dict()
@@ -536,6 +580,7 @@ def build_sglang_moss_tts_request(
         audio_top_p=float(gen_kwargs.get("audio_top_p", 1.0)),
         audio_top_k=int(gen_kwargs.get("audio_top_k", -1)),
         audio_repetition_penalty=float(gen_kwargs.get("audio_repetition_penalty", 1.0)),
+        seed=gen_kwargs.get("seed"),
         engine_start_s=time.perf_counter(),
     )
     data.input_embeds_are_projected = True

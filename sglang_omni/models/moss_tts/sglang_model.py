@@ -29,6 +29,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
 
+from sglang_omni.models.moss_tts.payload_types import moss_tts_special_token_defaults
+
 logger = logging.getLogger(__name__)
 
 
@@ -156,16 +158,7 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
             text_pad = int(getattr(config, "pad_token_id", 0) or 0)
             audio_pad = int(getattr(config, "audio_pad_code", audio_vocab_size))
             config.pad_token = [text_pad] + [audio_pad] * (config.channels - 1)
-        for attr, default in (
-            ("audio_start_token_id", 151652),
-            ("audio_end_token_id", 151653),
-            ("audio_assistant_gen_slot_token_id", 151656),
-            ("audio_assistant_delay_slot_token_id", 151662),
-            ("audio_pad_code", audio_vocab_size),
-            ("im_start_token_id", 151644),
-            ("im_end_token_id", 151645),
-            ("pad_token_id", 151643),
-        ):
+        for attr, default in moss_tts_special_token_defaults(audio_vocab_size):
             if getattr(config, attr, None) is None:
                 setattr(config, attr, default)
         config.language_config.channels = config.channels

@@ -109,6 +109,15 @@ class MossTTSModelRunner(ModelRunner):
             return
         embedding = self.model._decode_input_embedding
         weight = embedding.weight
+        if forward_batch.input_ids.numel() < batch_size:
+            raise RuntimeError(
+                "MOSS-TTS decode input_ids must contain one row id per request"
+            )
+        if batch_size > int(weight.shape[0]):
+            raise RuntimeError(
+                "MOSS-TTS decode batch exceeds the staged decode-embedding rows "
+                f"({batch_size} > {int(weight.shape[0])})"
+            )
         rows = []
         for sched_req in requests:
             queue = sched_req.data.pending_feedback_queue
@@ -181,14 +190,10 @@ class MossTTSModelRunner(ModelRunner):
         *,
         n_vq: int,
     ) -> torch.Tensor:
-        """Vectorized MOSS-TTS delay-pattern step over the whole batch.
+        """One batched MOSS-TTS delay-pattern decode step over the whole batch.
 
-        Mirrors one step of the upstream ``MossTTSDelayModel.generate`` loop but
-        as batched tensor ops, so a decode step issues a couple of sampling
-        kernels instead of ``batch * (1 + n_vq)`` Python-level samples (the old
-        per-row/per-codebook loop was ~490 ms/step and dominated RTF). Per-request
-        delay state (audio_length / delayed_length / is_audio) is gathered from
-        the scheduler ``data`` objects and scattered back at the end.
+        A vectorized port of one ``MossTTSDelayModel.generate`` step; per-request
+        delay state is gathered from the ``data`` objects and scattered back.
         """
         cfg = self.model.config
         device = channel_logits[0].device
@@ -202,7 +207,6 @@ class MossTTSModelRunner(ModelRunner):
         im_end = int(cfg.im_end_token_id)
         audio_pad_code = int(cfg.audio_pad_code)
 
-        # --- gather per-request delay state ---
         audio_lengths = torch.tensor(
             [int(d.audio_length) for d in datas], dtype=torch.long, device=device
         )
@@ -251,6 +255,17 @@ class MossTTSModelRunner(ModelRunner):
             dtype=torch.float32,
             device=device,
         )
+        # Batched multinomial shares one RNG, so a per-request seed is only
+        # well-defined for a single stream; bs==1 + seed is reproducible per
+        # position, larger batches fall back to the global (server-seeded) RNG.
+        generator = None
+        seed = getattr(datas[0], "seed", None)
+        if batch_size == 1 and seed is not None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(
+                (int(seed) * 1_000_003 + int(datas[0].generation_steps))
+                & ((1 << 63) - 1)
+            )
 
         # --- text channel ---
         text_logits = channel_logits[0].to(torch.float32)
@@ -305,6 +320,7 @@ class MossTTSModelRunner(ModelRunner):
                 temperature=text_temp[idx],
                 top_p=text_top_p[idx],
                 top_k=text_top_k[idx],
+                generator=generator,
             )
         is_audio = is_audio | (next_text == audio_start)
         is_audio = is_audio & (next_text != im_end)
@@ -336,9 +352,10 @@ class MossTTSModelRunner(ModelRunner):
                 temperature=audio_temp_full[sampling_audio_mask],
                 top_p=audio_top_p_full[sampling_audio_mask],
                 top_k=audio_top_k_full[sampling_audio_mask],
+                generator=generator,
             )
 
-        # --- advance delay state (matches upstream update order) ---
+        # advance delay state (matches upstream update order)
         increment = (
             (next_text == audio_start)
             | (next_text == gen_slot)
@@ -386,16 +403,16 @@ class MossTTSModelRunner(ModelRunner):
         temperature: torch.Tensor | float,
         top_p: torch.Tensor | float,
         top_k: torch.Tensor | int,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Batched temperature / top-k / top-p sampling for ``[N, vocab]`` logits.
 
         ``temperature``/``top_p``/``top_k`` may be scalars or per-row tensors of
         length N; rows sharing the same ``(top_k, top_p)`` are filtered together
         so each request's own parameters are applied (never the first request's).
-        Faithful to upstream ``sample_token``: temperature scaling, then top-k,
-        then top-p, then multinomial. Rows with temperature <= 0 fall back to
-        greedy argmax. ``logits`` is float32 with disallowed tokens masked to
-        ``-inf``.
+        ``generator`` (optional) makes ``multinomial`` reproducible for a fixed
+        seed. Rows with temperature <= 0 fall back to greedy argmax; ``logits``
+        is float32 with disallowed tokens masked to ``-inf``.
         """
         num_rows, vocab = logits.shape
         if num_rows == 0:
@@ -439,10 +456,12 @@ class MossTTSModelRunner(ModelRunner):
         sampled = torch.empty(num_rows, dtype=torch.long, device=logits.device)
         valid = row_sums > 0
         if bool(valid.all()):
-            sampled = torch.multinomial(probs, 1).squeeze(1)
+            sampled = torch.multinomial(probs, 1, generator=generator).squeeze(1)
         else:
             if bool(valid.any()):
-                sampled[valid] = torch.multinomial(probs[valid], 1).squeeze(1)
+                sampled[valid] = torch.multinomial(
+                    probs[valid], 1, generator=generator
+                ).squeeze(1)
             invalid = ~valid
             if bool(invalid.any()):
                 sampled[invalid] = torch.argmax(logits[invalid], dim=-1)
@@ -534,7 +553,9 @@ class MossTTSModelRunner(ModelRunner):
             req_output = outputs[sched_req.request_id]
             if req_output.data is None or int(req_output.data) == eos_id:
                 continue
-            sched_req.data.output_rows.append(rows[row_idx].detach().cpu().clone())
+            # Keep rows on the GPU; apply_sglang_moss_tts_result stacks them and
+            # moves to host once, avoiding a per-request D2H sync each step.
+            sched_req.data.output_rows.append(rows[row_idx].detach().clone())
             sched_req.data.pending_feedback_queue.append(
                 embeds[row_idx].detach().clone()
             )

@@ -7,6 +7,23 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def moss_tts_special_token_defaults(
+    audio_vocab_size: int = 1024,
+) -> tuple[tuple[str, int], ...]:
+    """Default MOSS-TTS special-token ids, shared by model- and processor-side
+    config normalization. ``audio_pad_code`` follows ``audio_vocab_size``."""
+    return (
+        ("audio_start_token_id", 151652),
+        ("audio_end_token_id", 151653),
+        ("audio_assistant_gen_slot_token_id", 151656),
+        ("audio_assistant_delay_slot_token_id", 151662),
+        ("audio_pad_code", int(audio_vocab_size)),
+        ("im_start_token_id", 151644),
+        ("im_end_token_id", 151645),
+        ("pad_token_id", 151643),
+    )
+
+
 @dataclass
 class MossTTSState:
     """Per-request state for MOSS-TTS Delay generation."""

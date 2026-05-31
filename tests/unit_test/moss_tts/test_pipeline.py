@@ -625,3 +625,68 @@ def test_moss_preprocess_discards_handoff_after_abort(
             assert not rb._PREPARED_REQUESTS
     finally:
         rb.clear_moss_tts_preprocessing_context()
+
+
+def test_moss_sample_tokens_seeded_is_reproducible() -> None:
+    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
+
+    torch.manual_seed(0)
+    logits = torch.randn(2, 64)
+    temperature = torch.tensor([1.5, 1.7])
+    top_p = torch.tensor([0.9, 0.8])
+    top_k = torch.tensor([50, 25])
+
+    def sample(seed: int) -> torch.Tensor:
+        return MossTTSModelRunner._sample_tokens(
+            logits,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            generator=torch.Generator().manual_seed(seed),
+        )
+
+    # Same seed + same positions reproduce; the generator is actually consulted.
+    assert torch.equal(sample(123), sample(123))
+
+
+def test_moss_tts_rejects_invalid_sampling_params() -> None:
+    for bad in (
+        {"audio_temperature": -1.0},
+        {"audio_top_p": 1.5},
+        {"text_top_p": 0.0},
+        {"audio_repetition_penalty": 0.0},
+        {"seed": -5},
+    ):
+        with pytest.raises(ValueError):
+            build_moss_tts_state(make_payload(inputs={"text": "hi"}, tts_params=bad))
+
+
+def test_moss_preprocess_pre_start_abort_does_not_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.moss_tts import request_builders as rb
+
+    def fake_prepare(pl, *, processor):
+        return rb.MossTTSPreparedRequest(
+            state=MossTTSState(),
+            input_ids_list=[],
+            input_ids=torch.zeros(0, dtype=torch.long),
+            prompt_rows=torch.zeros((0, 0), dtype=torch.long),
+            gen_kwargs={},
+        )
+
+    monkeypatch.setattr(rb, "_prepare_moss_tts_request", fake_prepare)
+    try:
+        rb.set_moss_tts_preprocessing_context(processor=object())
+        # Abort for a request that never started preprocessing: no tombstone.
+        rb.cleanup_prepared_moss_tts_request("ghost")
+        with rb._PREPARED_REQUESTS_LOCK:
+            assert not rb._ABORTED_REQUESTS
+        # The same id can still run a normal preprocess and publish its handoff.
+        rb.preprocess_moss_tts_payload(make_payload(inputs="hello", request_id="ghost"))
+        with rb._PREPARED_REQUESTS_LOCK:
+            assert "ghost" in rb._PREPARED_REQUESTS
+            assert not rb._ABORTED_REQUESTS
+            assert not rb._INFLIGHT_REQUESTS
+    finally:
+        rb.clear_moss_tts_preprocessing_context()

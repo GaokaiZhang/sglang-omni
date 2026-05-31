@@ -12,7 +12,10 @@ from typing import Any
 import torch
 
 from sglang_omni.models.moss_tts.codec import split_moss_audio_segments
-from sglang_omni.models.moss_tts.payload_types import MossTTSState
+from sglang_omni.models.moss_tts.payload_types import (
+    MossTTSState,
+    moss_tts_special_token_defaults,
+)
 from sglang_omni.models.moss_tts.request_builders import (
     cleanup_prepared_moss_tts_request,
     make_moss_tts_scheduler_adapters,
@@ -55,20 +58,10 @@ def _torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
 
 @contextmanager
 def _moss_transformers_processor_compat():
-    """Temporarily patch Transformers API drifts only while loading the MOSS
-    processor, restoring the globals afterwards.
-
-    All three drifts are load-time only (they are consulted by
-    ``ProcessorMixin.from_pretrained`` / the remote config code, not at runtime):
-    - the remote config references the renamed ``PreTrainedConfig``;
-    - ``MODALITY_TO_BASE_CLASS_MAPPING`` / the ``AutoModel`` entry must exist for
-      the optional audio-tokenizer branch;
-    - Transformers 4.57's ``ProcessorMixin`` rejects the AutoModel-loaded
-      MOSS-Audio-Tokenizer unless ``PreTrainedAudioTokenizerBase`` accepts a
-      plain ``PreTrainedModel``.
-    Leaking these into the global namespace can mask drift in unrelated models,
-    so they are scoped and reverted here.
-    """
+    """Scope load-time Transformers API-drift patches to the MOSS processor load
+    (renamed PreTrainedConfig, the audio-tokenizer modality mapping, and
+    PreTrainedAudioTokenizerBase), restoring the globals afterwards so they don't
+    leak into unrelated models."""
     import transformers.configuration_utils as configuration_utils
     from transformers import PreTrainedModel, processing_utils
 
@@ -141,16 +134,8 @@ def _normalize_moss_processor_config(processor: Any) -> None:
     model_config = getattr(processor, "model_config", None)
     if model_config is None:
         return
-    for attr, default in (
-        ("audio_start_token_id", 151652),
-        ("audio_end_token_id", 151653),
-        ("audio_assistant_gen_slot_token_id", 151656),
-        ("audio_assistant_delay_slot_token_id", 151662),
-        ("audio_pad_code", 1024),
-        ("im_start_token_id", 151644),
-        ("im_end_token_id", 151645),
-        ("pad_token_id", 151643),
-    ):
+    audio_vocab_size = int(getattr(model_config, "audio_vocab_size", 1024) or 1024)
+    for attr, default in moss_tts_special_token_defaults(audio_vocab_size):
         if getattr(model_config, attr, None) is None:
             setattr(model_config, attr, default)
 
@@ -170,8 +155,6 @@ def _load_moss_processor(
                 checkpoint_dir,
                 trust_remote_code=True,
             )
-    except ImportError as exc:
-        raise RuntimeError(_MOSS_TTS_INSTALL_HINT) from exc
     except Exception as exc:
         raise RuntimeError(_MOSS_TTS_INSTALL_HINT) from exc
 
