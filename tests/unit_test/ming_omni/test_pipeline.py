@@ -181,8 +181,8 @@ def test_ming_talker_factory_returns_scheduler_contract(monkeypatch) -> None:
     )
 
     weight_loader_module = ModuleType("sglang_omni.models.weight_loader")
-    weight_loader_module.resolve_model_path = (
-        lambda model_path: f"/resolved/{model_path}"
+    weight_loader_module.resolve_model_path = lambda model_path: (
+        f"/resolved/{model_path}"
     )
     monkeypatch.setitem(
         sys.modules,
@@ -756,14 +756,14 @@ def test_ming_merge_extracts_video_embeds_into_thinker_inputs() -> None:
     """
     import torch
 
-    from sglang_omni.models.ming_omni.io import PipelineState
+    from sglang_omni.models.ming_omni.io import MingOmniPipelineState
     from sglang_omni.models.ming_omni.pipeline.merge import build_thinker_inputs
     from sglang_omni.models.ming_omni.pipeline.next_stage import (
         AUDIO_STAGE,
         IMAGE_STAGE,
     )
 
-    state = PipelineState(
+    state = MingOmniPipelineState(
         raw_inputs={},
         prompt={
             "input_ids": torch.zeros((1, 1), dtype=torch.long),
