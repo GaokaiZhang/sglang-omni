@@ -84,6 +84,9 @@ Accuracy (accuracy.wer)
 Note: the Higgs TTS EN raw corpus WER includes 2 samples above 50% WER; the
 outlier-excluded corpus WER is 1.36%.
 
+Note: the MOSS-TTS EN raw corpus WER includes 5 samples above 50% WER; the
+outlier-excluded corpus WER is 1.54%.
+
 | Model  | Config           | wer_corpus | wer_per_sample_mean | wer_per_sample_median | wer_per_sample_std | evaluated | skipped | Source                         |
 | ------ | ---------------- | ---------- | ------------------- | --------------------- | ------------------ | --------- | ------- | ------------------------------ |
 | S2-Pro | EN, stream=False | 1.07%      | 1.03%               | 0.00%                 | 3.6%               | 1088/1088 | 0       | PR #411 [H200, full-set, c=16] |
@@ -100,6 +103,7 @@ outlier-excluded corpus WER is 1.36%.
 | S2-Pro | ZH, stream=True  | 0.90%      | 0.86%               | 0.00%                 | 2.1%               | 2020/2020 | 0       | PR #411 [H100, full-set, c=16] |
 | Higgs TTS | EN, stream=False | 4.68%   | 4.16%               | 0.00%                 | 91.2%              | 1088/1088 | 0       | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
 | Higgs TTS | ZH, stream=False | 1.14%   | 1.08%               | 0.00%                 | 2.7%               | 2020/2020 | 0       | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
+| MOSS-TTS | EN, stream=False | 1.93%   | 1.98%               | 0.00%                 | 8.1%               | 1088/1088 | 0       | PR #609 [H100, full-set, c=16, token-count=auto] |
 
 Generation speed (generation.speed)
 
@@ -119,6 +123,7 @@ Generation speed (generation.speed)
 | S2-Pro | ZH, stream=True  | 11.417         | 15.020        | 2.141    | 1.398          | 65.5                           | PR #411 [H100, V1-pipeline, full-set, c=16] |
 | Higgs TTS | EN, stream=False | 1.749       | 2.600         | 0.425    | 9.104          | 112.9                          | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
 | Higgs TTS | ZH, stream=False | 1.629       | 2.110         | 0.282    | 9.792          | 109.9                          | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
+| MOSS-TTS | EN, stream=False | 3.890       | 4.781         | 0.913    | 4.091          | 54.1                           | PR #609 [H100, full-set, c=16, token-count=auto] |
 """
 
 from __future__ import annotations
