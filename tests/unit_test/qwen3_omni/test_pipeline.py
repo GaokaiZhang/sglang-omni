@@ -15,14 +15,20 @@ from sglang_omni.cli.serve import (
     apply_mem_fraction_cli_overrides,
     apply_parallelism_cli_overrides,
 )
-from sglang_omni.config import PipelineConfig, StageConfig, resolve_stage_factory_args
+from sglang_omni.config import (
+    PipelineConfig,
+    StageConfig,
+    build_process_topology_plan,
+    build_stage_placement_plan,
+    resolve_stage_factory_args,
+)
 from sglang_omni.models.qwen3_omni.config import (
     Qwen3OmniPipelineConfig,
     Qwen3OmniSpeechColocatedPipelineConfig,
     Qwen3OmniSpeechPipelineConfig,
 )
 from sglang_omni.models.qwen3_omni.merge import decode_events, merge_for_thinker
-from sglang_omni.models.qwen3_omni.payload_types import PipelineState
+from sglang_omni.models.qwen3_omni.payload_types import Qwen3OmniPipelineState
 from sglang_omni.models.qwen3_omni.request_builders import (
     build_sglang_thinker_request,
     project_preprocessing_to_mm_aggregate,
@@ -57,7 +63,7 @@ def _runtime_mem_fraction_static(config, name: str) -> float | None:
 
 
 def test_qwen_pipeline_config_and_state_contracts() -> None:
-    """Preserves Qwen text/speech topology and PipelineState coercion behavior."""
+    """Preserves Qwen text/speech topology and Qwen3OmniPipelineState coercion behavior."""
     text_config = Qwen3OmniPipelineConfig(model_path="model")
     speech_config = Qwen3OmniSpeechPipelineConfig(model_path="model")
     colocated_config = Qwen3OmniSpeechColocatedPipelineConfig(model_path="model")
@@ -136,7 +142,7 @@ def test_qwen_pipeline_config_and_state_contracts() -> None:
     assert text_aggregate.next == "thinker"
     assert _stage(text_config, "thinker").next == "decode"
 
-    state = PipelineState.from_dict(
+    state = Qwen3OmniPipelineState.from_dict(
         {
             "prompt": {"input_ids": torch.tensor([1, 2]), "prompt_text": "hi"},
             "mm_inputs": "bad",
@@ -180,7 +186,7 @@ def test_qwen_thinker_to_decode_projection_drops_multimodal_tensors() -> None:
     )
 
     projected = project_thinker_to_decode(payload)
-    state = PipelineState.from_dict(projected.data)
+    state = Qwen3OmniPipelineState.from_dict(projected.data)
 
     assert state.thinker_inputs == {}
     assert state.thinker_out["output_ids"] == [3]
@@ -385,7 +391,7 @@ def test_qwen_aggregate_projection_marks_uncached_active_encoder_inputs() -> Non
     )
 
     projected = project_preprocessing_to_mm_aggregate(make_qwen_payload(state))
-    projected_state = PipelineState.from_dict(projected.data)
+    projected_state = Qwen3OmniPipelineState.from_dict(projected.data)
 
     assert projected_state.encoder_inputs == {
         "audio_encoder": {"_active": True},
@@ -845,6 +851,32 @@ def test_qwen_cli_thinker_tp_override_keeps_parallelism_alias_in_sync() -> None:
     assert thinker.gpu == [0, 1]
 
 
+def test_qwen_text_thinker_tp_builds_topology_without_memory_fractions() -> None:
+    config = Qwen3OmniPipelineConfig(model_path="dummy")
+
+    apply_mem_fraction_cli_overrides(
+        config,
+        mem_fraction_static=0.82,
+        thinker_mem_fraction_static=None,
+        talker_mem_fraction_static=None,
+    )
+    apply_parallelism_cli_overrides(
+        config,
+        thinker_tp_size=2,
+        thinker_gpus="0,1",
+        talker_gpu=None,
+        code2wav_gpu=None,
+    )
+
+    placement = build_stage_placement_plan(config)
+    build_process_topology_plan(config, placement)
+
+    thinker = _stage(config, "thinker")
+    assert thinker.tp_size == 2
+    assert thinker.gpu == [0, 1]
+    assert _stage(config, "thinker").runtime.resources.total_gpu_memory_fraction is None
+
+
 def test_qwen_thinker_auto_path_applies_encoder_reserve() -> None:
     server_args = SimpleNamespace(mem_fraction_static=0.929)
 
@@ -916,17 +948,17 @@ def test_qwen_mm_aggregate_keeps_lightweight_inputs_and_prunes_after_merge() -> 
     )
 
     projected = project_preprocessing_to_mm_aggregate(make_qwen_payload(state))
-    projected_state = PipelineState.from_dict(projected.data)
+    projected_state = Qwen3OmniPipelineState.from_dict(projected.data)
     assert "pixel_values" not in projected_state.mm_inputs["image"]
     assert projected_state.encoder_inputs == {
         "image_encoder": {"cache_key": "image-cache", "_active": True},
         "audio_encoder": {"cache_key": "audio-cache", "_active": True},
     }
 
-    image_state = PipelineState(
+    image_state = Qwen3OmniPipelineState(
         encoder_outs={"image_encoder": {"image_embeds": torch.ones((2, 2))}}
     )
-    audio_state = PipelineState(
+    audio_state = Qwen3OmniPipelineState(
         encoder_outs={
             "audio_encoder": {
                 "audio_embeds": torch.ones((2, 2)),
@@ -941,7 +973,7 @@ def test_qwen_mm_aggregate_keeps_lightweight_inputs_and_prunes_after_merge() -> 
             "audio_encoder": make_qwen_payload(audio_state),
         }
     )
-    merged_state = PipelineState.from_dict(merged.data)
+    merged_state = Qwen3OmniPipelineState.from_dict(merged.data)
     assert merged_state.encoder_inputs == {}
     assert merged_state.encoder_outs == {}
     assert "image_embeds" in merged_state.thinker_inputs["model_inputs"]
@@ -957,7 +989,7 @@ def test_qwen_mm_aggregate_keeps_lightweight_inputs_and_prunes_after_merge() -> 
 
 def test_qwen_thinker_request_and_decode_contracts() -> None:
     """Preserves incremental text deltas, replacement-char suppression, and final text."""
-    stream_state = PipelineState()
+    stream_state = Qwen3OmniPipelineState()
     tokenizer = FakeQwenTokenizer(pieces={1: "A", 2: "\ufffd", 3: "B"})
     first = list(
         decode_events(
