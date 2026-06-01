@@ -360,6 +360,65 @@ def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
     assert data.audio_length == 2
 
 
+def test_moss_prefill_forward_uses_prompt_row_embeds() -> None:
+    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
+
+    class FakeAttnBackend:
+        def __init__(self) -> None:
+            self.called = False
+
+        def init_forward_metadata(self, forward_batch) -> None:
+            del forward_batch
+            self.called = True
+
+    class FakeModel:
+        dtype = torch.float32
+        hidden_size = 2
+
+        def __init__(self) -> None:
+            self.call_kwargs = None
+
+        def _prepare_multi_modal_inputs(self, rows):
+            return rows.to(torch.float32)[:, :2]
+
+        def __call__(self, **kwargs):
+            self.call_kwargs = kwargs
+            return SimpleNamespace(hidden_states=kwargs["input_embeds"])
+
+    attn_backend = FakeAttnBackend()
+    model = FakeModel()
+    runner = MossTTSModelRunner.__new__(MossTTSModelRunner)
+    runner.model = model
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(attn_backend=attn_backend)
+    )
+    prompt_rows = torch.tensor(
+        [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+        dtype=torch.long,
+    )
+    sched_req = SimpleNamespace(
+        data=SimpleNamespace(
+            req=SimpleNamespace(extend_input_len=2, prefix_indices=[0]),
+            prompt_rows=prompt_rows,
+        )
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=torch.tensor([123456, 123457], dtype=torch.long),
+        positions=torch.arange(2),
+        mrope_positions=None,
+    )
+
+    result = runner.custom_prefill_forward(forward_batch, object(), [sched_req])
+
+    assert attn_backend.called
+    assert result.can_run_cuda_graph is False
+    assert torch.equal(
+        model.call_kwargs["input_embeds"],
+        torch.tensor([[4.0, 5.0], [7.0, 8.0]]),
+    )
+    assert torch.equal(model.call_kwargs["input_ids"], forward_batch.input_ids)
+
+
 def test_moss_decode_feedback_uses_row_id_embedding() -> None:
     from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
 
@@ -594,9 +653,10 @@ def test_moss_sample_tokens_uses_per_row_top_k() -> None:
     assert row1_vals <= {0, 1, 2, 3}  # never the -inf-masked token
 
 
-def test_moss_tts_rejects_nonpositive_token_count() -> None:
-    with pytest.raises(ValueError):
-        build_moss_tts_state(make_payload(inputs={"text": "${token:0}hi"}))
+def test_moss_tts_rejects_invalid_token_count() -> None:
+    for bad_text in ("${token:0}hi", "${token:-1}hi", "${token:abc}hi"):
+        with pytest.raises(ValueError):
+            build_moss_tts_state(make_payload(inputs={"text": bad_text}))
     with pytest.raises(ValueError):
         build_moss_tts_state(
             make_payload(inputs={"text": "hi"}, tts_params={"token_count": 0})

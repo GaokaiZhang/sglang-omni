@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 from sglang.srt.layers.sampler import multinomial_with_seed
+from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.request_builders import _INF_DELAY
@@ -24,20 +25,17 @@ class MossTTSModelRunner(ModelRunner):
         self._pending_rows: torch.Tensor | None = None
         self._pending_embeds: torch.Tensor | None = None
 
-    def prepare_prefill(
+    def custom_prefill_forward(
         self,
         forward_batch: Any,
         schedule_batch: Any,
         requests: list,
-    ) -> None:
+    ) -> GenerationBatchResult:
         del schedule_batch
-        forward_batch.input_embeds = self._build_prefill_input_embeds(
-            forward_batch,
-            requests,
-        )
-        return None
+        input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
+        return self._forward_with_input_embeds(forward_batch, input_embeds)
 
-    def prepare_decode(
+    def before_decode(
         self,
         forward_batch: Any,
         schedule_batch: Any,
@@ -48,7 +46,6 @@ class MossTTSModelRunner(ModelRunner):
         del is_lookahead
         del schedule_batch
         self._write_decode_input_embedding(forward_batch, requests)
-        return None
 
     def post_prefill(
         self,
@@ -98,6 +95,32 @@ class MossTTSModelRunner(ModelRunner):
         return torch.cat(pieces, dim=0).to(
             device=forward_batch.input_ids.device,
             dtype=self.model.dtype,
+        )
+
+    def _forward_with_input_embeds(
+        self,
+        forward_batch: Any,
+        input_embeds: torch.Tensor,
+    ) -> GenerationBatchResult:
+        model_runner = self.tp_worker.model_runner
+        model_runner.attn_backend.init_forward_metadata(forward_batch)
+
+        positions = forward_batch.positions
+        if forward_batch.mrope_positions is not None:
+            positions = forward_batch.mrope_positions
+        logits_output = self.model(
+            input_ids=forward_batch.input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds.to(
+                device=forward_batch.input_ids.device,
+                dtype=self.model.dtype,
+            ),
+            input_embeds_are_projected=True,
+        )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            can_run_cuda_graph=False,
         )
 
     def _write_decode_input_embedding(
@@ -184,6 +207,29 @@ class MossTTSModelRunner(ModelRunner):
             return self.model.compute_channel_logits(hidden_states, forward_batch)
         raise RuntimeError("MOSS-TTS model output did not include channel logits")
 
+    @staticmethod
+    def _delay_state_tensor(data: Any, device: torch.device) -> torch.Tensor:
+        state = getattr(data, "delay_state", None)
+        if isinstance(state, torch.Tensor) and tuple(state.shape) == (3,):
+            state = state.to(device=device, dtype=torch.long)
+        else:
+            delayed = (
+                _INT64_MAX
+                if int(getattr(data, "delayed_length", _INF_DELAY)) == _INF_DELAY
+                else int(getattr(data, "delayed_length"))
+            )
+            state = torch.tensor(
+                [
+                    int(getattr(data, "audio_length", 0)),
+                    delayed,
+                    int(bool(getattr(data, "is_audio", False))),
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+        data.delay_state = state
+        return state
+
     def _sample_rows(
         self,
         channel_logits: list[torch.Tensor],
@@ -208,24 +254,12 @@ class MossTTSModelRunner(ModelRunner):
         im_end = int(cfg.im_end_token_id)
         audio_pad_code = int(cfg.audio_pad_code)
 
-        audio_lengths = torch.tensor(
-            [int(d.audio_length) for d in datas], dtype=torch.long, device=device
+        delay_state = torch.stack(
+            [self._delay_state_tensor(d, device) for d in datas], dim=0
         )
-        delayed = torch.tensor(
-            [
-                (
-                    _INT64_MAX
-                    if int(d.delayed_length) == _INF_DELAY
-                    else int(d.delayed_length)
-                )
-                for d in datas
-            ],
-            dtype=torch.long,
-            device=device,
-        )
-        is_audio = torch.tensor(
-            [bool(d.is_audio) for d in datas], dtype=torch.bool, device=device
-        )
+        audio_lengths = delay_state[:, 0]
+        delayed = delay_state[:, 1]
+        is_audio = delay_state[:, 2].bool()
         gen_steps = torch.tensor(
             [int(d.generation_steps) for d in datas], dtype=torch.long, device=device
         )
@@ -256,10 +290,6 @@ class MossTTSModelRunner(ModelRunner):
             dtype=torch.float32,
             device=device,
         )
-        # Per-request sampling seeds. multinomial_with_seed combines each row's
-        # seed with a per-(step, channel) position, so a sampled token depends
-        # only on its own seed and position -- reproducible at any batch size and
-        # never perturbed by batch neighbours.
         sampling_seeds = torch.tensor(
             [int(d.sampling_seed) for d in datas], dtype=torch.long, device=device
         )
@@ -275,7 +305,6 @@ class MossTTSModelRunner(ModelRunner):
         is_audio_eos = delayed == n_vq
         next_text[is_audio_eos] = audio_end
         is_audio = is_audio & ~is_audio_eos
-        # delayed == INF (> n_vq) is the only state where the text head is sampled.
         sampling_text_mask = delayed > n_vq
 
         not_audio = ~is_audio
@@ -336,17 +365,12 @@ class MossTTSModelRunner(ModelRunner):
                 [cl.to(torch.float32) for cl in channel_logits[1:]], dim=1
             )  # [batch, n_vq, vocab_audio]
             if 0 <= audio_pad_code < audio_logits.shape[-1]:
-                # Mask the pad code and any vocab padding columns beyond it so
-                # out-of-range codes can never be sampled.
                 audio_logits[..., audio_pad_code:] = _NEG_INF
             if bool((audio_rep != 1.0).any()):
                 self._apply_audio_repetition_penalty(audio_logits, datas, n_vq=n_vq)
             audio_temp_full = audio_temp.unsqueeze(1).expand(batch_size, n_vq)
             audio_top_p_full = audio_top_p.unsqueeze(1).expand(batch_size, n_vq)
             audio_top_k_full = audio_top_k.unsqueeze(1).expand(batch_size, n_vq)
-            # nonzero() and boolean-mask indexing share row-major order, so the
-            # (row, channel) pairs here align with audio_logits[mask]. Channel c
-            # maps to position offset c + 1 (text channel takes offset 0).
             mask_idx = sampling_audio_mask.nonzero(as_tuple=False)
             audio_rows = mask_idx[:, 0]
             audio_chans = mask_idx[:, 1]
@@ -359,7 +383,6 @@ class MossTTSModelRunner(ModelRunner):
                 positions=gen_steps[audio_rows] * num_channels + (audio_chans + 1),
             )
 
-        # advance delay state (matches upstream update order)
         increment = (
             (next_text == audio_start)
             | (next_text == gen_slot)
@@ -372,14 +395,16 @@ class MossTTSModelRunner(ModelRunner):
         delayed[not_inf] = delayed[not_inf] + 1
         delayed[delayed > n_vq] = _INT64_MAX
 
-        state = torch.stack((audio_lengths, delayed, is_audio.long()), dim=0).tolist()
-        audio_lengths_l, delayed_l, is_audio_l = state[0], state[1], state[2]
+        next_state = torch.stack((audio_lengths, delayed, is_audio.long()), dim=1)
         for i, data in enumerate(datas):
-            data.audio_length = int(audio_lengths_l[i])
-            data.delayed_length = (
-                _INF_DELAY if delayed_l[i] == _INT64_MAX else int(delayed_l[i])
-            )
-            data.is_audio = bool(is_audio_l[i])
+            data.delay_state = next_state[i].detach()
+            if device.type == "cpu":
+                data.audio_length = int(next_state[i, 0])
+                delayed_i = int(next_state[i, 1])
+                data.delayed_length = (
+                    _INF_DELAY if delayed_i == _INT64_MAX else delayed_i
+                )
+                data.is_audio = bool(int(next_state[i, 2]))
 
         rows = torch.empty((batch_size, n_vq + 1), dtype=torch.long, device=device)
         rows[:, 0] = next_text
@@ -463,8 +488,11 @@ class MossTTSModelRunner(ModelRunner):
         if not bool(active.any()):
             return scores
         k_clamped = top_k_row.clamp(min=1, max=vocab)
-        sorted_scores, _ = torch.sort(scores, descending=True, dim=-1)
-        kth = sorted_scores.gather(1, (k_clamped - 1).unsqueeze(1))
+        max_top_k = int(k_clamped[active].max().item())
+        topk_scores, _ = torch.topk(scores, k=max_top_k, dim=-1)
+        gather_k = torch.where(active, k_clamped, torch.ones_like(k_clamped))
+        gather_k = gather_k.clamp(min=1, max=max_top_k)
+        kth = topk_scores.gather(1, (gather_k - 1).unsqueeze(1))
         threshold = torch.where(
             active.unsqueeze(1), kth, torch.full_like(kth, _NEG_INF)
         )
@@ -549,8 +577,6 @@ class MossTTSModelRunner(ModelRunner):
             req_output = outputs[sched_req.request_id]
             if req_output.data is None or int(req_output.data) == eos_id:
                 continue
-            # Keep rows on the GPU; apply_sglang_moss_tts_result stacks them and
-            # moves to host once, avoiding a per-request D2H sync each step.
             sched_req.data.output_rows.append(rows[row_idx].detach().clone())
             sched_req.data.pending_feedback_queue.append(
                 embeds[row_idx].detach().clone()

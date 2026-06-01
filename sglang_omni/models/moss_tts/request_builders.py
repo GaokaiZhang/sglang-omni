@@ -23,6 +23,7 @@ from sglang_omni.scheduling.types import ARRequestData
 MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
 _MOSS_TTS_PREPARED_MARKER = "_moss_tts_prepared_request"
 _TOKEN_PREFIX_RE = re.compile(r"^\$\{token:(\d+)\}")
+_TOKEN_PREFIX_START_RE = re.compile(r"^\$\{token:")
 _DATA_URI_RE = re.compile(r"^data:audio/[^;,]+;base64,(?P<data>.+)$", re.DOTALL)
 _INF_DELAY = -1
 _MOSS_TTS_SAMPLING_SEED_MASK = 0x7FFFFFFF
@@ -90,6 +91,7 @@ class MossTTSSGLangRequestData(ARRequestData):
     audio_repetition_penalty: float = 1.0
     seed: int | None = None
     sampling_seed: int = field(default_factory=_new_moss_tts_sampling_seed)
+    delay_state: torch.Tensor | None = None
     audio_length: int = 0
     delayed_length: int = _INF_DELAY
     is_audio: bool = False
@@ -243,6 +245,8 @@ def _resolve_token_count(
         if count <= 0:
             raise ValueError("MOSS-TTS ${token:N} count must be > 0")
         return text[match.end() :].lstrip(), count
+    if _TOKEN_PREFIX_START_RE.match(text):
+        raise ValueError("MOSS-TTS ${token:N} count must be a positive integer")
     return text, None
 
 
