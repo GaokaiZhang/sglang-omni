@@ -29,3 +29,15 @@ def test_qwen3_asr_stage_default_allows_32_running_requests() -> None:
     signature = inspect.signature(create_sglang_qwen3_asr_executor)
 
     assert signature.parameters["max_running_requests"].default == 32
+
+
+def test_qwen3_asr_stage_default_uses_auto_static_kv_budget() -> None:
+    signature = inspect.signature(create_sglang_qwen3_asr_executor)
+
+    assert signature.parameters["mem_fraction_static"].default is None
+
+
+def test_qwen3_asr_stage_default_disables_multimodal_embedding_cache() -> None:
+    signature = inspect.signature(create_sglang_qwen3_asr_executor)
+
+    assert signature.parameters["mm_embedding_cache_size_bytes"].default == 0

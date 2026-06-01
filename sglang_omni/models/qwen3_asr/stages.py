@@ -13,9 +13,12 @@ def create_sglang_qwen3_asr_executor(
     dtype: str = "float16",
     max_running_requests: int = 32,
     max_new_tokens: int = 256,
-    # 0.6B/1.7B are tiny; a large static KV-cache pool wastes VRAM and OOMs
-    # under load. 0.3 leaves ample headroom on an H200.
-    mem_fraction_static: float = 0.3,
+    # Leave unset by default so SGLang/Omni auto-tunes the static KV/radix
+    # memory budget from GPU size, chunked prefill, and CUDA graph settings.
+    mem_fraction_static: float | None = None,
+    # SeedTTS WER inputs are unique audio clips, so caching audio embeddings on
+    # GPU has essentially no reuse and only retains runtime memory.
+    mm_embedding_cache_size_bytes: int = 0,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     from transformers import AutoProcessor
@@ -99,10 +102,11 @@ def create_sglang_qwen3_asr_executor(
 
     # general_mm_embed_routine reads a module-global multimodal embedding cache
     # that upstream sglang inits in its own model runner; the omni runner does
-    # not, so initialize it here.
+    # not, so initialize it explicitly. Keep it disabled by default for ASR
+    # because benchmark audio requests are not reused.
     from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 
-    init_mm_embedding_cache(256 * 1024 * 1024)
+    init_mm_embedding_cache(mm_embedding_cache_size_bytes)
 
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,
