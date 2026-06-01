@@ -314,6 +314,7 @@ def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
         delayed_length=_INF_DELAY,
         is_audio=False,
         generation_steps=0,
+        sampling_seed=0,
         text_temperature=0.0,
         text_top_p=1.0,
         text_top_k=-1,
@@ -577,9 +578,13 @@ def test_moss_sample_tokens_uses_per_row_top_k() -> None:
     row0_vals: set[int] = set()
     row1_vals: set[int] = set()
     for seed in range(64):
-        torch.manual_seed(seed)
         out = MossTTSModelRunner._sample_tokens(
-            logits, temperature=temperature, top_p=top_p, top_k=top_k
+            logits,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seeds=torch.tensor([seed, seed], dtype=torch.long),
+            positions=torch.zeros(2, dtype=torch.long),
         )
         row0_vals.add(int(out[0]))
         row1_vals.add(int(out[1]))
@@ -596,6 +601,23 @@ def test_moss_tts_rejects_nonpositive_token_count() -> None:
         build_moss_tts_state(
             make_payload(inputs={"text": "hi"}, tts_params={"token_count": 0})
         )
+
+
+def test_moss_tts_rejects_nonpositive_max_new_tokens() -> None:
+    # An explicit max_new_tokens must be validated, not silently replaced by the
+    # default: 0 and negatives are rejected (0 previously fell through ``or``).
+    for bad in (0, -1, -100):
+        with pytest.raises(ValueError):
+            build_moss_tts_state(
+                make_payload(inputs={"text": "hi"}, params={"max_new_tokens": bad})
+            )
+
+
+def test_moss_tts_explicit_max_new_tokens_is_preserved() -> None:
+    state = build_moss_tts_state(
+        make_payload(inputs={"text": "hi"}, params={"max_new_tokens": 128})
+    )
+    assert state.generation_kwargs["max_new_tokens"] == 128
 
 
 def test_moss_preprocess_discards_handoff_after_abort(
@@ -636,17 +658,29 @@ def test_moss_sample_tokens_seeded_is_reproducible() -> None:
     top_p = torch.tensor([0.9, 0.8])
     top_k = torch.tensor([50, 25])
 
-    def sample(seed: int) -> torch.Tensor:
+    def sample(seeds: list[int], positions: list[int]) -> torch.Tensor:
         return MossTTSModelRunner._sample_tokens(
             logits,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
-            generator=torch.Generator().manual_seed(seed),
+            seeds=torch.tensor(seeds, dtype=torch.long),
+            positions=torch.tensor(positions, dtype=torch.long),
         )
 
-    # Same seed + same positions reproduce; the generator is actually consulted.
-    assert torch.equal(sample(123), sample(123))
+    # Reproducible: same per-row seeds + positions give identical output.
+    assert torch.equal(sample([11, 22], [5, 5]), sample([11, 22], [5, 5]))
+
+    # Neighbour-independence: a row's token depends only on its own seed and
+    # position, never on its batch neighbours. Changing the *other* row's seed
+    # must leave this row's sampled token unchanged.
+    baseline = sample([11, 22], [5, 5])
+    assert int(sample([11, 999], [5, 5])[0]) == int(baseline[0])
+    assert int(sample([777, 22], [5, 5])[1]) == int(baseline[1])
+
+    # Position is part of the sampling key: varying it changes some draws.
+    outs = {tuple(sample([11, 22], [p, p]).tolist()) for p in range(8)}
+    assert len(outs) > 1
 
 
 def test_moss_tts_rejects_invalid_sampling_params() -> None:

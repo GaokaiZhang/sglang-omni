@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from sglang.srt.layers.sampler import multinomial_with_seed
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.request_builders import _INF_DELAY
@@ -255,19 +256,15 @@ class MossTTSModelRunner(ModelRunner):
             dtype=torch.float32,
             device=device,
         )
-        # Batched multinomial shares one RNG, so a per-request seed is only
-        # well-defined for a single stream; bs==1 + seed is reproducible per
-        # position, larger batches fall back to the global (server-seeded) RNG.
-        generator = None
-        seed = getattr(datas[0], "seed", None)
-        if batch_size == 1 and seed is not None:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(
-                (int(seed) * 1_000_003 + int(datas[0].generation_steps))
-                & ((1 << 63) - 1)
-            )
+        # Per-request sampling seeds. multinomial_with_seed combines each row's
+        # seed with a per-(step, channel) position, so a sampled token depends
+        # only on its own seed and position -- reproducible at any batch size and
+        # never perturbed by batch neighbours.
+        sampling_seeds = torch.tensor(
+            [int(d.sampling_seed) for d in datas], dtype=torch.long, device=device
+        )
+        num_channels = n_vq + 1
 
-        # --- text channel ---
         text_logits = channel_logits[0].to(torch.float32)
         vocab = text_logits.shape[-1]
 
@@ -320,12 +317,12 @@ class MossTTSModelRunner(ModelRunner):
                 temperature=text_temp[idx],
                 top_p=text_top_p[idx],
                 top_k=text_top_k[idx],
-                generator=generator,
+                seeds=sampling_seeds[idx],
+                positions=gen_steps[idx] * num_channels,
             )
         is_audio = is_audio | (next_text == audio_start)
         is_audio = is_audio & (next_text != im_end)
 
-        # --- audio channels ---
         next_audio = torch.full(
             (batch_size, n_vq), audio_pad_code, dtype=torch.long, device=device
         )
@@ -347,12 +344,19 @@ class MossTTSModelRunner(ModelRunner):
             audio_temp_full = audio_temp.unsqueeze(1).expand(batch_size, n_vq)
             audio_top_p_full = audio_top_p.unsqueeze(1).expand(batch_size, n_vq)
             audio_top_k_full = audio_top_k.unsqueeze(1).expand(batch_size, n_vq)
+            # nonzero() and boolean-mask indexing share row-major order, so the
+            # (row, channel) pairs here align with audio_logits[mask]. Channel c
+            # maps to position offset c + 1 (text channel takes offset 0).
+            mask_idx = sampling_audio_mask.nonzero(as_tuple=False)
+            audio_rows = mask_idx[:, 0]
+            audio_chans = mask_idx[:, 1]
             next_audio[sampling_audio_mask] = self._sample_tokens(
                 audio_logits[sampling_audio_mask],
                 temperature=audio_temp_full[sampling_audio_mask],
                 top_p=audio_top_p_full[sampling_audio_mask],
                 top_k=audio_top_k_full[sampling_audio_mask],
-                generator=generator,
+                seeds=sampling_seeds[audio_rows],
+                positions=gen_steps[audio_rows] * num_channels + (audio_chans + 1),
             )
 
         # advance delay state (matches upstream update order)
@@ -368,10 +372,8 @@ class MossTTSModelRunner(ModelRunner):
         delayed[not_inf] = delayed[not_inf] + 1
         delayed[delayed > n_vq] = _INT64_MAX
 
-        # --- scatter state back to per-request data ---
-        audio_lengths_l = audio_lengths.tolist()
-        delayed_l = delayed.tolist()
-        is_audio_l = is_audio.tolist()
+        state = torch.stack((audio_lengths, delayed, is_audio.long()), dim=0).tolist()
+        audio_lengths_l, delayed_l, is_audio_l = state[0], state[1], state[2]
         for i, data in enumerate(datas):
             data.audio_length = int(audio_lengths_l[i])
             data.delayed_length = (
@@ -403,18 +405,21 @@ class MossTTSModelRunner(ModelRunner):
         temperature: torch.Tensor | float,
         top_p: torch.Tensor | float,
         top_k: torch.Tensor | int,
-        generator: torch.Generator | None = None,
+        seeds: torch.Tensor,
+        positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Batched temperature / top-k / top-p sampling for ``[N, vocab]`` logits.
+        """Per-row temperature / top-k / top-p sampling for ``[N, vocab]`` logits.
 
         ``temperature``/``top_p``/``top_k`` may be scalars or per-row tensors of
-        length N; rows sharing the same ``(top_k, top_p)`` are filtered together
-        so each request's own parameters are applied (never the first request's).
-        ``generator`` (optional) makes ``multinomial`` reproducible for a fixed
-        seed. Rows with temperature <= 0 fall back to greedy argmax; ``logits``
-        is float32 with disallowed tokens masked to ``-inf``.
+        length N and are applied entirely through vectorized tensor masks (no
+        ``.tolist()`` or Python-side grouping, so each row keeps its own params).
+        Sampling uses ``multinomial_with_seed`` so each row draws from its own
+        ``seeds``/``positions`` and is reproducible regardless of batch
+        composition. Rows with temperature <= 0, or rows left fully masked, fall
+        back to greedy argmax; ``logits`` is float32 with disallowed tokens
+        already masked to ``-inf``.
         """
-        num_rows, vocab = logits.shape
+        num_rows = logits.shape[0]
         if num_rows == 0:
             return torch.empty(0, dtype=torch.long, device=logits.device)
         device = logits.device
@@ -431,66 +436,57 @@ class MossTTSModelRunner(ModelRunner):
         do_sample = temp > 0
         safe_temp = torch.where(do_sample, temp, torch.ones_like(temp))
         scores = logits / safe_temp.unsqueeze(1)
-
-        # Apply top-k / top-p per (k, p) group so each row's own params are used.
-        groups: dict[tuple[int, float], list[int]] = {}
-        for row, (k, p) in enumerate(zip(top_k_row.tolist(), top_p_row.tolist())):
-            groups.setdefault((int(k), float(p)), []).append(row)
-        for (k, p), row_list in groups.items():
-            use_k = bool(k) and 0 < k < vocab
-            use_p = 0.0 < p < 1.0
-            if not (use_k or use_p):
-                continue
-            ridx = torch.tensor(row_list, dtype=torch.long, device=device)
-            sub = scores.index_select(0, ridx)
-            if use_k:
-                sub = MossTTSModelRunner._apply_top_k(sub, k)
-            if use_p:
-                sub = MossTTSModelRunner._apply_top_p(sub, p)
-            scores.index_copy_(0, ridx, sub)
+        scores = MossTTSModelRunner._apply_top_k(scores, top_k_row)
+        scores = MossTTSModelRunner._apply_top_p(scores, top_p_row)
 
         probs = torch.softmax(scores, dim=-1)
         probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-        row_sums = probs.sum(dim=-1)
 
-        sampled = torch.empty(num_rows, dtype=torch.long, device=logits.device)
-        valid = row_sums > 0
-        if bool(valid.all()):
-            sampled = torch.multinomial(probs, 1, generator=generator).squeeze(1)
-        else:
-            if bool(valid.any()):
-                sampled[valid] = torch.multinomial(
-                    probs[valid], 1, generator=generator
-                ).squeeze(1)
-            invalid = ~valid
-            if bool(invalid.any()):
-                sampled[invalid] = torch.argmax(logits[invalid], dim=-1)
+        seeds_row = MossTTSModelRunner._as_row_tensor(
+            seeds, num_rows, torch.long, device
+        )
+        positions_row = MossTTSModelRunner._as_row_tensor(
+            positions, num_rows, torch.long, device
+        )
+        sampled = multinomial_with_seed(probs, seeds_row, positions_row).view(-1)
 
-        if bool((~do_sample).any()):
-            greedy = ~do_sample
-            sampled[greedy] = torch.argmax(logits[greedy], dim=-1)
+        fallback = (~do_sample) | (probs.sum(dim=-1) <= 0)
+        if bool(fallback.any()):
+            sampled[fallback] = torch.argmax(logits[fallback], dim=-1)
         return sampled.to(torch.long)
 
     @staticmethod
-    def _apply_top_k(logits: torch.Tensor, top_k: int) -> torch.Tensor:
-        top_k = min(top_k, logits.shape[-1])
-        values, indices = torch.topk(logits, top_k, dim=-1)
-        filtered = torch.full_like(logits, _NEG_INF)
-        filtered.scatter_(-1, indices, values)
-        return filtered
+    def _apply_top_k(scores: torch.Tensor, top_k_row: torch.Tensor) -> torch.Tensor:
+        """Per-row top-k mask; rows with k <= 0 or k >= vocab are left untouched."""
+        vocab = scores.shape[-1]
+        active = (top_k_row > 0) & (top_k_row < vocab)
+        if not bool(active.any()):
+            return scores
+        k_clamped = top_k_row.clamp(min=1, max=vocab)
+        sorted_scores, _ = torch.sort(scores, descending=True, dim=-1)
+        kth = sorted_scores.gather(1, (k_clamped - 1).unsqueeze(1))
+        threshold = torch.where(
+            active.unsqueeze(1), kth, torch.full_like(kth, _NEG_INF)
+        )
+        return scores.masked_fill(scores < threshold, _NEG_INF)
 
     @staticmethod
-    def _apply_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-        probs = torch.softmax(sorted_logits, dim=-1)
+    def _apply_top_p(scores: torch.Tensor, top_p_row: torch.Tensor) -> torch.Tensor:
+        """Per-row nucleus mask; rows with p <= 0 or p >= 1 are left untouched."""
+        active = (top_p_row > 0.0) & (top_p_row < 1.0)
+        if not bool(active.any()):
+            return scores
+        sorted_scores, sorted_indices = torch.sort(scores, descending=True, dim=-1)
+        probs = torch.softmax(sorted_scores, dim=-1)
         cumulative = torch.cumsum(probs, dim=-1)
-        remove = cumulative > top_p
+        remove = cumulative > top_p_row.unsqueeze(1)
         remove[..., 1:] = remove[..., :-1].clone()
         remove[..., 0] = False
-        remove_scattered = torch.zeros_like(logits, dtype=torch.bool).scatter_(
+        remove = remove & active.unsqueeze(1)
+        remove_scattered = torch.zeros_like(scores, dtype=torch.bool).scatter_(
             -1, sorted_indices, remove
         )
-        return logits.masked_fill(remove_scattered, _NEG_INF)
+        return scores.masked_fill(remove_scattered, _NEG_INF)
 
     @staticmethod
     def _apply_audio_repetition_penalty(

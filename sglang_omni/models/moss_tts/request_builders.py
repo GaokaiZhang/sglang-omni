@@ -7,6 +7,7 @@ import base64
 import collections
 import hashlib
 import io
+import os
 import re
 import threading
 import time
@@ -24,6 +25,26 @@ _MOSS_TTS_PREPARED_MARKER = "_moss_tts_prepared_request"
 _TOKEN_PREFIX_RE = re.compile(r"^\$\{token:(\d+)\}")
 _DATA_URI_RE = re.compile(r"^data:audio/[^;,]+;base64,(?P<data>.+)$", re.DOTALL)
 _INF_DELAY = -1
+_MOSS_TTS_SAMPLING_SEED_MASK = 0x7FFFFFFF
+
+
+def _new_moss_tts_sampling_seed() -> int:
+    return int.from_bytes(os.urandom(4), "little") & _MOSS_TTS_SAMPLING_SEED_MASK
+
+
+def derive_moss_tts_sampling_seed(public_seed: int) -> int:
+    """Derive a stable per-request sampling seed from a public ``seed``.
+
+    Mirrors the Qwen3-TTS pattern: ``multinomial_with_seed`` combines this
+    per-request seed with a per-(step, channel) position, so a row's sampled
+    token depends only on its own seed and position -- never on its batch
+    neighbours. This makes ``seed`` reproducible at any batch size, not just 1.
+    """
+    digest = hashlib.blake2b(
+        f"moss-tts:{int(public_seed)}".encode("utf-8"), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "little") & _MOSS_TTS_SAMPLING_SEED_MASK
+
 
 _GENERATION_FIELDS = (
     "max_new_tokens",
@@ -68,6 +89,7 @@ class MossTTSSGLangRequestData(ARRequestData):
     audio_top_k: int = 25
     audio_repetition_penalty: float = 1.0
     seed: int | None = None
+    sampling_seed: int = field(default_factory=_new_moss_tts_sampling_seed)
     audio_length: int = 0
     delayed_length: int = _INF_DELAY
     is_audio: bool = False
@@ -266,10 +288,18 @@ def build_generation_kwargs(
     else:
         explicit_fields = set()
 
+    raw_max_new_tokens = params.get("max_new_tokens")
+    if raw_max_new_tokens is None:
+        max_new_tokens = MOSS_TTS_DEFAULT_MAX_NEW_TOKENS
+    elif isinstance(raw_max_new_tokens, bool):
+        raise ValueError(
+            f"MOSS-TTS max_new_tokens must be an integer, got {raw_max_new_tokens!r}"
+        )
+    else:
+        max_new_tokens = int(raw_max_new_tokens)
+
     generation_kwargs: dict[str, Any] = {
-        "max_new_tokens": int(
-            params.get("max_new_tokens") or MOSS_TTS_DEFAULT_MAX_NEW_TOKENS
-        ),
+        "max_new_tokens": max_new_tokens,
         # note (chenyang): the checkpoint's own generate() defaults; greedy
         # (temperature=0) collapses the codec LM into copying the reference
         # audio. Callers may override any field.
@@ -328,6 +358,10 @@ def build_generation_kwargs(
 def _validate_moss_tts_generation_kwargs(kwargs: dict[str, Any]) -> None:
     """Validate public sampling fields (MOSS uses a custom sampler that bypasses
     SGLang's SamplingParams.verify), raising ValueError on out-of-range values."""
+    if int(kwargs["max_new_tokens"]) <= 0:
+        raise ValueError(
+            f"MOSS-TTS max_new_tokens must be > 0, got {kwargs['max_new_tokens']!r}"
+        )
     for field in ("text_temperature", "audio_temperature"):
         if float(kwargs[field]) < 0:
             raise ValueError(f"MOSS-TTS {field} must be >= 0, got {kwargs[field]!r}")
@@ -581,6 +615,11 @@ def build_sglang_moss_tts_request(
         audio_top_k=int(gen_kwargs.get("audio_top_k", -1)),
         audio_repetition_penalty=float(gen_kwargs.get("audio_repetition_penalty", 1.0)),
         seed=gen_kwargs.get("seed"),
+        sampling_seed=(
+            derive_moss_tts_sampling_seed(gen_kwargs["seed"])
+            if gen_kwargs.get("seed") is not None
+            else _new_moss_tts_sampling_seed()
+        ),
         engine_start_s=time.perf_counter(),
     )
     data.input_embeds_are_projected = True
