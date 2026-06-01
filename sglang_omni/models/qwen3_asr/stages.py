@@ -19,6 +19,9 @@ def create_sglang_qwen3_asr_executor(
     # SeedTTS WER inputs are unique audio clips, so caching audio embeddings on
     # GPU has essentially no reuse and only retains runtime memory.
     mm_embedding_cache_size_bytes: int = 0,
+    # CUDA graph capture is fast for this ASR path; torch.compile dominates
+    # startup latency and gives little benefit for the benchmark workload.
+    enable_torch_compile: bool = False,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     from transformers import AutoProcessor
@@ -59,7 +62,7 @@ def create_sglang_qwen3_asr_executor(
     overrides: dict[str, Any] = {
         "disable_cuda_graph": False,
         "disable_overlap_schedule": True,
-        "enable_torch_compile": True,
+        "enable_torch_compile": enable_torch_compile,
         "torch_compile_max_bs": max_running_requests,
         "cuda_graph_max_bs": max_running_requests,
         "mem_fraction_static": mem_fraction_static,
