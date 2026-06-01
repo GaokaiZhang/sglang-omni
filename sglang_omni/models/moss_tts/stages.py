@@ -209,6 +209,7 @@ def create_sglang_tts_engine_executor(
     device: str = "cuda:0",
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
+    server_args_overrides: dict[str, Any] | None = None,
 ) -> Any:
     from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
     from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
@@ -223,21 +224,26 @@ def create_sglang_tts_engine_executor(
         device = f"cuda:{gpu_id}"
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
+    overrides: dict[str, Any] = {
+        "dtype": dtype,
+        "cuda_graph_bs": [1, 2, 4, 8, 16],
+        "cuda_graph_max_bs": 16,
+        "disable_cuda_graph": False,
+        "disable_overlap_schedule": True,
+        "enable_torch_compile": False,
+        "max_prefill_tokens": 8192,
+        "max_running_requests": 16,
+        "sampling_backend": "pytorch",
+        "torch_compile_max_bs": 16,
+        "trust_remote_code": True,
+    }
+    if server_args_overrides:
+        overrides.update(server_args_overrides)
+
     server_args = build_sglang_server_args(
         checkpoint_dir,
         context_length=8192,
-        dtype=dtype,
-        cuda_graph_bs=[1, 2, 4, 8, 16],
-        cuda_graph_max_bs=16,
-        disable_cuda_graph=False,
-        disable_overlap_schedule=True,
-        enable_torch_compile=True,
-        mem_fraction_static=0.70,
-        max_prefill_tokens=8192,
-        max_running_requests=16,
-        sampling_backend="pytorch",
-        torch_compile_max_bs=16,
-        trust_remote_code=True,
+        **overrides,
     )
 
     want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))

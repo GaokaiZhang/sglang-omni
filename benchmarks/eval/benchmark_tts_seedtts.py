@@ -1,92 +1,57 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0
 """SeedTTS benchmark for TTS models with performance and WER metrics.
 
 Note (Qiujiang, Chenyang):
 
 1. Voice-clone models (e.g. fishaudio/s2-pro): default uses ref_audio /
   ref_text from the meta file.
+
 2. Plain TTS (e.g. mistralai/Voxtral-4B-TTS-2603): use --no-ref-audio and
   --voice for a server-side speaker preset.
-3. Higgs TTS uses the same benchmark with --ref-format references.
 
 Usage:
 
-    # Download the test set:
+1. Download the test set:
+
     python -m benchmarks.dataset.prepare --dataset seedtts
 
-    # Launch the server:
-    1. For S2-Pro:
-    python -m sglang_omni.cli serve \
-        --model-path fishaudio/s2-pro \
-        --port 8000
+2. Full pipeline (auto start TTS → generate → stop TTS → start ASR → WER):
 
-    2. For Voxtral-4B-TTS-2603:
-    python -m sglang_omni.cli serve \
-        --model-path mistralai/Voxtral-4B-TTS-2603 \
-        --port 8000
 
-    3. For Higgs TTS:
-    python -m sglang_omni.cli serve \
-        --model-path boson-sglang/higgs-audio-v3-tts-4b-base \
-        --port 8000
-
-    4. For MOSS-TTS:
-    python -m sglang_omni.cli serve \
-        --model-path OpenMOSS-Team/MOSS-TTS-v1.5 \
-        --port 8000
-
-    5. For Qwen3-TTS (0.6B / 1.7B share the same pipeline; needs the upstream
-       qwen-tts package, see docs/cookbook/qwen3_tts.md):
-    python -m sglang_omni.cli serve \
-        --model-path Qwen/Qwen3-TTS-12Hz-1.7B-Base \
-        --port 8000
-
-    # Full pipeline (auto start TTS → generate → stop TTS → start ASR → WER)
-    # Single GPU: TTS and ASR reuse the same --port sequentially.
     python -m benchmarks.eval.benchmark_tts_seedtts \
         --meta zhaochenyang20/seed-tts-eval-arrow \
         --max-concurrency 16 \
         --model fishaudio/s2-pro \
         --port 8000
 
-    # Plain TTS (no ref audio from testset)
     python -m benchmarks.eval.benchmark_tts_seedtts \
         --meta zhaochenyang20/seed-tts-eval-arrow \
         --model mistralai/Voxtral-4B-TTS-2603 --port 8000 \
         --max-concurrency 16 \
-        --no-ref-audio --voice cheerful_female --max-samples 50
+        --no-ref-audio --voice cheerful_female
 
-    # Higgs TTS voice cloning
     python -m benchmarks.eval.benchmark_tts_seedtts \
         --meta zhaochenyang20/seed-tts-eval-arrow \
-        --model boson-sglang/higgs-audio-v3-tts-4b-base --port 8000 \
+        --model boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999 --port 8000 \
         --ref-format references \
         --output-dir results/higgs_tts_en \
         --lang en --max-concurrency 16
 
-    # Full pipeline — MOSS-TTS voice cloning (--token-count auto estimates the
-    # duration token target per sample using OpenMOSS app defaults)
     python -m benchmarks.eval.benchmark_tts_seedtts \
         --meta zhaochenyang20/seed-tts-eval-arrow \
         --model OpenMOSS-Team/MOSS-TTS-v1.5 --port 8000 \
         --ref-format references \
         --token-count auto \
         --output-dir results/moss_tts_en \
-        --lang en --max-concurrency 8
-
-    # Full pipeline — Qwen3-TTS voice cloning
-    python -m benchmarks.eval.benchmark_tts_seedtts \
-        --meta zhaochenyang20/seed-tts-eval-arrow \
-        --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --port 8000 \
-        --ref-format references \
-        --output-dir results/qwen3_tts_en \
         --lang en --max-concurrency 16
 
-For CI settings, separate the generate and transcribe phases into two runs.
+3. For CI settings, separate the generate and transcribe phases into two runs.
 
 Usage (CI):
 
     # Generate audio only
+
     python -m benchmarks.eval.benchmark_tts_seedtts \
         --generate-only \
         --meta zhaochenyang20/seed-tts-eval-arrow \
@@ -96,6 +61,7 @@ Usage (CI):
         --port 8000
 
     # Transcribe + WER only
+
     python -m benchmarks.eval.benchmark_tts_seedtts \
         --transcribe-only \
         --meta zhaochenyang20/seed-tts-eval-arrow \
@@ -104,7 +70,7 @@ Usage (CI):
         --lang en --port 8000
 
 
-H200 Full-Set Reference Results
+Reference Results
 
 Reproducibility references for the FULL eval set — NOT CI thresholds.
 CI runs on a subset and has its own thresholds elsewhere (see tasks/*.py).
@@ -115,14 +81,8 @@ Last verified: 2026-05-25
 
 Accuracy (accuracy.wer)
 
-Note: Higgs TTS raw corpus WER includes outliers above 50% WER (EN: 1 sample,
-outlier-excluded 1.27%; ZH: 3 samples, outlier-excluded 1.22%).
-
-Note: MOSS-TTS raw corpus WER includes outliers above 50% WER (EN: 4 samples,
-outlier-excluded 1.32%; ZH: 2 samples, outlier-excluded 1.27%).
-
-Note: Qwen3-TTS-1.7B EN raw corpus WER includes 1 sample above 50% WER; outlier-excluded corpus WER is 0.91%.
-Qwen3-TTS is run at c=4 (0.6B) / c=8 (1.7B): higher concurrency regresses WER.
+Note: the Higgs TTS EN raw corpus WER includes 2 samples above 50% WER; the
+outlier-excluded corpus WER is 1.36%.
 
 | Model  | Config           | wer_corpus | wer_per_sample_mean | wer_per_sample_median | wer_per_sample_std | evaluated | skipped | Source                         |
 | ------ | ---------------- | ---------- | ------------------- | --------------------- | ------------------ | --------- | ------- | ------------------------------ |
@@ -138,15 +98,8 @@ Qwen3-TTS is run at c=4 (0.6B) / c=8 (1.7B): higher concurrency regresses WER.
 | S2-Pro | EN, stream=True  | 1.06%      | 1.02%               | 0.00%                 | 3.5%               | 1088/1088 | 0       | PR #411 [H100, full-set, c=16] |
 | S2-Pro | ZH, stream=False | 0.92%      | 0.87%               | 0.00%                 | 2.1%               | 2020/2020 | 0       | PR #411 [H100, full-set, c=16] |
 | S2-Pro | ZH, stream=True  | 0.90%      | 0.86%               | 0.00%                 | 2.1%               | 2020/2020 | 0       | PR #411 [H100, full-set, c=16] |
-| Higgs TTS | EN, stream=False | 4.53%   | 3.79%               | 0.00%                 | 84.5%              | 1088/1088 | 0       | PR #534 [H200, full-set, c=16] |
-| Higgs TTS | ZH, stream=False | 1.85%   | 1.69%               | 0.00%                 | 21.0%              | 2020/2020 | 0       | PR #534 [H200, full-set, c=16] |
-| MOSS-TTS | EN, stream=False | 1.68%   | 1.74%               | 0.00%                 | 8.6%               | 1088/1088 | 0       | PR #609 [H200, full-set, c=8, token-count=auto] |
-| MOSS-TTS | ZH, stream=False | 1.36%   | 1.31%               | 0.00%                 | 3.9%               | 2020/2020 | 0       | PR #609 [H200, full-set, c=8, token-count=auto] |
-| Voxtral | EN, stream=False | 1.19%   | 1.19%               | 0.00%                 | 4.0%               | 1088/1088 | 0       | PR #527 [H200, full-set, c=16, no-ref-audio, voice=cheerful_female] |
-| Qwen3-TTS-0.6B | EN, stream=False | 1.26%   | 1.23%               | 0.00%                 | 4.1%               | 1088/1088 | 0       | PR #527 [H200, full-set, c=4]  |
-| Qwen3-TTS-0.6B | ZH, stream=False | 1.17%   | 1.13%               | 0.00%                 | 3.0%               | 2020/2020 | 0       | PR #527 [H200, full-set, c=4]  |
-| Qwen3-TTS-1.7B | EN, stream=False | 2.68%   | 2.27%               | 0.00%                 | 4576%              | 1088/1088 | 0       | PR #527 [H200, full-set, c=8]  |
-| Qwen3-TTS-1.7B | ZH, stream=False | 1.04%   | 0.99%               | 0.00%                 | 2.6%               | 2020/2020 | 0       | PR #527 [H200, full-set, c=8]  |
+| Higgs TTS | EN, stream=False | 4.68%   | 4.16%               | 0.00%                 | 91.2%              | 1088/1088 | 0       | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
+| Higgs TTS | ZH, stream=False | 1.14%   | 1.08%               | 0.00%                 | 2.7%               | 2020/2020 | 0       | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
 
 Generation speed (generation.speed)
 
@@ -164,37 +117,8 @@ Generation speed (generation.speed)
 | S2-Pro | EN, stream=True  | 12.164         | 16.717        | 3.265    | 1.308          | 67.0                           | PR #411 [H100, V1-pipeline, full-set, c=16] |
 | S2-Pro | ZH, stream=False | 12.028         | 15.526        | 2.256    | 1.327          | 65.7                           | PR #411 [H100, V1-pipeline, full-set, c=16] |
 | S2-Pro | ZH, stream=True  | 11.417         | 15.020        | 2.141    | 1.398          | 65.5                           | PR #411 [H100, V1-pipeline, full-set, c=16] |
-| Higgs TTS | EN, stream=False | 3.345       | 4.586         | 0.829    | 4.747          | 131.3                          | PR #534 [H200, full-set, c=16] |
-| Higgs TTS | ZH, stream=False | 2.561       | 3.833         | 0.439    | 6.236          | 102.5                          | PR #534 [H200, full-set, c=16] |
-| MOSS-TTS | EN, stream=False | 3.449       | 4.141         | 0.811    | 2.312          | 75.2                           | PR #609 [H200, full-set, c=8, token-count=auto] |
-| MOSS-TTS | ZH, stream=False | 3.608       | 4.153         | 0.635    | 2.213          | 77.8                           | PR #609 [H200, full-set, c=8, token-count=auto] |
-| Voxtral | EN, stream=False | 1.630       | 2.410         | 0.286    | 9.706          | n/a                            | PR #527 [H200, full-set, c=16, no-ref-audio, voice=cheerful_female] |
-| Qwen3-TTS-0.6B | EN, stream=False | 2.897       | 4.141         | 0.696    | 1.379          | 20.0                           | PR #527 [H200, full-set, c=4] |
-| Qwen3-TTS-0.6B | ZH, stream=False | 3.957       | 4.977         | 0.637    | 1.010          | 21.1                           | PR #527 [H200, full-set, c=4] |
-| Qwen3-TTS-1.7B | EN, stream=False | 3.374       | 4.886         | 0.817    | 2.367          | 16.7                           | PR #527 [H200, full-set, c=8] |
-| Qwen3-TTS-1.7B | ZH, stream=False | 4.479       | 5.725         | 0.758    | 1.783          | 17.5                           | PR #527 [H200, full-set, c=8] |
-
-Note (Chenyang): output-token rates here count S2-Pro's codec tokens. They are not
-comparable to Qwen3-Omni rates in benchmark_omni_seedtts.py, whose tokens are
-discrete talker LM tokens emitted at audio frame rate. Cross-model comparison of
-this rate is not meaningful; use latency_mean_s / rtf_mean / throughput_qps
-instead when comparing backends.
-
-ASR speed (asr_speed_results.json) — Qwen3-ASR-1.7B server for EN/ZH
-
-| Model     | Lang | asr_latency_mean_s | asr_rtf_mean | asr_throughput_samples_per_s | Source                                          |
-| --------- | ---- | ------------------ | ------------ | ---------------------------- | ----------------------------------------------- |
-| S2-Pro    | EN   | 0.297              | 0.0772       | 3.36                         | PR #393 [H200, from S2-Pro EN stream=False run] |
-| S2-Pro    | ZH   | 0.294              | 0.0556       | 3.40                         | PR #393 [H200, from S2-Pro ZH stream=False run] |
-| Higgs TTS | EN   | 0.393              | 0.0914       | 2.54                         | PR #534 [H200, from Higgs TTS EN stream=False run] |
-| Higgs TTS | ZH   | 0.112              | 0.0199       | 8.91                         | PR #534 [H200, from Higgs TTS ZH stream=False run] |
-| MOSS-TTS  | EN   | 0.370              | 0.0854       | 2.70                         | PR #609 [H200, from MOSS-TTS EN stream=False run] |
-| MOSS-TTS  | ZH   | 0.109              | 0.0192       | 9.18                         | PR #609 [H200, from MOSS-TTS ZH stream=False run] |
-| Voxtral   | EN   | 0.360              | 0.0665       | 2.77                         | PR #527 [H200, from Voxtral EN stream=False run] |
-| Qwen3-TTS-0.6B | EN | 0.361          | 0.0892       | 2.77                         | PR #527 [H200, from Qwen3-TTS-0.6B EN stream=False run] |
-| Qwen3-TTS-0.6B | ZH | 0.116          | 0.0193       | 8.61                         | PR #527 [H200, from Qwen3-TTS-0.6B ZH stream=False run] |
-| Qwen3-TTS-1.7B | EN | 0.366          | 0.0910       | 2.73                         | PR #527 [H200, from Qwen3-TTS-1.7B EN stream=False run] |
-| Qwen3-TTS-1.7B | ZH | 0.108          | 0.0186       | 9.30                         | PR #527 [H200, from Qwen3-TTS-1.7B ZH stream=False run] |
+| Higgs TTS | EN, stream=False | 1.749       | 2.600         | 0.425    | 9.104          | 112.9                          | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
+| Higgs TTS | ZH, stream=False | 1.629       | 2.110         | 0.282    | 9.792          | 109.9                          | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
 """
 
 from __future__ import annotations

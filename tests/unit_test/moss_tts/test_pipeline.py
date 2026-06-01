@@ -127,6 +127,128 @@ def test_moss_tts_config_and_registry_contracts() -> None:
         PIPELINE_CONFIG_REGISTRY.get_config("MossTTSDelayModel")
         is MossTTSPipelineConfig
     )
+    assert MossTTSPipelineConfig.mem_fraction_role_to_stage() == {
+        "talker": "tts_engine"
+    }
+    assert MossTTSPipelineConfig.talker_sglang_role_to_stage() == {
+        "talker": "tts_engine"
+    }
+
+
+def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
+    from sglang_omni.models.moss_tts import stages
+    from sglang_omni.scheduling import bootstrap, omni_scheduler, sglang_backend
+
+    captured: dict[str, object] = {"build_kwargs": []}
+
+    def fake_build_sglang_server_args(model_path, context_length, **kwargs):
+        captured["model_path"] = model_path
+        captured["context_length"] = context_length
+        captured["build_kwargs"].append(dict(kwargs))
+        return SimpleNamespace(
+            disable_cuda_graph=kwargs["disable_cuda_graph"],
+            disable_overlap_schedule=False,
+        )
+
+    def fake_create_sglang_infrastructure(
+        server_args,
+        gpu_id,
+        *,
+        model_arch_override=None,
+    ):
+        captured["gpu_id"] = gpu_id
+        captured["model_arch_override"] = model_arch_override
+        model = object()
+        model_runner = SimpleNamespace(
+            model=model,
+            init_device_graphs=lambda: captured.setdefault("graph_inits", 0) or None,
+        )
+        model_worker = SimpleNamespace(model_runner=model_runner)
+        return (
+            model_worker,
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+        )
+
+    class FakeOutputProcessor:
+        def __init__(self, **kwargs) -> None:
+            captured["output_processor_kwargs"] = kwargs
+
+    class FakeMossTTSModelRunner:
+        def __init__(self, model_worker, output_proc) -> None:
+            captured["model_runner_args"] = (model_worker, output_proc)
+
+    class FakeOmniScheduler:
+        def __init__(self, **kwargs) -> None:
+            captured["scheduler_kwargs"] = kwargs
+
+    fake_model_runner_module = types.ModuleType(
+        "sglang_omni.models.moss_tts.model_runner"
+    )
+    fake_model_runner_module.MossTTSModelRunner = FakeMossTTSModelRunner
+
+    monkeypatch.setattr(stages, "_resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(
+        stages,
+        "make_moss_tts_scheduler_adapters",
+        lambda model: (lambda payload: payload, lambda data: data),
+    )
+    monkeypatch.setattr(
+        sglang_backend,
+        "build_sglang_server_args",
+        fake_build_sglang_server_args,
+    )
+    monkeypatch.setattr(sglang_backend, "SGLangOutputProcessor", FakeOutputProcessor)
+    monkeypatch.setattr(
+        bootstrap,
+        "create_sglang_infrastructure",
+        fake_create_sglang_infrastructure,
+    )
+    monkeypatch.setattr(omni_scheduler, "OmniScheduler", FakeOmniScheduler)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang_omni.models.moss_tts.model_runner",
+        fake_model_runner_module,
+    )
+
+    stages.create_sglang_tts_engine_executor("OpenMOSS-Team/MOSS-TTS-v1.5")
+    stages.create_sglang_tts_engine_executor(
+        "OpenMOSS-Team/MOSS-TTS-v1.5",
+        server_args_overrides={
+            "enable_torch_compile": True,
+            "mem_fraction_static": 0.61,
+        },
+    )
+
+    default_kwargs, explicit_kwargs = captured["build_kwargs"]
+    assert default_kwargs["enable_torch_compile"] is False
+    assert "mem_fraction_static" not in default_kwargs
+    assert explicit_kwargs["enable_torch_compile"] is True
+    assert explicit_kwargs["mem_fraction_static"] == 0.61
+    assert captured["context_length"] == 8192
+    assert captured["model_arch_override"] == "MossTTSDelaySGLangModel"
+
+
+def test_moss_tts_talker_torch_compile_cli_override_targets_tts_engine() -> None:
+    from sglang_omni.cli.serve import apply_torch_compile_cli_overrides
+
+    config = MossTTSPipelineConfig(model_path="model")
+    apply_torch_compile_cli_overrides(
+        config,
+        thinker_torch_compile="default",
+        talker_torch_compile="on",
+        thinker_torch_compile_max_bs=None,
+        talker_torch_compile_max_bs=4,
+    )
+
+    tts_engine = next(stage for stage in config.stages if stage.name == "tts_engine")
+    server_args_overrides = tts_engine.factory_args["server_args_overrides"]
+    assert server_args_overrides["enable_torch_compile"] is True
+    assert server_args_overrides["torch_compile_max_bs"] == 4
 
 
 def test_moss_tts_state_round_trip_keeps_tensors_native() -> None:
