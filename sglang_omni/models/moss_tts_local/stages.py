@@ -138,6 +138,13 @@ class _BatchedReferenceEncoder:
     so one bad file only fails its own request.
     """
 
+    # Mirrors the Higgs reference-audio cap: bounds both encoder runtime and
+    # the batch-padding memory amplification.
+    MAX_REFERENCE_SECONDS = 100.0
+    # An encode batch takes well under a second; a result this late means the
+    # worker died or wedged, so fail the request instead of hanging the slot.
+    ENCODE_TIMEOUT_S = 120.0
+
     def __init__(
         self,
         processor: Any,
@@ -154,11 +161,28 @@ class _BatchedReferenceEncoder:
         )
         self._thread.start()
 
+    @classmethod
+    def _check_reference_duration(cls, path: str) -> None:
+        try:
+            import torchaudio
+
+            info = torchaudio.info(path)
+            duration = info.num_frames / max(int(info.sample_rate), 1)
+        except Exception:
+            return  # unreadable files fail with a clearer error in the codec
+        if duration > cls.MAX_REFERENCE_SECONDS:
+            raise ValueError(
+                f"reference audio is {duration:.1f}s long; the limit is "
+                f"{cls.MAX_REFERENCE_SECONDS:.0f}s"
+            )
+
     def encode(self, path: str) -> torch.Tensor:
         """Encode one reference file; blocks until its batch completes."""
+        path = str(path)
+        self._check_reference_duration(path)
         future: concurrent.futures.Future = concurrent.futures.Future()
-        self._queue.put((str(path), future))
-        return future.result()
+        self._queue.put((path, future))
+        return future.result(timeout=self.ENCODE_TIMEOUT_S)
 
     def _drain_batch(self) -> list[tuple[str, concurrent.futures.Future]]:
         batch = [self._queue.get()]
@@ -350,13 +374,17 @@ def create_vocoder_executor(
     device = _resolve_codec_device(device)
     processor = _load_moss_tts_local_processor(model_path, device=device)
 
-    def _prepare_codes(payload: StagePayload) -> tuple[MossTTSLocalState, torch.Tensor]:
+    def _prepare_codes(
+        payload: StagePayload,
+    ) -> tuple[MossTTSLocalState, torch.Tensor | None]:
         state = load_state(payload)
         if state.audio_codes is None:
             raise RuntimeError("MOSS-TTS Local vocoder requires audio_codes")
         codes = torch.as_tensor(state.audio_codes, dtype=torch.long)
         if codes.numel() == 0:
-            raise RuntimeError("MOSS-TTS Local generated no audio codes")
+            # Immediate stop decision: emit no audio so only this request
+            # fails downstream instead of poisoning the whole decode batch.
+            return state, None
         return state, codes
 
     def _store_vocoder_result(
@@ -394,17 +422,18 @@ def create_vocoder_executor(
 
     def _vocode_batch(payloads: list[StagePayload]) -> list[StagePayload]:
         prepared = [_prepare_codes(payload) for payload in payloads]
-        codes_list = [codes for _, codes in prepared]
-        decoded = processor.decode_audio_codes(codes_list)
-        if len(decoded) != len(payloads):
-            raise RuntimeError(
-                "MOSS-TTS Local vocoder returned "
-                f"{len(decoded)} waveforms for {len(payloads)} requests"
-            )
+        codes_list = [codes for _, codes in prepared if codes is not None]
+        decoded = iter(processor.decode_audio_codes(codes_list))
         sample_rate = _sample_rate()
         results = []
-        for payload, (state, _), wav in zip(payloads, prepared, decoded):
-            wav = torch.as_tensor(wav).detach().to("cpu")
+        for payload, (state, codes) in zip(payloads, prepared):
+            if codes is None:
+                # No audio fields: the client surfaces a per-request
+                # "no audio output" error without failing batch peers.
+                state.audio_codes = None
+                results.append(store_state(payload, state))
+                continue
+            wav = torch.as_tensor(next(decoded)).detach().to("cpu")
             results.append(_store_vocoder_result(payload, state, wav, sample_rate))
         return results
 

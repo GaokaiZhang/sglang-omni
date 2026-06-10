@@ -170,6 +170,13 @@ class MossTTSLocalTransformer(nn.Module):
 
         self._kv_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
         self._kv_capacity = 0
+        self._kv_frozen = False
+
+    def freeze_kv_cache(self) -> None:
+        """Forbid KV reallocation; captured CUDA graphs hold raw pointers
+        into the current buffers, so growing them would leave the graphs
+        reading freed memory."""
+        self._kv_frozen = True
 
     def _ensure_kv_cache(
         self, batch_size: int, device: torch.device, dtype: torch.dtype
@@ -181,6 +188,11 @@ class MossTTSLocalTransformer(nn.Module):
             and self._kv_cache[0][0].dtype == dtype
         ):
             return
+        if self._kv_frozen:
+            raise RuntimeError(
+                "local-transformer KV cache is frozen after CUDA graph capture "
+                f"(capacity {self._kv_capacity}, requested {batch_size})"
+            )
         capacity = max(batch_size, self._kv_capacity, 1)
         shape = (capacity, self.num_heads, self.max_positions, self.head_dim)
         self._kv_cache = [

@@ -277,13 +277,13 @@ def encode_audio(
     if arr.ndim > 1:
         arr = arr.squeeze()
     if arr.ndim > 1:
-        # Multi-channel: normalize to (channels, samples). WAV and PCM keep
-        # every channel (interleaved); the compressed mono encoders fall back
-        # to the first channel as before.
+        # Multi-channel: normalize to (channels, samples). Only WAV carries
+        # channel metadata, so it keeps every channel; raw PCM and the
+        # compressed mono encoders downmix to preserve the mono contract.
         if arr.shape[0] > arr.shape[-1]:
             arr = arr.T
-        if response_format.lower().strip() not in ("wav", "pcm"):
-            arr = arr[0]
+        if response_format.lower().strip() != "wav":
+            arr = arr.mean(axis=0).astype(np.float32)
 
     # Apply speed
     if speed != 1.0:

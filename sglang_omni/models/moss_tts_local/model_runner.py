@@ -166,31 +166,59 @@ class MossTTSLocalModelRunner(ModelRunner):
         batch_size = len(datas)
         num_channels = int(cfg.n_vq) + 1
 
-        text_temp = torch.tensor(
-            [float(d.text_temperature) for d in datas],
-            dtype=torch.float32,
-            device=device,
-        )
-        text_top_p = torch.tensor(
-            [float(d.text_top_p) for d in datas], dtype=torch.float32, device=device
-        )
-        text_top_k = torch.tensor(
-            [int(d.text_top_k) for d in datas], dtype=torch.long, device=device
-        )
-        audio_temp = torch.tensor(
-            [float(d.audio_temperature) for d in datas],
-            dtype=torch.float32,
-            device=device,
-        )
-        audio_top_p = torch.tensor(
-            [float(d.audio_top_p) for d in datas], dtype=torch.float32, device=device
-        )
-        audio_top_k = torch.tensor(
-            [int(d.audio_top_k) for d in datas], dtype=torch.long, device=device
-        )
-        sampling_seeds = torch.tensor(
-            [int(d.sampling_seed) for d in datas], dtype=torch.long, device=device
-        )
+        # The static per-request sampling parameters only change with batch
+        # composition, so rebuild them once per composition; gen_steps moves
+        # every step and is rebuilt each time.
+        cache_key = tuple(sched_req.request_id for sched_req in requests)
+        cached = getattr(self, "_param_cache", None)
+        if cached is None or cached[0] != cache_key:
+            params = {
+                "text_temp": torch.tensor(
+                    [float(d.text_temperature) for d in datas],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "text_top_p": torch.tensor(
+                    [float(d.text_top_p) for d in datas],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "text_top_k": torch.tensor(
+                    [int(d.text_top_k) for d in datas],
+                    dtype=torch.long,
+                    device=device,
+                ),
+                "audio_temp": torch.tensor(
+                    [float(d.audio_temperature) for d in datas],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "audio_top_p": torch.tensor(
+                    [float(d.audio_top_p) for d in datas],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "audio_top_k": torch.tensor(
+                    [int(d.audio_top_k) for d in datas],
+                    dtype=torch.long,
+                    device=device,
+                ),
+                "seeds": torch.tensor(
+                    [int(d.sampling_seed) for d in datas],
+                    dtype=torch.long,
+                    device=device,
+                ),
+            }
+            self._param_cache = (cache_key, params)
+        else:
+            params = cached[1]
+        text_temp = params["text_temp"]
+        text_top_p = params["text_top_p"]
+        text_top_k = params["text_top_k"]
+        audio_temp = params["audio_temp"]
+        audio_top_p = params["audio_top_p"]
+        audio_top_k = params["audio_top_k"]
+        sampling_seeds = params["seeds"]
         gen_steps = torch.tensor(
             [int(d.generation_steps) for d in datas], dtype=torch.long, device=device
         )
@@ -225,7 +253,7 @@ class MossTTSLocalModelRunner(ModelRunner):
             self.model, "frame_graph_max_bs", 0
         )
         if use_graph:
-            stop_choice, codes = self.model.decode_frame_graphed(
+            stop_choice, codes, feedback = self.model.decode_frame_graphed(
                 hidden_states,
                 text_temperature=text_temp,
                 text_top_p=text_top_p,
@@ -236,12 +264,17 @@ class MossTTSLocalModelRunner(ModelRunner):
                 seeds=sampling_seeds,
                 base_positions=gen_steps * num_channels,
             )
+            # The graph outputs are static buffers that the next replay (any
+            # later prefill or decode step) overwrites; snapshot what we keep.
+            codes = codes.clone()
+            embeds = feedback.clone()
         else:
             stop_choice, codes = self.model.decode_frame(
                 hidden_states,
                 sample_text=sample_text,
                 sample_audio=sample_audio,
             )
+            embeds = None
 
         slot_id = int(cfg.audio_assistant_slot_token_id)
         end_id = int(cfg.audio_end_token_id)
@@ -257,9 +290,10 @@ class MossTTSLocalModelRunner(ModelRunner):
 
         result.next_token_ids = next_text
         schedule_batch.output_ids = next_text
-        embeds = self.model._prepare_multi_modal_inputs(
-            rows.to(device=self.model.device)
-        )
+        if embeds is None:
+            embeds = self.model._prepare_multi_modal_inputs(
+                rows.to(device=self.model.device)
+            )
         self._pending_rows = rows
         self._pending_embeds = embeds.detach()
 
@@ -323,12 +357,12 @@ class MossTTSLocalModelRunner(ModelRunner):
             return
 
         end_id = int(self.model.config.audio_end_token_id)
+        # rows/embeds are step-private tensors (the graph outputs were
+        # snapshotted in _collect_frame), so per-request views are stable.
         for row_idx, sched_req in enumerate(scheduler_output.requests):
             req_output = outputs[sched_req.request_id]
             if req_output.data is None or int(req_output.data) == end_id:
                 # Stop decision: no frame is emitted alongside audio_end.
                 continue
-            sched_req.data.output_rows.append(rows[row_idx].detach().clone())
-            sched_req.data.pending_feedback_queue.append(
-                embeds[row_idx].detach().clone()
-            )
+            sched_req.data.output_rows.append(rows[row_idx])
+            sched_req.data.pending_feedback_queue.append(embeds[row_idx])
