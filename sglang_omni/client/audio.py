@@ -130,11 +130,7 @@ def apply_speed(
 
 
 def encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
-    """Encode audio as a WAV file (16-bit PCM).
-
-    Accepts rank-1 mono or rank-2 ``(channels, samples)`` input; multi-channel
-    samples are interleaved per the WAV spec.
-    """
+    """Encode audio as a WAV file (16-bit PCM)."""
     # Clamp to [-1, 1]
     audio = np.clip(audio, -1.0, 1.0)
     pcm = (audio * 32767.0).astype(np.int16)
@@ -242,10 +238,7 @@ def _encode_with_pyav(
 
 
 def encode_pcm(audio: np.ndarray, sample_rate: int) -> bytes:
-    """Encode audio as raw 16-bit PCM bytes.
-
-    Rank-2 ``(channels, samples)`` input is interleaved sample-major.
-    """
+    """Encode audio as raw 16-bit PCM bytes."""
     audio = np.clip(audio, -1.0, 1.0)
     pcm = (audio * 32767.0).astype(np.int16)
     if pcm.ndim == 2:
@@ -273,19 +266,14 @@ def encode_audio(
     """
     arr = to_numpy(audio)
 
-    # Flatten to 1D if needed
     if arr.ndim > 1:
         arr = arr.squeeze()
     if arr.ndim > 1:
-        # Multi-channel: normalize to (channels, samples). Only WAV carries
-        # channel metadata, so it keeps every channel; raw PCM and the
-        # compressed mono encoders downmix to preserve the mono contract.
         if arr.shape[0] > arr.shape[-1]:
             arr = arr.T
         if response_format.lower().strip() != "wav":
             arr = arr.mean(axis=0).astype(np.float32)
 
-    # Apply speed
     if speed != 1.0:
         if arr.ndim > 1:
             adjusted = [apply_speed(channel, speed, sample_rate) for channel in arr]
@@ -349,7 +337,6 @@ def encode_audio(
             )
             return encode_wav(arr, sample_rate), FORMAT_MIME_TYPES["wav"]
 
-    # Unknown format -> fall back to WAV
     logger.warning("Unknown audio format '%s'; falling back to WAV", fmt)
     return encode_wav(arr, sample_rate), FORMAT_MIME_TYPES["wav"]
 

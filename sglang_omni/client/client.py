@@ -208,7 +208,6 @@ class Client:
             audio_data = audio_chunks[0]
         else:
             arrays = [to_numpy(c) for c in audio_chunks]
-            # Rank-2 chunks are [channels, samples]: concatenate on time.
             axis = -1 if arrays[0].ndim > 1 else 0
             audio_data = np.concatenate(arrays, axis=axis)
 

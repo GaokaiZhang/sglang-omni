@@ -42,18 +42,7 @@ def _stages(*, codec_device: str) -> list[StageConfig]:
 
 
 class MossTTSLocalPipelineConfig(PipelineConfig):
-    """MOSS-TTS Local pipeline: preprocessing -> AR engine -> vocoder.
-
-    Resolves OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5, whose checkpoint
-    declares ``architectures: ["MossTTSLocalModel"]``, so serving by model id
-    works without an explicit config file. The AR engine runs on GPU 0; the
-    48 kHz stereo v2 codec (reference encode + vocoder) is explicitly placed
-    on GPU 1 because its ~1B-param encoder otherwise competes with the AR
-    decode loop. The three stages stay in one process because preprocessing
-    hands scheduler-owned prompt state to the AR request builder through an
-    in-process table. Use ``MossTTSLocalColocatedPipelineConfig`` for single-GPU
-    deployments.
-    """
+    """MOSS-TTS Local pipeline: preprocessing -> AR engine -> vocoder."""
 
     architecture: ClassVar[str] = "MossTTSLocalModel"
     architecture_aliases: ClassVar[tuple[str, ...]] = (
