@@ -304,14 +304,45 @@ class MossTTSLocalModelRunner(ModelRunner):
         rows[:, 0] = next_text
         rows[:, 1:] = codes
 
-        result.next_token_ids = next_text
-        schedule_batch.output_ids = next_text
+        next_token_ids = self._row_radix_token_ids(rows, next_text, end_id)
+        result.next_token_ids = next_token_ids
+        schedule_batch.output_ids = next_token_ids
         if embeds is None:
             embeds = self.model._prepare_multi_modal_inputs(
                 rows.to(device=self.model.device)
             )
         self._pending_rows = rows
         self._pending_embeds = embeds.detach()
+
+    @staticmethod
+    def _row_radix_token_ids(
+        rows: torch.Tensor,
+        next_text: torch.Tensor,
+        end_id: int,
+    ) -> torch.Tensor:
+        """Radix-cache token ids for generated frames.
+
+        The scheduler appends one token id per frame to the request's KV
+        chain, and the radix tree keys on those ids. The text channel alone is
+        the same assistant-slot id for every continuing frame of every
+        request, so a re-prefill after retraction could falsely prefix-match
+        into another identical-prompt request's cached generated region. Hash
+        the full multi-channel row — the same keying used for prompt rows —
+        so a radix match implies identical audio content (a per-position id
+        clash is ~1/151643 and only matters on top of an identical full
+        prefix). The hash is folded below the special-token band because the
+        scheduler finishes any request whose generated id crosses the vocab
+        boundary (``Req._check_vocab_boundary_finish``); the stop decision
+        keeps the raw audio_end id so eos detection still fires.
+        """
+        from sglang_omni.models.moss_tts.request_builders import build_row_cache_key_ids
+
+        # <|endoftext|> 151643 opens the special/control id band.
+        hash_space = 151643
+        hashed = torch.tensor(
+            build_row_cache_key_ids(rows), dtype=torch.long, device=rows.device
+        )
+        return torch.where(next_text == end_id, next_text, hashed % hash_space)
 
     @staticmethod
     def _gather_rep_histories(

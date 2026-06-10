@@ -365,6 +365,29 @@ def test_audio_repetition_penalty_matches_upstream_semantics():
     )
 
 
+def test_row_radix_token_ids_hash_rows_and_keep_eos():
+    from sglang_omni.models.moss_tts.request_builders import build_row_cache_key_ids
+    from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
+
+    end_id = 151670
+    slot_id = 151656
+    rows = torch.full((3, N_VQ + 1), 7, dtype=torch.long)
+    rows[:, 0] = torch.tensor([slot_id, end_id, slot_id])
+    rows[2, 1:] = torch.arange(N_VQ)
+    next_text = rows[:, 0].clone()
+
+    out = MossTTSLocalModelRunner._row_radix_token_ids(rows, next_text, end_id)
+    expected = [k % 151643 for k in build_row_cache_key_ids(rows)]
+    assert int(out[1]) == end_id  # stop decision keeps the raw eos id
+    assert int(out[0]) == expected[0]
+    assert int(out[2]) == expected[2]
+    assert int(out[0]) != int(out[2])  # different codes -> different keys
+    assert int(out[0]) != slot_id  # no longer the constant slot id
+    # Generated ids must stay inside the vocab: the scheduler finishes any
+    # request whose output id crosses the vocab boundary.
+    assert all(0 <= int(v) < 151936 for v in out)
+
+
 def test_gather_rep_histories_excludes_prompt_and_inactive_rows():
     from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
 
