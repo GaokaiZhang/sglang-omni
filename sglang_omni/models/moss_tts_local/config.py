@@ -5,9 +5,40 @@ from __future__ import annotations
 
 from typing import ClassVar
 
+from pydantic import Field
+
 from sglang_omni.config import PipelineConfig, StageConfig
 
 _PKG = "sglang_omni.models.moss_tts_local"
+
+
+def _stages(*, codec_device: str) -> list[StageConfig]:
+    return [
+        StageConfig(
+            name="preprocessing",
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_preprocessing_executor",
+            factory_args={"device": codec_device},
+            gpu=0,
+            next="tts_engine",
+        ),
+        StageConfig(
+            name="tts_engine",
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
+            factory_args={"gpu_id": 0, "dtype": "bfloat16"},
+            gpu=0,
+            next="vocoder",
+        ),
+        StageConfig(
+            name="vocoder",
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_vocoder_executor",
+            factory_args={"device": codec_device},
+            gpu=0,
+            terminal=True,
+        ),
+    ]
 
 
 class MossTTSLocalPipelineConfig(PipelineConfig):
@@ -16,10 +47,12 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
     Resolves OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5, whose checkpoint
     declares ``architectures: ["MossTTSLocalModel"]``, so serving by model id
     works without an explicit config file. The AR engine runs on GPU 0; the
-    48 kHz stereo v2 codec (reference encode + vocoder) auto-places on the
-    second visible GPU when one exists — its ~1B-param encoder otherwise
-    competes with the AR decode loop — and falls back to GPU 0 on
-    single-GPU hosts.
+    48 kHz stereo v2 codec (reference encode + vocoder) is explicitly placed
+    on GPU 1 because its ~1B-param encoder otherwise competes with the AR
+    decode loop. The three stages stay in one process because preprocessing
+    hands scheduler-owned prompt state to the AR request builder through an
+    in-process table. Use ``MossTTSLocalColocatedPipelineConfig`` for single-GPU
+    deployments.
     """
 
     architecture: ClassVar[str] = "MossTTSLocalModel"
@@ -37,30 +70,22 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
         return {"talker": "tts_engine"}
 
     model_path: str
-    stages: list[StageConfig] = [
-        StageConfig(
-            name="preprocessing",
-            process="pipeline",
-            factory=f"{_PKG}.stages.create_preprocessing_executor",
-            gpu=0,
-            next="tts_engine",
-        ),
-        StageConfig(
-            name="tts_engine",
-            process="pipeline",
-            factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
-            factory_args={"gpu_id": 0, "dtype": "bfloat16"},
-            gpu=0,
-            next="vocoder",
-        ),
-        StageConfig(
-            name="vocoder",
-            process="pipeline",
-            factory=f"{_PKG}.stages.create_vocoder_executor",
-            gpu=0,
-            terminal=True,
-        ),
-    ]
+    stages: list[StageConfig] = Field(
+        default_factory=lambda: _stages(codec_device="cuda:1")
+    )
+
+
+class MossTTSLocalColocatedPipelineConfig(MossTTSLocalPipelineConfig):
+    """Single-GPU variant that colocates the codec with the AR engine."""
+
+    stages: list[StageConfig] = Field(
+        default_factory=lambda: _stages(codec_device="cuda:0")
+    )
 
 
 EntryClass = MossTTSLocalPipelineConfig
+
+Variants = {
+    "default": MossTTSLocalPipelineConfig,
+    "colocated": MossTTSLocalColocatedPipelineConfig,
+}

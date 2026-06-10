@@ -9,7 +9,11 @@ import pytest
 import torch
 
 from sglang_omni.client.audio import encode_audio, encode_wav
-from sglang_omni.models.moss_tts_local.config import MossTTSLocalPipelineConfig
+from sglang_omni.config.placement import build_stage_placement_plan
+from sglang_omni.models.moss_tts_local.config import (
+    MossTTSLocalColocatedPipelineConfig,
+    MossTTSLocalPipelineConfig,
+)
 from sglang_omni.models.moss_tts_local.local_transformer import (
     MossTTSLocalTransformer,
     _rotate_half_interleaved,
@@ -160,16 +164,34 @@ def test_registry_resolves_local_architecture():
 
 
 def test_pipeline_stage_wiring():
-    stages = {
-        stage.name: stage
-        for stage in MossTTSLocalPipelineConfig.model_fields["stages"].default
-    }
+    config = MossTTSLocalPipelineConfig(model_path="OpenMOSS-Team/moss-local-test")
+    stages = {stage.name: stage for stage in config.stages}
     assert set(stages) == {"preprocessing", "tts_engine", "vocoder"}
     assert stages["preprocessing"].next == "tts_engine"
     assert stages["tts_engine"].next == "vocoder"
     assert stages["vocoder"].terminal
     for stage in stages.values():
         assert "moss_tts_local" in stage.factory
+    assert stages["preprocessing"].process == "pipeline"
+    assert stages["preprocessing"].gpu == 0
+    assert stages["preprocessing"].factory_args["device"] == "cuda:1"
+    assert stages["tts_engine"].process == "pipeline"
+    assert stages["tts_engine"].gpu == 0
+    assert stages["vocoder"].process == "pipeline"
+    assert stages["vocoder"].gpu == 0
+    assert stages["vocoder"].factory_args["device"] == "cuda:1"
+
+    placement = build_stage_placement_plan(config)
+    assert placement.stages["tts_engine"].gpu_ids == (0,)
+    assert placement.stages["preprocessing"].gpu_ids == (0,)
+    assert placement.stages["vocoder"].gpu_ids == (0,)
+
+    colocated = MossTTSLocalColocatedPipelineConfig(
+        model_path="OpenMOSS-Team/moss-local-test"
+    )
+    colocated_stages = {stage.name: stage for stage in colocated.stages}
+    assert colocated_stages["preprocessing"].factory_args["device"] == "cuda:0"
+    assert colocated_stages["vocoder"].factory_args["device"] == "cuda:0"
 
 
 def test_special_token_defaults_match_v15_checkpoint():

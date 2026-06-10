@@ -39,12 +39,11 @@ _MOSS_TTS_LOCAL_INSTALL_HINT = (
 )
 
 # NOTE: the preprocessing and vocoder stages each load their own processor
-# (and thus their own ~4.3 GB bf16 codec instance) even though both run in the
-# pipeline process. The codec's chunked decode flips module-global streaming
-# state (`model.streaming()`), so a decode on a shared instance corrupts any
-# concurrently running reference encode; with separate instances the encoder
-# side only ever runs stateless forwards and the streaming decode stays
-# confined to the single-threaded vocoder batch loop.
+# (and thus their own ~4.3 GB bf16 codec instance). The codec's chunked decode
+# flips module-global streaming state (`model.streaming()`), so a decode on a
+# shared instance corrupts any concurrently running reference encode; with
+# separate instances the encoder side only ever runs stateless forwards and the
+# streaming decode stays confined to the single-threaded vocoder batch loop.
 
 
 def load_state(payload: StagePayload) -> MossTTSLocalState:
@@ -66,23 +65,19 @@ def _normalize_processor_config(processor: Any) -> None:
             setattr(model_config, attr, default)
 
 
-def _resolve_codec_device(device: str | None) -> str:
+def _resolve_codec_device(device: str | None, gpu_id: int | None) -> str:
     """Pick the codec GPU for the preprocessing/vocoder stages.
 
     The ~1B-param codec encoder costs ~0.25 GPU-seconds per reference, which
-    at concurrency 16 starves the AR engine when both share one device. With
-    an explicit ``device`` that placement is honored; otherwise the codec
-    tensors land on the second visible GPU when one exists, else GPU 0. Only
-    the module placement moves — the stages stay in the single pipeline
-    process group on GPU 0 (one process group must not span GPUs).
+    at concurrency 16 starves the AR engine when both share one device.
+    The default config passes an explicit ``device`` so the second-GPU codec
+    placement is visible in the pipeline config. ``gpu_id`` remains a fallback
+    for custom colocated configs and launcher-injected runtime defaults.
     """
     if device:
         return device
-    try:
-        if torch.cuda.device_count() > 1:
-            return "cuda:1"
-    except Exception:
-        pass
+    if gpu_id is not None:
+        return f"cuda:{int(gpu_id)}"
     return "cuda:0"
 
 
@@ -236,11 +231,12 @@ def create_preprocessing_executor(
     model_path: str,
     *,
     device: str | None = None,
+    gpu_id: int | None = None,
     max_concurrency: int = 16,
     encode_batch_size: int = 8,
     encode_batch_wait_ms: int = 4,
 ) -> SimpleScheduler:
-    device = _resolve_codec_device(device)
+    device = _resolve_codec_device(device, gpu_id)
     processor = _load_moss_tts_local_processor(model_path, device=device)
     reference_encoder = _BatchedReferenceEncoder(
         processor,
@@ -372,10 +368,11 @@ def create_vocoder_executor(
     model_path: str,
     *,
     device: str | None = None,
+    gpu_id: int | None = None,
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
 ) -> SimpleScheduler:
-    device = _resolve_codec_device(device)
+    device = _resolve_codec_device(device, gpu_id)
     processor = _load_moss_tts_local_processor(model_path, device=device)
 
     def _prepare_codes(
