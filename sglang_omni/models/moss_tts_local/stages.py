@@ -219,7 +219,11 @@ class _BatchedReferenceEncoder:
             for path, future in batch:
                 outcome = results.get(path)
                 if isinstance(outcome, Exception):
-                    future.set_exception(outcome)
+                    # Fresh exception per future: a shared instance would be
+                    # mutated concurrently by every waiter's traceback raise.
+                    future.set_exception(
+                        RuntimeError(f"reference encode failed for {path}: {outcome}")
+                    )
                 elif outcome is None:
                     future.set_exception(
                         RuntimeError(f"reference encode produced no codes: {path}")
