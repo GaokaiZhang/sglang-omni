@@ -316,7 +316,11 @@ List what's configured:
 ```
 python .claude/skills/tune-ci-thresholds/tune.py models-list
 ```
-Today: `qwen3-omni-v1`, `qwen3-asr-v1`, `tts`. To add another model,
+Today: `qwen3-omni-v1`, `qwen3-asr-v1`, `tts`. The `tts` model covers the
+Higgs pipeline only; the multi-model random-pick TTS CI (issue #724) needs
+per-model configs and per-model threshold writing — see
+`multi-model-random-pick-proposal.md` in this directory before calibrating
+any non-Higgs TTS model. To add another model,
 drop in a new `models/<name>/config.yaml` and run `tune.py discover
 --model <name>`. No Python code changes needed unless the new model
 emits metrics with a
