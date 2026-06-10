@@ -389,9 +389,7 @@ def build_sglang_moss_tts_local_request(
         audio_temperature=float(gen_kwargs.get("audio_temperature", 1.7)),
         audio_top_p=float(gen_kwargs.get("audio_top_p", 0.8)),
         audio_top_k=int(gen_kwargs.get("audio_top_k", 25)),
-        audio_repetition_penalty=float(
-            gen_kwargs.get("audio_repetition_penalty", 1.0)
-        ),
+        audio_repetition_penalty=float(gen_kwargs.get("audio_repetition_penalty", 1.0)),
         seed=gen_kwargs.get("seed"),
         sampling_seed=(
             derive_moss_tts_sampling_seed(gen_kwargs["seed"])

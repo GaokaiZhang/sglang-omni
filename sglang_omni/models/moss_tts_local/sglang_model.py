@@ -105,9 +105,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             num_layers=int(getattr(self.config, "local_transformer_layers", 1)),
             max_positions=self.n_vq + 1,
             rope_base=float(self._cfg_get(gpt2_cfg, "rope_base", 1_000_000.0)),
-            layer_norm_eps=float(
-                self._cfg_get(gpt2_cfg, "layer_norm_epsilon", 1e-6)
-            ),
+            layer_norm_eps=float(self._cfg_get(gpt2_cfg, "layer_norm_epsilon", 1e-6)),
         )
         # Binary continue/stop head over the local position-0 hidden state:
         # index 0 -> audio_assistant_slot (emit a frame), 1 -> audio_end (stop).
@@ -404,7 +402,9 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
             return
         device = self.device
         self.local_transformer._ensure_kv_cache(max(buckets), device, self.dtype)
-        self._frame_graphs: dict[int, tuple[Any, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]] = {}
+        self._frame_graphs: dict[
+            int, tuple[Any, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]
+        ] = {}
 
         for bucket in buckets:
             static_inputs = {
@@ -426,9 +426,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                     (bucket,), 25, device=device, dtype=torch.long
                 ),
                 "seeds": torch.zeros(bucket, device=device, dtype=torch.long),
-                "base_positions": torch.zeros(
-                    bucket, device=device, dtype=torch.long
-                ),
+                "base_positions": torch.zeros(bucket, device=device, dtype=torch.long),
             }
             warmup_stream = torch.cuda.Stream()
             warmup_stream.wait_stream(torch.cuda.current_stream())
@@ -581,9 +579,7 @@ class MossTTSLocalSGLangModel(torch.nn.Module):
                     rows = int(loaded_weight.shape[0])
                     with torch.no_grad():
                         param.data[:rows].copy_(
-                            loaded_weight.to(
-                                device=param.device, dtype=param.dtype
-                            )
+                            loaded_weight.to(device=param.device, dtype=param.dtype)
                         )
                 continue
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import struct
-import types
 
 import numpy as np
 import pytest
@@ -60,8 +59,7 @@ def _reference_full_forward(
     head_dim = module.head_dim
 
     inv_freq = 1.0 / (
-        1_000_000.0
-        ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        1_000_000.0 ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
     )
     positions = torch.arange(seq, dtype=torch.float32)
     freqs = torch.outer(positions, inv_freq)
@@ -110,9 +108,7 @@ def test_local_transformer_incremental_matches_full_recompute(num_layers: int):
     inputs = torch.randn(batch, seq, 64)
 
     reference = _reference_full_forward(module, inputs)
-    stepped = torch.stack(
-        [module.step(inputs[:, t], t) for t in range(seq)], dim=1
-    )
+    stepped = torch.stack([module.step(inputs[:, t], t) for t in range(seq)], dim=1)
     torch.testing.assert_close(stepped, reference, rtol=1e-4, atol=1e-5)
 
 
@@ -164,9 +160,10 @@ def test_registry_resolves_local_architecture():
 
 
 def test_pipeline_stage_wiring():
-    stages = {stage.name: stage for stage in MossTTSLocalPipelineConfig.model_fields[
-        "stages"
-    ].default}
+    stages = {
+        stage.name: stage
+        for stage in MossTTSLocalPipelineConfig.model_fields["stages"].default
+    }
     assert set(stages) == {"preprocessing", "tts_engine", "vocoder"}
     assert stages["preprocessing"].next == "tts_engine"
     assert stages["tts_engine"].next == "vocoder"
@@ -307,9 +304,7 @@ def test_preprocess_and_result_adapter():
             engine_start_s=0.0,
         )
         data.output_rows = [
-            torch.cat(
-                [torch.tensor([151656]), torch.arange(N_VQ, dtype=torch.long)]
-            )
+            torch.cat([torch.tensor([151656]), torch.arange(N_VQ, dtype=torch.long)])
             for _ in range(3)
         ]
         result = apply_sglang_moss_tts_local_result(payload, data)
@@ -343,9 +338,7 @@ def test_result_adapter_empty_generation():
 
 
 def test_audio_repetition_penalty_matches_upstream_semantics():
-    from sglang_omni.models.moss_tts_local.model_runner import (
-        MossTTSLocalModelRunner,
-    )
+    from sglang_omni.models.moss_tts_local.model_runner import MossTTSLocalModelRunner
 
     logits = torch.tensor(
         [[2.0, -1.0, 0.5, 3.0], [1.0, 1.0, 1.0, 1.0]], dtype=torch.float32

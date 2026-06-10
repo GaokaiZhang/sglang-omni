@@ -154,7 +154,9 @@ class MossTTSLocalModelRunner(ModelRunner):
             return
         hidden_states = getattr(result.logits_output, "hidden_states", None)
         if not isinstance(hidden_states, torch.Tensor):
-            raise RuntimeError("MOSS-TTS Local model output did not include hidden states")
+            raise RuntimeError(
+                "MOSS-TTS Local model output did not include hidden states"
+            )
         if hidden_states.ndim == 3:
             hidden_states = hidden_states[:, -1, :]
 
@@ -219,9 +221,8 @@ class MossTTSLocalModelRunner(ModelRunner):
                 positions=gen_steps * num_channels + channel + 1,
             )
 
-        use_graph = (
-            rep_histories is None
-            and batch_size <= getattr(self.model, "frame_graph_max_bs", 0)
+        use_graph = rep_histories is None and batch_size <= getattr(
+            self.model, "frame_graph_max_bs", 0
         )
         if use_graph:
             stop_choice, codes = self.model.decode_frame_graphed(
@@ -250,9 +251,7 @@ class MossTTSLocalModelRunner(ModelRunner):
             torch.full((batch_size,), end_id, dtype=torch.long, device=device),
         )
 
-        rows = torch.empty(
-            (batch_size, num_channels), dtype=torch.long, device=device
-        )
+        rows = torch.empty((batch_size, num_channels), dtype=torch.long, device=device)
         rows[:, 0] = next_text
         rows[:, 1:] = codes
 

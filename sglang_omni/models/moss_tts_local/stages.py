@@ -187,9 +187,9 @@ class _BatchedReferenceEncoder:
                 )
                 for path in unique_paths:
                     try:
-                        results[path] = self._processor.encode_audios_from_path(
-                            [path]
-                        )[0]
+                        results[path] = self._processor.encode_audios_from_path([path])[
+                            0
+                        ]
                     except Exception as exc:
                         results[path] = exc
             for path, future in batch:
