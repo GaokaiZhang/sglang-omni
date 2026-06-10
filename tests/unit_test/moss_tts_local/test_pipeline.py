@@ -524,6 +524,48 @@ def test_decode_frame_graphed_matches_branchless_eager():
     torch.testing.assert_close(from_graph, eager)
 
 
+def test_reference_codes_cache_hits_and_invalidation(tmp_path):
+    import os
+
+    from sglang_omni.models.moss_tts_local.stages import (
+        _BatchedReferenceEncoder,
+        _ReferenceCodesCache,
+    )
+
+    calls = []
+
+    class _CountingProcessor:
+        def encode_audios_from_path(self, paths):
+            calls.extend(paths)
+            return [torch.full((4, N_VQ), len(p), dtype=torch.long) for p in paths]
+
+    ref = tmp_path / "voice.wav"
+    ref.write_bytes(b"a" * 64)
+    cache = _ReferenceCodesCache(max_items=4)
+    encoder = _BatchedReferenceEncoder(
+        _CountingProcessor(), max_batch_size=2, max_batch_wait_ms=1, cache=cache
+    )
+
+    first = encoder.encode(str(ref))
+    second = encoder.encode(str(ref))
+    assert len(calls) == 1  # second request served from cache
+    torch.testing.assert_close(first, second)
+    assert cache.hits == 1
+
+    # Content change invalidates via the stat signature -> new content key.
+    ref.write_bytes(b"b" * 128)
+    os.utime(ref, ns=(1, 1))
+    encoder.encode(str(ref))
+    assert len(calls) == 2
+
+    # Eviction respects the item cap.
+    for i in range(5):
+        extra = tmp_path / f"v{i}.wav"
+        extra.write_bytes(bytes([i]) * 32)
+        encoder.encode(str(extra))
+    assert len(cache._entries) <= 4
+
+
 def test_batched_reference_encoder_coalesces_and_isolates_errors():
     import threading
 

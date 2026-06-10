@@ -122,6 +122,85 @@ def _build_usage(state: MossTTSLocalState) -> dict[str, Any] | None:
     return usage
 
 
+class _ReferenceCodesCache:
+    """Content-keyed LRU of encoded reference codes (Higgs-style, #562).
+
+    Keys are a blake2b hash of the file contents, memoized per
+    ``(path, size, mtime_ns)`` stat signature so unchanged files hash once.
+    Values are the CPU ``[T, n_vq]`` code tensors. Repeated reference audio
+    (the common voice-cloning pattern: one voice, many requests) then skips
+    the codec encode entirely.
+    """
+
+    def __init__(self, max_items: int = 256, max_bytes: int = 256 * 1024 * 1024):
+        import collections
+
+        self._max_items = int(max_items)
+        self._max_bytes = int(max_bytes)
+        self._lock = threading.Lock()
+        self._stat_memo: dict[str, tuple[tuple[int, int], str]] = {}
+        self._entries: "collections.OrderedDict[str, torch.Tensor]" = (
+            collections.OrderedDict()
+        )
+        self._bytes = 0
+        self.hits = 0
+        self.misses = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self._max_items > 0 and self._max_bytes > 0
+
+    def _content_key(self, path: str) -> str | None:
+        import hashlib
+        import os
+
+        try:
+            stat = os.stat(path)
+            signature = (int(stat.st_size), int(stat.st_mtime_ns))
+        except OSError:
+            return None
+        with self._lock:
+            memo = self._stat_memo.get(path)
+            if memo is not None and memo[0] == signature:
+                return memo[1]
+        try:
+            digest = hashlib.blake2b(open(path, "rb").read(), digest_size=16)
+        except OSError:
+            return None
+        key = digest.hexdigest()
+        with self._lock:
+            self._stat_memo[path] = (signature, key)
+        return key
+
+    def get(self, key: str | None) -> torch.Tensor | None:
+        if key is None:
+            return None
+        with self._lock:
+            codes = self._entries.get(key)
+            if codes is None:
+                self.misses += 1
+                return None
+            self._entries.move_to_end(key)
+            self.hits += 1
+            return codes
+
+    def put(self, key: str | None, codes: torch.Tensor) -> None:
+        if key is None or not self.enabled:
+            return
+        size = codes.numel() * codes.element_size()
+        with self._lock:
+            previous = self._entries.pop(key, None)
+            if previous is not None:
+                self._bytes -= previous.numel() * previous.element_size()
+            self._entries[key] = codes
+            self._bytes += size
+            while self._entries and (
+                len(self._entries) > self._max_items or self._bytes > self._max_bytes
+            ):
+                _, evicted = self._entries.popitem(last=False)
+                self._bytes -= evicted.numel() * evicted.element_size()
+
+
 class _BatchedReferenceEncoder:
     """Coalesces concurrent reference-audio encodes into batched codec calls.
 
@@ -129,8 +208,9 @@ class _BatchedReferenceEncoder:
     (~0.25 GPU-seconds). The preprocessing workers call :meth:`encode`
     concurrently; a single daemon thread drains the queue and encodes up to
     ``max_batch_size`` files in one ``batch_encode`` forward, which costs
-    barely more than a single encode. Failures fall back to per-item encodes
-    so one bad file only fails its own request.
+    barely more than a single encode. Encoded codes land in a content-keyed
+    LRU so repeated reference audio skips the codec. Failures fall back to
+    per-item encodes so one bad file only fails its own request.
     """
 
     # Mirrors the Higgs reference-audio cap: bounds both encoder runtime and
@@ -146,10 +226,12 @@ class _BatchedReferenceEncoder:
         *,
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 4,
+        cache: _ReferenceCodesCache | None = None,
     ) -> None:
         self._processor = processor
         self._max_batch_size = max(int(max_batch_size), 1)
         self._max_wait_s = max(float(max_batch_wait_ms), 0.0) / 1000.0
+        self._cache = cache
         self._queue: queue.Queue[tuple[str, concurrent.futures.Future]] = queue.Queue()
         self._thread = threading.Thread(
             target=self._worker, name="moss-local-ref-encode", daemon=True
@@ -174,10 +256,19 @@ class _BatchedReferenceEncoder:
     def encode(self, path: str) -> torch.Tensor:
         """Encode one reference file; blocks until its batch completes."""
         path = str(path)
+        cache_key = None
+        if self._cache is not None and self._cache.enabled:
+            cache_key = self._cache._content_key(path)
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
         self._check_reference_duration(path)
         future: concurrent.futures.Future = concurrent.futures.Future()
         self._queue.put((path, future))
-        return future.result(timeout=self.ENCODE_TIMEOUT_S)
+        codes = future.result(timeout=self.ENCODE_TIMEOUT_S)
+        if self._cache is not None:
+            self._cache.put(cache_key, codes)
+        return codes
 
     def _drain_batch(self) -> list[tuple[str, concurrent.futures.Future]]:
         batch = [self._queue.get()]
@@ -235,6 +326,8 @@ def create_preprocessing_executor(
     max_concurrency: int = 16,
     encode_batch_size: int = 8,
     encode_batch_wait_ms: int = 4,
+    encode_cache_items: int = 256,
+    encode_cache_mb: int = 256,
 ) -> SimpleScheduler:
     device = _resolve_codec_device(device, gpu_id)
     processor = _load_moss_tts_local_processor(model_path, device=device)
@@ -242,6 +335,10 @@ def create_preprocessing_executor(
         processor,
         max_batch_size=encode_batch_size,
         max_batch_wait_ms=encode_batch_wait_ms,
+        cache=_ReferenceCodesCache(
+            max_items=encode_cache_items,
+            max_bytes=encode_cache_mb * 1024 * 1024,
+        ),
     )
     set_moss_tts_local_preprocessing_context(
         processor=processor, reference_encoder=reference_encoder
