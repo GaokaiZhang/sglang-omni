@@ -195,7 +195,10 @@ class Client:
         if len(audio_chunks) == 1:
             audio_data = audio_chunks[0]
         else:
-            audio_data = np.concatenate([to_numpy(c) for c in audio_chunks])
+            arrays = [to_numpy(c) for c in audio_chunks]
+            # Rank-2 chunks are [channels, samples]: concatenate on time.
+            axis = -1 if arrays[0].ndim > 1 else 0
+            audio_data = np.concatenate(arrays, axis=axis)
 
         encode_kwargs: dict[str, Any] = {
             "response_format": response_format,

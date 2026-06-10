@@ -130,13 +130,21 @@ def apply_speed(
 
 
 def encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
-    """Encode audio as a WAV file (16-bit PCM)."""
+    """Encode audio as a WAV file (16-bit PCM).
+
+    Accepts rank-1 mono or rank-2 ``(channels, samples)`` input; multi-channel
+    samples are interleaved per the WAV spec.
+    """
     # Clamp to [-1, 1]
     audio = np.clip(audio, -1.0, 1.0)
     pcm = (audio * 32767.0).astype(np.int16)
-    pcm_bytes = pcm.tobytes()
+    if pcm.ndim == 2:
+        num_channels = int(pcm.shape[0])
+        pcm_bytes = np.ascontiguousarray(pcm.T).tobytes()
+    else:
+        num_channels = 1
+        pcm_bytes = pcm.tobytes()
 
-    num_channels = 1
     bits_per_sample = 16
     byte_rate = sample_rate * num_channels * bits_per_sample // 8
     block_align = num_channels * bits_per_sample // 8
@@ -234,9 +242,15 @@ def _encode_with_pyav(
 
 
 def encode_pcm(audio: np.ndarray, sample_rate: int) -> bytes:
-    """Encode audio as raw 16-bit PCM bytes."""
+    """Encode audio as raw 16-bit PCM bytes.
+
+    Rank-2 ``(channels, samples)`` input is interleaved sample-major.
+    """
     audio = np.clip(audio, -1.0, 1.0)
-    return (audio * 32767.0).astype(np.int16).tobytes()
+    pcm = (audio * 32767.0).astype(np.int16)
+    if pcm.ndim == 2:
+        pcm = np.ascontiguousarray(pcm.T)
+    return pcm.tobytes()
 
 
 def encode_audio(
@@ -263,16 +277,22 @@ def encode_audio(
     if arr.ndim > 1:
         arr = arr.squeeze()
     if arr.ndim > 1:
-        # Multi-channel: take first channel.
-        # Handle both (channels, samples) and (samples, channels).
-        if arr.shape[0] < arr.shape[-1]:
+        # Multi-channel: normalize to (channels, samples). WAV and PCM keep
+        # every channel (interleaved); the compressed mono encoders fall back
+        # to the first channel as before.
+        if arr.shape[0] > arr.shape[-1]:
+            arr = arr.T
+        if response_format.lower().strip() not in ("wav", "pcm"):
             arr = arr[0]
-        else:
-            arr = arr[:, 0]
 
     # Apply speed
     if speed != 1.0:
-        arr, sample_rate = apply_speed(arr, speed, sample_rate)
+        if arr.ndim > 1:
+            adjusted = [apply_speed(channel, speed, sample_rate) for channel in arr]
+            arr = np.stack([channel for channel, _ in adjusted])
+            sample_rate = adjusted[0][1]
+        else:
+            arr, sample_rate = apply_speed(arr, speed, sample_rate)
 
     fmt = response_format.lower().strip()
     mime = FORMAT_MIME_TYPES.get(fmt, "application/octet-stream")
