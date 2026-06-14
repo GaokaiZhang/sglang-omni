@@ -72,6 +72,18 @@ def decode_to_pcm(
     return _get_vocoder(device).decode(audio_codes, eos_frame=eos_frame)
 
 
+def decode_batch(
+    audio_codes_list: list[torch.Tensor],
+    eos_frames: list[int | None],
+    device: str = "cuda",
+) -> list[torch.Tensor]:
+    """Batched analogue of ``decode_to_pcm``: one DAC forward for many items.
+
+    Reuses the process-wide DAC cache, so no second checkpoint load.
+    """
+    return _get_vocoder(device).decode_batch(audio_codes_list, eos_frames)
+
+
 # ---- streaming (incremental raised-cosine OLA) ----
 
 
@@ -326,4 +338,4 @@ class Zonos2StreamingVocoderScheduler(StreamingSimpleScheduler):
         )
 
 
-__all__ = ["decode_to_pcm", "Zonos2StreamingVocoderScheduler"]
+__all__ = ["decode_to_pcm", "decode_batch", "Zonos2StreamingVocoderScheduler"]

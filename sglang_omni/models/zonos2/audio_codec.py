@@ -98,3 +98,64 @@ class Zonos2DACVocoder:
         audio = self._dac.decode(z).float().squeeze(1).cpu()
 
         return audio[0].contiguous()
+
+    @torch.inference_mode()
+    def decode_batch(
+        self,
+        audio_codes_list: list[torch.Tensor],
+        eos_frames: list[int | None],
+    ) -> list[torch.Tensor]:
+        """Decode many delayed ``[T_i, 9]`` code tensors in ONE DAC forward.
+
+        Returns one 1-D float32 CPU PCM tensor per input, trimmed to its own
+        valid frame count (empty when the item has no aligned frames). Each item
+        is sheared and trimmed individually (the delay pattern is per-item),
+        then right-padded to the longest valid length before the shared decode.
+        """
+        if len(audio_codes_list) != len(eos_frames):
+            raise ValueError("audio_codes_list and eos_frames length mismatch")
+        results: list[torch.Tensor] = [
+            torch.zeros(0, dtype=torch.float32) for _ in audio_codes_list
+        ]
+        sheared: list[torch.Tensor] = []
+        valids: list[int] = []
+        keep: list[int] = []
+        for i, (item, eos_frame) in enumerate(zip(audio_codes_list, eos_frames)):
+            codes = torch.as_tensor(item, dtype=torch.long, device=self.device)
+            if codes.ndim != 2:
+                raise ValueError(
+                    f"each audio_codes entry must be [T, 9], got shape "
+                    f"{tuple(codes.shape)}"
+                )
+            codes = shear_up(codes, self.audio_pad_id)
+            valid = codes.shape[0] - (self.n_codebooks - 1)
+            if eos_frame is not None:
+                valid = min(valid, max(0, int(eos_frame)))
+            if valid <= 0:
+                continue
+            sheared.append(codes[:valid, :])
+            valids.append(valid)
+            keep.append(i)
+
+        if not keep:
+            return results
+
+        t_max = max(valids)
+        batch = torch.full(
+            (len(keep), t_max, self.n_codebooks),
+            self.audio_pad_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        for j, codes in enumerate(sheared):
+            batch[j, : codes.shape[0], :] = codes
+        batch = torch.clamp(batch, max=_MAX_VALID_CODE)
+
+        # DAC expects (batch, codebooks, seq); float32 for stable ConvTranspose.
+        batch = batch.permute(0, 2, 1).contiguous()
+        z = self._dac.quantizer.from_codes(batch)[0]
+        audio = self._dac.decode(z).float().squeeze(1).cpu()
+
+        for j, i in enumerate(keep):
+            results[i] = audio[j, : valids[j] * self.hop_length].contiguous()
+        return results
