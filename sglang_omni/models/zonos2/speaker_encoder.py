@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import subprocess
+import threading
 import wave
 from collections import OrderedDict
 from functools import cache
@@ -41,9 +43,11 @@ class Qwen3SpeakerEmbedding(nn.Module):
     F_MIN = 0.0
     F_MAX = 12_000.0
 
-    def __init__(self, device: str = "cuda"):
+    def __init__(self, device: str = "cuda", compile_forward: bool = False):
         super().__init__()
         self.device = device
+        self._compile_forward = compile_forward
+        self._compiled = None
         self.model = AutoModel.from_pretrained(
             self.MODEL_NAME,
             trust_remote_code=True,
@@ -93,10 +97,21 @@ class Qwen3SpeakerEmbedding(nn.Module):
         mel = torch.log(torch.clamp(mel, min=1e-5))
         return mel.transpose(1, 2)
 
-    def forward(self, wav: torch.Tensor, sample_rate: int):
+    def _forward_impl(self, wav: torch.Tensor, sample_rate: int):
         wav = self.prepare_input(wav, sample_rate)
         mel = self._make_mel(wav)
+        if self._compile_forward:
+            # note (Yue Yin): mark the mel time dim symbolic so dynamic=True yields
+            # one graph across variable audio lengths instead of per-length recompiles.
+            torch._dynamo.mark_dynamic(mel, 1)
         return self.model(input_values=mel).last_hidden_state.to(torch.float32)
+
+    def forward(self, wav: torch.Tensor, sample_rate: int):
+        if not self._compile_forward:
+            return self._forward_impl(wav, sample_rate)
+        if self._compiled is None:
+            self._compiled = torch.compile(self._forward_impl, dynamic=True)
+        return self._compiled(wav, sample_rate)
 
 
 def _transcode_audio_bytes_to_wav(audio_bytes: bytes) -> bytes:
@@ -194,10 +209,18 @@ class SpeakerEncoder:
         self._embedder: Qwen3SpeakerEmbedding | None = None
         self._cache: "OrderedDict[str, torch.Tensor]" = OrderedDict()
         self._last_fingerprint: str | None = None
+        # note (Yue Yin): opt-in compile kill-switch (default OFF for bit-for-bit
+        # parity), mirroring the ZONOS2_TTS_NORM env idiom in text_frontend.py.
+        self._compile = os.environ.get("ZONOS2_SPK_COMPILE", "0") == "1"
+        # note (Yue Yin): max_concurrency=4 dispatches encode() across threads that
+        # share one CUDA model + one LRU; serialize the body to keep it re-entrant.
+        self._lock = threading.Lock()
 
     def _get_embedder(self) -> Qwen3SpeakerEmbedding:
         if self._embedder is None:
-            self._embedder = Qwen3SpeakerEmbedding(device=self.device)
+            self._embedder = Qwen3SpeakerEmbedding(
+                device=self.device, compile_forward=self._compile
+            )
         return self._embedder
 
     @staticmethod
@@ -257,20 +280,23 @@ class SpeakerEncoder:
         ``(waveform, sample_rate)`` pair.
         """
         wav, sr, key = self._load_waveform(ref_audio, sample_rate)
-        self._last_fingerprint = key
 
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._cache.move_to_end(key)
-            return cached.clone()  # clone so callers can't mutate the cached tensor
+        with self._lock:
+            self._last_fingerprint = key
 
-        embedder = self._get_embedder()
-        with torch.inference_mode():
-            output = embedder(wav, sr)
+            cached = self._cache.get(key)
+            if cached is not None:
+                self._cache.move_to_end(key)
+                # clone so callers can't mutate the cached tensor
+                return cached.clone()
 
-        emb = self._select_embedding(output)
-        self._cache_put(key, emb)
-        return emb.clone()
+            embedder = self._get_embedder()
+            with torch.inference_mode():
+                output = embedder(wav, sr)
+
+            emb = self._select_embedding(output)
+            self._cache_put(key, emb)
+            return emb.clone()
 
     def fingerprint(self) -> str | None:
         """Content-hash string of the most recent :meth:`encode` call."""
