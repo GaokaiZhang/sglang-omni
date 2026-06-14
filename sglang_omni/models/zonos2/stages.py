@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from sglang_omni.models.zonos2.payload_types import Zonos2State
+from sglang_omni.models.zonos2.payload_types import N_CODEBOOKS, Zonos2State
 from sglang_omni.models.zonos2.request_builders import (
     build_zonos2_state,
     ref_audio_to_encoder_input,
@@ -247,7 +247,7 @@ def create_vocoder_executor(
     # output vs the single decode. Keep it opt-in (default off) until GPU
     # allclose-vs-single parity is confirmed; default path stays single-decode.
     batch_enabled = os.environ.get("ZONOS2_DAC_BATCH", "0") == "1"
-    return Zonos2StreamingVocoderScheduler(
+    scheduler = Zonos2StreamingVocoderScheduler(
         device=device,
         compute_fn=_vocode,
         batch_compute_fn=_vocode_batch if batch_enabled else None,
@@ -256,3 +256,17 @@ def create_vocoder_executor(
         request_cost_fn=_request_cost if batch_enabled else None,
         max_batch_cost=32768 if batch_enabled else None,
     )
+    # note (Yue Yin): opt-in warmup moves the one-time DAC load + conv autotune
+    # off the first request's critical path to startup. N_CODEBOOKS+1 rows keep
+    # 2 aligned frames after the de-shear so a real decode warms the kernels.
+    # Never fatal -- the lazy load still happens on first decode if this fails.
+    if os.environ.get("ZONOS2_VOCODER_WARMUP", "0") == "1":
+        try:
+            decode_to_pcm(
+                torch.zeros((N_CODEBOOKS + 1, N_CODEBOOKS), dtype=torch.long),
+                device=device,
+            )
+            logger.info("ZONOS2 DAC vocoder warmed up at startup")
+        except Exception:  # noqa: BLE001 - warmup must never block server start
+            logger.warning("ZONOS2 vocoder warmup failed", exc_info=True)
+    return scheduler
