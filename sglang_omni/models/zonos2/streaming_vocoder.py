@@ -43,6 +43,11 @@ _STREAM_INITIAL_CHUNK_FRAMES = 5  # ~0.06 s first chunk for low TTFB
 _STREAM_OLA_OVERLAP_FRAMES = 2  # note (Yue Yin): cross-fade width; TODO calibrate
 # shear_up needs the trailing N_CODEBOOKS-1 future rows to de-shear a frame.
 _STREAM_WITHHOLD_TAIL = N_CODEBOOKS - 1
+# note (Yue Yin): the AR engine appends n+1 post-EOS countdown rows that the
+# one-shot path trims via eos_frame. eos_frame is unknown mid-stream, so steady
+# pulls hold this region back; the eos_frame-capped flush at stream_done emits
+# the true tail, keeping streamed length == one-shot length.
+_STREAM_EOS_GUARD_FRAMES = N_CODEBOOKS + 1
 
 
 def _get_vocoder(device: str) -> Zonos2DACVocoder:
@@ -127,7 +132,12 @@ class _Zonos2OLADecoder:
         ovl = self.overlap
         hop = self.hop
         hold = ovl * hop
-        max_frame = len(self.rows) - _STREAM_WITHHOLD_TAIL
+        trail = (
+            _STREAM_WITHHOLD_TAIL
+            if flush
+            else _STREAM_WITHHOLD_TAIL + _STREAM_EOS_GUARD_FRAMES
+        )
+        max_frame = len(self.rows) - trail
         if eos_frame is not None:
             max_frame = min(max_frame, int(eos_frame))
         if max_frame <= 0:
@@ -246,6 +256,9 @@ class Zonos2StreamingVocoderScheduler(StreamingSimpleScheduler):
             if (not state.emitted_any and state.initial_chunk_frames > 0)
             else self._steady_chunk_frames
         )
+        # note (Yue Yin): a request-supplied chunk size <= overlap would drive the
+        # OLA cursor negative; keep at least one non-overlap frame per window.
+        chunk_frames = max(chunk_frames, self._overlap_frames + 1)
         messages: list[OutgoingMessage] = []
         for pcm in state.decoder.pull(
             _get_vocoder(self._device), chunk_frames=chunk_frames, flush=False

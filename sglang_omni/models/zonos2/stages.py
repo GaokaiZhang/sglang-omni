@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -241,12 +242,17 @@ def create_vocoder_executor(
         except (AttributeError, IndexError):
             return int(len(codes))
 
+    # note (Yue Yin): batched DAC decode coalesces non-stream requests, but joint
+    # right-padding lets ConvTranspose bleed across items and changes the gate
+    # output vs the single decode. Keep it opt-in (default off) until GPU
+    # allclose-vs-single parity is confirmed; default path stays single-decode.
+    batch_enabled = os.environ.get("ZONOS2_DAC_BATCH", "0") == "1"
     return Zonos2StreamingVocoderScheduler(
         device=device,
         compute_fn=_vocode,
-        batch_compute_fn=_vocode_batch,
-        max_batch_size=16,
-        max_batch_wait_ms=10,
-        request_cost_fn=_request_cost,
-        max_batch_cost=32768,
+        batch_compute_fn=_vocode_batch if batch_enabled else None,
+        max_batch_size=16 if batch_enabled else 1,
+        max_batch_wait_ms=10 if batch_enabled else 0,
+        request_cost_fn=_request_cost if batch_enabled else None,
+        max_batch_cost=32768 if batch_enabled else None,
     )
