@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import sys
 import threading
 from dataclasses import dataclass
 
@@ -126,8 +125,6 @@ _SPACE_PUNCT_RE = re.compile(r" +([.!?,;:])(?=\s|$)")
 # collapse the spacing we introduced ourselves.
 _MOSES_POSTPROCESS_LANGS = {"en", "zh", "ja", "ko"}
 
-_VENDORED_DIR = os.path.join(os.path.dirname(__file__), "_vendored")
-
 _NORMALIZER = None
 
 
@@ -162,9 +159,7 @@ class TTSTextNormalizer:
             return self._locks[lang]
 
     def _build(self, lang: str):
-        from zonos2.vendor.nemo_text_processing.text_normalization import (  # type: ignore
-            Normalizer,
-        )
+        from nemo_text_processing.text_normalization.normalize import Normalizer
 
         input_case = "lower_cased" if lang in _LOWER_CASED_LANGS else "cased"
         # One cache dir per (lang, case): upstream .far filenames collide
@@ -186,7 +181,7 @@ class TTSTextNormalizer:
                 cache_dir, f"{prefix}_tn_True_deterministic_verbalizer.far"
             )
             if not os.path.exists(far_path):
-                from zonos2.vendor.nemo_text_processing.text_normalization.en.graph_utils import (  # type: ignore
+                from nemo_text_processing.text_normalization.en.graph_utils import (
                     generator_main,
                 )
 
@@ -242,26 +237,13 @@ def _get_normalizer():
     global _NORMALIZER
     if _NORMALIZER is not None:
         return _NORMALIZER
-    # note (Yue Yin): expose the vendored ``zonos2.vendor.nemo_text_processing``
-    # namespace without shadowing a real ``zonos2`` install; insert once, only
-    # when the vendored package is not already importable.
-    try:
-        import importlib.util
-
-        already = importlib.util.find_spec("zonos2.vendor.nemo_text_processing")
-    except Exception:  # noqa: BLE001 - path probing must never raise
-        already = None
-    if already is None and _VENDORED_DIR not in sys.path:
-        sys.path.insert(0, _VENDORED_DIR)
     try:
         normalizer = TTSTextNormalizer()
-        # note (Yue Yin): probe-import so a missing pynini/sacremoses wheel
-        # degrades to None here rather than once per request.
+        # note (Yue Yin): probe-import so a missing nemo_text_processing /
+        # pynini wheel degrades to None here rather than once per request.
         import importlib
 
-        importlib.import_module(
-            "zonos2.vendor.nemo_text_processing.text_normalization"
-        )
+        importlib.import_module("nemo_text_processing.text_normalization.normalize")
     except Exception:  # noqa: BLE001 - missing dep must never raise
         return None
     _NORMALIZER = normalizer
