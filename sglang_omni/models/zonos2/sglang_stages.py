@@ -130,7 +130,8 @@ def create_sglang_omni_tts_engine_executor(
     )
     request_builder, result_adapter = make_zonos2_scheduler_adapters(model=model)
 
-    return OmniScheduler(
+    runner = Zonos2ModelRunner(model_worker, output_proc)
+    scheduler = OmniScheduler(
         tp_worker=model_worker,
         tree_cache=tree_cache,
         req_to_token_pool=req_to_token_pool,
@@ -139,7 +140,9 @@ def create_sglang_omni_tts_engine_executor(
         model_config=model_config,
         prefill_manager=prefill_mgr,
         decode_manager=decode_mgr,
-        model_runner=Zonos2ModelRunner(model_worker, output_proc),
+        model_runner=runner,
         request_builder=request_builder,
         result_adapter=result_adapter,
     )
+    runner.set_stream_outbox(scheduler.outbox)
+    return scheduler

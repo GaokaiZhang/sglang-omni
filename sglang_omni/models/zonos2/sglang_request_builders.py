@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 
+from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.models.zonos2.payload_types import Zonos2State
 from sglang_omni.models.zonos2.radix_hash import RADIX_HASH_SPACE, poly_row_hash
 from sglang_omni.models.zonos2.text_frontend import TTSSamplingParams, make_speaker_slot
@@ -47,6 +48,24 @@ class Zonos2SGLangRequestData(SGLangARRequestData):
     eos_countdown: int = 0
     generation_step: int = 0
     engine_start_s: float = 0.0
+    stream_metadata: dict | None = None
+    _stream_emit_idx: int = 0
+
+
+def build_zonos2_stream_metadata(payload: StagePayload, *, n_codebooks: int):
+    """Per-frame stream-chunk metadata, or None when the request is not streaming."""
+    params = payload.request.params
+    if not isinstance(params, dict) or not params.get("stream"):
+        return None
+    metadata = {
+        "stream": True,
+        "modality": "audio_codes",
+        "n_codebooks": int(n_codebooks),
+    }
+    initial = params.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM)
+    if initial is not None:
+        metadata[INITIAL_CODEC_CHUNK_FRAMES_PARAM] = initial
+    return metadata
 
 
 def _marker_token_ids(cfg) -> tuple[int, int]:
@@ -129,6 +148,9 @@ def build_sglang_zonos2_request(
         engine_start_s=time.perf_counter(),
     )
     data.stage_payload = payload
+    data.stream_metadata = build_zonos2_stream_metadata(
+        payload, n_codebooks=cfg.n_codebooks
+    )
     return data
 
 

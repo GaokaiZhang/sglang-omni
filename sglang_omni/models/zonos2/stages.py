@@ -172,9 +172,12 @@ def create_sglang_tts_engine_executor(
 
 
 def create_vocoder_executor(
-    model_path: str, *, device: str = "cuda:0", max_concurrency: int = 2, **_: Any
-) -> SimpleScheduler:
-    from sglang_omni.models.zonos2.streaming_vocoder import decode_to_pcm
+    model_path: str, *, device: str = "cuda:0", **_: Any
+) -> Any:
+    from sglang_omni.models.zonos2.streaming_vocoder import (
+        Zonos2StreamingVocoderScheduler,
+        decode_to_pcm,
+    )
 
     def _vocode(payload: StagePayload) -> StagePayload:
         state = Zonos2State.from_dict(payload.data)
@@ -208,4 +211,4 @@ def create_vocoder_executor(
             request_id=payload.request_id, request=payload.request, data=data
         )
 
-    return SimpleScheduler(_vocode, max_concurrency=max_concurrency)
+    return Zonos2StreamingVocoderScheduler(device=device, compute_fn=_vocode)
