@@ -72,6 +72,11 @@ dependencies = [
     # Ming-Omni
     "diffusers==0.37.0",      # Align with sglang 0.5.12.post1 hard pin (diffusers==0.37.0)
     "x-transformers",          # Ming talker rotary embeddings
+    # ZONOS2 vendored NeMo TTS text normalization (sglang_omni/models/zonos2/_vendored).
+    # pynini matches WeTextProcessing's pin (pt grammar miscompiles under 2.1.5);
+    # sacremoses pulls regex/joblib/tqdm transitively.
+    "pynini==2.1.6",
+    "sacremoses>=0.1.1",
 ]
 
 [project.scripts]
@@ -99,3 +104,5 @@ include = ["sglang_omni*"]
 [tool.setuptools.package-data]
 "sglang_omni.models.fishaudio_s2_pro" = ["fish_speech/configs/*.yaml"]
 "sglang_omni.models.higgs_tts" = ["_vendored/*.json"]
+# ZONOS2 vendored NeMo text-normalization grammars: the .tsv tables and .far caches.
+"sglang_omni.models.zonos2._vendored.zonos2.vendor.nemo_text_processing" = ["**/*.tsv", "**/*.far"]

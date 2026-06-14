@@ -9,10 +9,16 @@ speaking-rate, quality, speaker-background, and accurate-mode buckets in order.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
+import sys
+import threading
 from dataclasses import dataclass
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 # Vocab / frame layout (params.json).
 
@@ -98,6 +104,30 @@ _SERVER_TO_NEMO_LANG: dict[str, str] = {
     "ko": "ko",
 }
 
+# Upstream's own tests run Korean grammars with lower_cased input; everything
+# else uses cased.
+_LOWER_CASED_LANGS = {"ko"}
+
+# zh/ja verbalizers read a cached .far but never write one (upstream quirk);
+# we post-write it after first compile so later loads are fast. Note ja reads
+# a "jp_" prefixed name.
+_VERBALIZER_FAR_PREFIX = {"zh": "zh", "ja": "jp"}
+
+# A digit directly followed by sentence punctuation confuses several upstream
+# r1.2.0 grammars: pt's tagger raises FstOpError outright and de reads dates
+# digit-by-digit. Space the punctuation off before normalization; it is
+# re-attached afterwards.
+_DIGIT_PUNCT_RE = re.compile(r"(\d)([.!?,;:])(?=\s|$)")
+_SPACE_PUNCT_RE = re.compile(r" +([.!?,;:])(?=\s|$)")
+
+# Moses-based punct_post_process re-attaches punctuation well for these
+# languages. For the European languages it also glues currency symbols to the
+# following word ("5,32 € am" -> "€am"), so there we skip moses and only
+# collapse the spacing we introduced ourselves.
+_MOSES_POSTPROCESS_LANGS = {"en", "zh", "ja", "ko"}
+
+_VENDORED_DIR = os.path.join(os.path.dirname(__file__), "_vendored")
+
 _NORMALIZER = None
 
 
@@ -105,19 +135,136 @@ def normalization_enabled() -> bool:
     return os.environ.get("ZONOS2_TTS_NORM", "1") != "0"
 
 
+def _default_cache_root() -> str:
+    return os.environ.get(
+        "ZONOS2_TTS_NORM_CACHE_DIR",
+        os.path.expanduser("~/.cache/zonos2-tts-norm"),
+    )
+
+
+class TTSTextNormalizer:
+    """Lazy per-language NeMo normalizers with .far caching.
+
+    Construction and calls are serialized per language: the upstream
+    Normalizer shares a mutable TokenParser and is not thread-safe.
+    """
+
+    def __init__(self, cache_root: str | None = None):
+        self.cache_root = cache_root or _default_cache_root()
+        self._normalizers: dict[str, object] = {}
+        self._locks: dict[str, threading.Lock] = {}
+        self._global_lock = threading.Lock()
+
+    def _lang_lock(self, lang: str) -> threading.Lock:
+        with self._global_lock:
+            if lang not in self._locks:
+                self._locks[lang] = threading.Lock()
+            return self._locks[lang]
+
+    def _build(self, lang: str):
+        from zonos2.vendor.nemo_text_processing.text_normalization import (  # type: ignore
+            Normalizer,
+        )
+
+        input_case = "lower_cased" if lang in _LOWER_CASED_LANGS else "cased"
+        # One cache dir per (lang, case): upstream .far filenames collide
+        # across languages (e.g. ja's tagger writes a zh_-prefixed file).
+        cache_dir = os.path.join(self.cache_root, f"{lang}_{input_case}")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        logger.info("Loading TTS text normalizer for '%s' (%s)...", lang, input_case)
+        normalizer = Normalizer(
+            input_case=input_case,
+            lang=lang,
+            cache_dir=cache_dir,
+            overwrite_cache=False,
+        )
+
+        prefix = _VERBALIZER_FAR_PREFIX.get(lang)
+        if prefix is not None:
+            far_path = os.path.join(
+                cache_dir, f"{prefix}_tn_True_deterministic_verbalizer.far"
+            )
+            if not os.path.exists(far_path):
+                from zonos2.vendor.nemo_text_processing.text_normalization.en.graph_utils import (  # type: ignore
+                    generator_main,
+                )
+
+                generator_main(far_path, {"verbalize": normalizer.verbalizer.fst})
+        return normalizer
+
+    def get(self, lang: str):
+        with self._lang_lock(lang):
+            if lang not in self._normalizers:
+                self._normalizers[lang] = self._build(lang)
+            return self._normalizers[lang]
+
+    def warmup(self, languages: list[str] | None = None) -> None:
+        """Construct normalizers ahead of time (server codes or NeMo codes)."""
+        langs = languages or sorted(set(_SERVER_TO_NEMO_LANG.values()))
+        for lang in langs:
+            lang = _SERVER_TO_NEMO_LANG.get(lang, lang)
+            try:
+                self.get(lang)
+            except Exception:  # noqa: BLE001
+                logger.exception("TTS text normalizer warmup failed for '%s'", lang)
+
+    def normalize(self, text: str, language: str) -> str:
+        """Normalize text for the given server language code.
+
+        Returns the input unchanged for unsupported languages or on any
+        normalizer error -- normalization must never fail a request.
+        """
+        lang = _SERVER_TO_NEMO_LANG.get(language)
+        if lang is None or not text.strip():
+            return text
+        text_in = _DIGIT_PUNCT_RE.sub(r"\1 \2", text)
+        use_moses = lang in _MOSES_POSTPROCESS_LANGS
+        try:
+            normalizer = self.get(lang)
+            with self._lang_lock(lang):
+                result = normalizer.normalize(text_in, punct_post_process=use_moses)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "TTS text normalization failed for lang=%s; using raw text", language
+            )
+            return text
+        if isinstance(result, str):
+            result = _SPACE_PUNCT_RE.sub(r"\1", result)
+        if not isinstance(result, str) or not result.strip():
+            return text
+        logger.debug("TTS norm [%s]: %r -> %r", language, text, result)
+        return result
+
+
 def _get_normalizer():
     """Lazily build the NeMo normalizer; ``None`` if its heavy deps are missing."""
     global _NORMALIZER
     if _NORMALIZER is not None:
         return _NORMALIZER
+    # note (Yue Yin): expose the vendored ``zonos2.vendor.nemo_text_processing``
+    # namespace without shadowing a real ``zonos2`` install; insert once, only
+    # when the vendored package is not already importable.
     try:
-        from zonos2.tokenizer.textnorm import TTSTextNormalizer  # type: ignore
+        import importlib.util
+
+        already = importlib.util.find_spec("zonos2.vendor.nemo_text_processing")
+    except Exception:  # noqa: BLE001 - path probing must never raise
+        already = None
+    if already is None and _VENDORED_DIR not in sys.path:
+        sys.path.insert(0, _VENDORED_DIR)
+    try:
+        normalizer = TTSTextNormalizer()
+        # note (Yue Yin): probe-import so a missing pynini/sacremoses wheel
+        # degrades to None here rather than once per request.
+        import importlib
+
+        importlib.import_module(
+            "zonos2.vendor.nemo_text_processing.text_normalization"
+        )
     except Exception:  # noqa: BLE001 - missing dep must never raise
         return None
-    try:
-        _NORMALIZER = TTSTextNormalizer()
-    except Exception:  # noqa: BLE001
-        return None
+    _NORMALIZER = normalizer
     return _NORMALIZER
 
 
