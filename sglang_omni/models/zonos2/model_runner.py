@@ -122,6 +122,7 @@ class Zonos2ModelRunner(ModelRunner):
         # params; a per-request seed falls back to that request's generator.
         params = requests[0].data.params
         rep_ids = self._rep_window(requests, n, cb_size, logits.device)
+        self._break_frame_loops(logits, requests)
         gen = next(
             (sr.data.generator for sr in requests if sr.data.generator is not None),
             None,
@@ -185,3 +186,19 @@ class Zonos2ModelRunner(ModelRunner):
         rep = torch.full_like(t, -1)
         rep[:, :rc] = torch.where(t[:, :rc] < cb_size, t[:, :rc], rep[:, :rc])
         return rep
+
+    def _break_frame_loops(self, logits, requests, run: int = 8):
+        # Loop-collapse guard: if a request's full 9-codebook frame has repeated
+        # identically for `run` consecutive steps (a degenerate loop the windowed
+        # rep-penalty misses on long runs), mask its primary-codebook token so the
+        # next step must diverge. `run` byte-identical frames (~0.09s) is never
+        # real speech, so this is inert on healthy generation.
+        for i, sr in enumerate(requests):
+            h = sr.data.rep_hist
+            if len(h) < run:
+                continue
+            last = h[-1]
+            if last[0] < 0:
+                continue
+            if all(h[-j] == last for j in range(1, run + 1)):
+                logits[i, 0, last[0]] = float("-inf")
