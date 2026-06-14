@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -172,25 +173,22 @@ def create_sglang_tts_engine_executor(
 
 
 def create_vocoder_executor(
-    model_path: str, *, device: str = "cuda:0", max_concurrency: int = 2, **_: Any
-) -> SimpleScheduler:
-    from sglang_omni.models.zonos2.streaming_vocoder import decode_to_pcm
+    model_path: str, *, device: str = "cuda:0", **_: Any
+) -> Any:
+    from sglang_omni.models.zonos2.streaming_vocoder import (
+        Zonos2StreamingVocoderScheduler,
+        decode_batch,
+        decode_to_pcm,
+    )
 
-    def _vocode(payload: StagePayload) -> StagePayload:
-        state = Zonos2State.from_dict(payload.data)
-        codes = state.audio_codes
-        if codes is None or (isinstance(codes, torch.Tensor) and codes.numel() == 0):
-            raise ValueError("ZONOS2 generated no audio codes")
-        if not isinstance(codes, torch.Tensor):
-            codes = torch.tensor(codes, dtype=torch.long)
-
-        pcm = decode_to_pcm(codes, state.eos_frame, device=device)
+    def _result_payload(
+        payload: StagePayload, state: Zonos2State, pcm: Any
+    ) -> StagePayload:
         pcm_np = (
             pcm.detach().cpu().numpy()
             if isinstance(pcm, torch.Tensor)
             else np.asarray(pcm, dtype=np.float32)
         ).reshape(-1)
-
         # Terminal payload is msgpack'd back to the server: emit only
         # serializable values, never the upstream state tensors.
         data: dict[str, Any] = dict(
@@ -208,4 +206,53 @@ def create_vocoder_executor(
             request_id=payload.request_id, request=payload.request, data=data
         )
 
-    return SimpleScheduler(_vocode, max_concurrency=max_concurrency)
+    def _coerce_codes(state: Zonos2State) -> torch.Tensor:
+        codes = state.audio_codes
+        if isinstance(codes, torch.Tensor):
+            return codes
+        if codes is None:
+            return torch.empty((0, 9), dtype=torch.long)
+        return torch.as_tensor(codes, dtype=torch.long)
+
+    def _vocode(payload: StagePayload) -> StagePayload:
+        state = Zonos2State.from_dict(payload.data)
+        codes = state.audio_codes
+        if codes is None or (isinstance(codes, torch.Tensor) and codes.numel() == 0):
+            raise ValueError("ZONOS2 generated no audio codes")
+        if not isinstance(codes, torch.Tensor):
+            codes = torch.tensor(codes, dtype=torch.long)
+        pcm = decode_to_pcm(codes, state.eos_frame, device=device)
+        return _result_payload(payload, state, pcm)
+
+    def _vocode_batch(payloads: list[StagePayload]) -> list[StagePayload]:
+        states = [Zonos2State.from_dict(p.data) for p in payloads]
+        pcms = decode_batch(
+            [_coerce_codes(s) for s in states],
+            [s.eos_frame for s in states],
+            device=device,
+        )
+        return [_result_payload(p, s, pcm) for p, s, pcm in zip(payloads, states, pcms)]
+
+    def _request_cost(payload: StagePayload) -> int:
+        codes = Zonos2State.from_dict(payload.data).audio_codes
+        if codes is None:
+            return 0
+        try:
+            return int(codes.shape[0])
+        except (AttributeError, IndexError):
+            return int(len(codes))
+
+    # note (Yue Yin): batched DAC decode coalesces non-stream requests, but joint
+    # right-padding lets ConvTranspose bleed across items and changes the gate
+    # output vs the single decode. Keep it opt-in (default off) until GPU
+    # allclose-vs-single parity is confirmed; default path stays single-decode.
+    batch_enabled = os.environ.get("ZONOS2_DAC_BATCH", "0") == "1"
+    return Zonos2StreamingVocoderScheduler(
+        device=device,
+        compute_fn=_vocode,
+        batch_compute_fn=_vocode_batch if batch_enabled else None,
+        max_batch_size=16 if batch_enabled else 1,
+        max_batch_wait_ms=10 if batch_enabled else 0,
+        request_cost_fn=_request_cost if batch_enabled else None,
+        max_batch_cost=32768 if batch_enabled else None,
+    )

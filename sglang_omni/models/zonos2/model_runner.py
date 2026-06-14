@@ -17,6 +17,7 @@ import torch
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.zonos2.radix_hash import EOS_SENTINEL, poly_row_hash
 from sglang_omni.models.zonos2.sampler import sample_tts
+from sglang_omni.scheduling.messages import OutgoingMessage
 
 
 class Zonos2ModelRunner(ModelRunner):
@@ -26,6 +27,41 @@ class Zonos2ModelRunner(ModelRunner):
 
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
+
+    def post_process_outputs(self, result, scheduler_output, outputs) -> None:
+        # note (Yue Yin): additive stream hook — push each newly sampled delayed
+        # [9] row to the vocoder; reads the already-CPU output_codes and never
+        # touches the decode/EOS/feedback state.
+        del result, outputs
+        if self._outbox is None:
+            return
+        for sched_req in scheduler_output.requests:
+            data = sched_req.data
+            stream_metadata = getattr(data, "stream_metadata", None)
+            if stream_metadata is None:
+                continue
+            req = getattr(data, "req", None)
+            if req is not None:
+                finished = getattr(req, "finished", None)
+                if (callable(finished) and finished()) or bool(
+                    getattr(req, "is_retracted", False)
+                ):
+                    continue
+            codes = data.output_codes
+            start = int(data._stream_emit_idx)
+            if start >= len(codes):
+                continue
+            for row in codes[start:]:
+                self._outbox.put(
+                    OutgoingMessage(
+                        request_id=sched_req.request_id,
+                        type="stream",
+                        target="vocoder",
+                        data=row.clone(),
+                        metadata=stream_metadata,
+                    )
+                )
+            data._stream_emit_idx = len(codes)
 
     # ---- input embeddings ----
 
