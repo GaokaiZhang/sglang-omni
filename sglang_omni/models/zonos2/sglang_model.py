@@ -134,7 +134,9 @@ class Zonos2SonicRouter(nn.Module):
 
 
 class Zonos2MoEBlock(nn.Module):
-    def __init__(self, cfg: Zonos2Config, layer_id: int):
+    def __init__(
+        self, cfg: Zonos2Config, layer_id: int, quant_config: Optional[Any] = None
+    ):
         super().__init__()
         self.router = Zonos2SonicRouter(cfg, layer_id)
         self.experts = get_moe_impl_class(None)(
@@ -144,6 +146,7 @@ class Zonos2MoEBlock(nn.Module):
             intermediate_size=cfg.intermediate_size,
             layer_id=layer_id,
             reduce_results=False,
+            quant_config=quant_config,
         )
 
     def forward(
@@ -154,7 +157,9 @@ class Zonos2MoEBlock(nn.Module):
 
 
 class Zonos2DecoderLayer(nn.Module):
-    def __init__(self, cfg: Zonos2Config, layer_id: int):
+    def __init__(
+        self, cfg: Zonos2Config, layer_id: int, quant_config: Optional[Any] = None
+    ):
         super().__init__()
         self.eps = cfg.norm_eps
         self.attention = Zonos2Attention(cfg, layer_id)
@@ -162,7 +167,9 @@ class Zonos2DecoderLayer(nn.Module):
         self.ffn_norm = nn.Parameter(torch.empty(cfg.dim))
         self.is_moe = cfg.is_moe_layer(layer_id)
         self.feed_forward = (
-            Zonos2MoEBlock(cfg, layer_id) if self.is_moe else Zonos2DenseFFN(cfg)
+            Zonos2MoEBlock(cfg, layer_id, quant_config)
+            if self.is_moe
+            else Zonos2DenseFFN(cfg)
         )
 
     def forward(self, x, residual, router_states, positions, forward_batch):
@@ -221,7 +228,7 @@ class Zonos2SGLangModel(nn.Module):
         )
         self.speaker_projection = nn.Linear(cfg.speaker_lda_dim, cfg.dim, bias=True)
         self.layers = nn.ModuleList(
-            [Zonos2DecoderLayer(cfg, i) for i in range(cfg.n_layers)]
+            [Zonos2DecoderLayer(cfg, i, quant_config) for i in range(cfg.n_layers)]
         )
         self.out_norm = nn.Parameter(torch.empty(cfg.dim))
         self.multi_output = nn.Parameter(
