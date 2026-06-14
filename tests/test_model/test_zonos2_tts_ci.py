@@ -83,13 +83,14 @@ VC_WER_MAX_CORPUS = 0.02
 # GPU. While this is None the speed test skips its threshold assertion (the WER
 # test and the structural sanity checks still run).
 #
-# Measured reference (NOT the gate) from a single dev H100 80GB run, merged
-# Track A (AR torch.compile) + Track B, c=16, seed-tts-eval-50 EN:
-#   rtf_mean=0.9422  throughput_qps=4.48  latency_mean_s=3.195
+# Measured reference (NOT the gate) from a single dev H100 80GB run on this
+# branch (Track B rebased onto ZONOS2 = Track A + FP8-off + loop-guard), c=16,
+# seed-tts-eval-50 EN:
+#   rtf_mean=0.8212  throughput_qps=5.167  latency_mean_s=2.827
 # output_tok_per_req_s is unavailable via --use-existing-server (no per-request
 # engine_time_s); the in-harness managed-server path the test uses populates it,
 # so calibrate there. WER sanity check (whisper-large-v3, not the Qwen3-ASR
-# gate judge): corpus 2.1%, 0.9% excluding one >50% outlier sample.
+# gate judge): corpus 0.89%, no >50% outliers.
 _VC_NON_STREAM_P95: dict[int, dict[str, float]] | None = None
 
 # Optional ZONOS2-specific RTF hard cap (analogue of
