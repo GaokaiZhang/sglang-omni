@@ -81,10 +81,12 @@ def create_sglang_omni_tts_engine_executor(
     shim = _build_config_shim(model_path, cfg)
     gpu = int(gpu_id) if gpu_id is not None else 0
 
-    # Opt-in dynamic FP8 (ZONOS2_FP8) on the MoE experts: bf16 -> fp8 at load,
-    # halving the expert weights. bf16 nn.Linear projections are unaffected.
-    # Needs Hopper/Ada FP8; off by default so non-FP8 GPUs are unaffected.
-    fp8 = {"quantization": "fp8"} if os.environ.get("ZONOS2_FP8") else {}
+    # Opt-in dynamic FP8 on the MoE experts (bf16 -> fp8 at load, halving the
+    # expert weights); bf16 nn.Linear projections are unaffected. Off by default;
+    # needs sm80+ (native fp8 tensor-core speedup on Hopper/Ada). Parse the flag
+    # explicitly so ZONOS2_FP8=0 disables rather than enabling on truthiness.
+    _fp8_on = os.environ.get("ZONOS2_FP8", "").lower() in ("1", "true", "yes", "on")
+    fp8 = {"quantization": "fp8"} if _fp8_on else {}
 
     server_args = build_sglang_server_args(
         shim,
