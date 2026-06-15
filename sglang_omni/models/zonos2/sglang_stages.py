@@ -112,6 +112,7 @@ def create_sglang_omni_tts_engine_executor(
     fp8: bool = False,
     frame_graph: bool = False,
     compile_sampler: bool = False,
+    async_decode: bool = False,
     **_: Any,
 ) -> Any:
     from sglang_omni.models.zonos2.model_runner import Zonos2ModelRunner
@@ -143,7 +144,9 @@ def create_sglang_omni_tts_engine_executor(
         disable_cuda_graph=False,
         cuda_graph_bs=[1, 2, 4, 8, 16],
         cuda_graph_max_bs=16,
-        disable_overlap_schedule=True,
+        # async-decode lookahead overlaps the resolve D2H with the next forward;
+        # the overlap scheduler must be enabled for it (opt-in via async_decode).
+        disable_overlap_schedule=not async_decode,
         enable_torch_compile=True,
         max_running_requests=16,
         mem_fraction_static=mem_fraction_static,
@@ -196,6 +199,7 @@ def create_sglang_omni_tts_engine_executor(
         output_proc,
         compile_sampler=compile_sampler,
         frame_graph=frame_graph,
+        async_decode=async_decode,
     )
     scheduler = OmniScheduler(
         tp_worker=model_worker,

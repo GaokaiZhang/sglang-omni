@@ -250,6 +250,13 @@ class Zonos2SGLangModel(nn.Module):
             max_bs, cfg.dim, device=w.device, dtype=w.dtype
         )
         self._decode_input_embedding.weight.requires_grad_(False)
+        # note (Yue Yin): on-device per-request decode state (feedback + EOS +
+        # rep-history ring) for the eager-tail RTF work. Allocated here so its
+        # tensors get stable addresses before CUDA-graph capture; the runner
+        # gathers/scatters it each frame instead of per-request Python deques.
+        from sglang_omni.models.zonos2.state_pool import Zonos2DecodeStatePool
+
+        self._decode_state_pool = Zonos2DecodeStatePool(self)
         self.requires_grad_(
             False
         )  # inference-only; sglang in-place ops reject grad tensors

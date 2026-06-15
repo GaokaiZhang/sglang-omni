@@ -28,19 +28,27 @@ class Zonos2ModelRunner(ModelRunner):
         *,
         compile_sampler: bool = False,
         frame_graph: bool = False,
+        async_decode: bool = False,
     ):
         super().__init__(tp_worker, output_processor)
         self._outbox: Any | None = None
-        # The per-request sampler runs eager (outside the backbone graph) and is a
-        # large slice of the decode step. Opt-in torch.compile fuses its
-        # elementwise launches (~6% decode at bs=16 on H100); off by default until
-        # validated more widely.
+        # Side stream for the lagged resolve D2H: gated by a launch event so the
+        # copy waits only for codes(N), not the next forward queued on the main
+        # stream -> the host resolve overlaps forward(N+1).
+        self._copy_stream: Any | None = None
+        # Per-request sampler (preserves the ZH-CER fix): per-request
+        # temperature/top_k/top_p/min_p/repetition_penalty, no requests[0]
+        # broadcast. Opt-in torch.compile fuses its elementwise launches.
         self._sampler = (
             torch.compile(sample_tts, dynamic=True) if compile_sampler else sample_tts
         )
         # Opt-in: replay the captured per-frame tail graph (head+sample+embed+hash)
-        # instead of the eager tail. Inert unless the model captured tail graphs.
+        # for the GPU tail, fed rep_ids/break_mask from the on-device ring. Inert
+        # unless the model captured tail graphs.
         self._frame_graph = frame_graph
+        # Opt-in async-decode lookahead (overlap the resolve D2H with the next
+        # forward); also gates disable_overlap_schedule in sglang_stages.
+        self._async_decode = async_decode
 
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
@@ -94,23 +102,16 @@ class Zonos2ModelRunner(ModelRunner):
         bs = len(requests)
         if bs == 0:
             return
-        dim = self.model.config.dim
         buf = self.model._decode_input_embedding.weight
-        if bs > buf.shape[0]:
-            raise RuntimeError(
-                f"decode batch {bs} exceeds the staged feedback buffer "
-                f"({buf.shape[0]} rows); raise max_running_requests."
-            )
-        rows = []
-        for sr in requests:
-            q = sr.data.pending_feedback_queue
-            rows.append(
-                q.popleft()
-                if q
-                else torch.zeros(dim, device=buf.device, dtype=buf.dtype)
-            )
+        # note (Yue Yin): gather each request's last feedback from its on-device
+        # pool row into the positional decode buffer (buf[i] = request i), instead
+        # of a per-request Python deque. Byte-identical: the deque held exactly the
+        # latest feedback the pool row now holds. Reconcile-release finished rows.
+        pool = self.model._decode_state_pool
+        pool.release_inactive({sr.request_id for sr in requests})
+        row_t = pool.prepare_active_rows(requests)
         with torch.no_grad():
-            buf[:bs].copy_(torch.stack(rows, dim=0).to(buf.device, buf.dtype))
+            buf[:bs].copy_(pool.feedback_embeds[row_t])
         # Decode reads the staged buffer by row index -> stable input for graph replay.
         forward_batch.input_ids = torch.arange(bs, device=buf.device, dtype=torch.long)
         forward_batch.input_embeds = None
@@ -145,14 +146,31 @@ class Zonos2ModelRunner(ModelRunner):
     def post_prefill(self, result, forward_batch, schedule_batch, requests):
         if bool(getattr(schedule_batch, "is_prefill_only", False)):
             return
-        self._collect_frame(
+        buf = self._collect_launch(
             result, forward_batch, schedule_batch, requests, is_prefill=True
         )
+        self._collect_resolve(buf, result)
 
     def post_decode(self, result, forward_batch, schedule_batch, requests):
-        self._collect_frame(
+        buf = self._collect_launch(
             result, forward_batch, schedule_batch, requests, is_prefill=False
         )
+        self._collect_resolve(buf, result)
+
+    # note (Yue Yin): async-decode lookahead splits post_decode into a GPU launch
+    # half (publishes next_ids on-device, no host sync) and a host resolve half
+    # (the deferred output codes.to('cpu')), so the resolve D2H overlaps the next
+    # decode forward. No lookahead_eligible gate needed: the rep-history ring is
+    # updated on-device IN launch, so there is no one-step lag (default True holds).
+    def post_decode_launch(self, result, forward_batch, requests):
+        return self._collect_launch(
+            result, forward_batch, None, requests, is_prefill=False
+        )
+
+    def post_decode_resolve(
+        self, launch_buf, result, forward_batch, schedule_batch, requests
+    ):
+        self._collect_resolve(launch_buf, result)
 
     def _last_token_hidden(self, hidden, forward_batch, is_prefill) -> torch.Tensor:
         if not is_prefill:
@@ -161,11 +179,12 @@ class Zonos2ModelRunner(ModelRunner):
         idx = torch.cumsum(lens.to(hidden.device, torch.long), dim=0) - 1
         return hidden[idx]
 
-    def _collect_frame(
+    def _collect_launch(
         self, result, forward_batch, schedule_batch, requests, *, is_prefill
     ):
         model = self.model
         n = model.n_codebooks
+        eoa = model.config.eoa_id
         text_pad = model.config.text_vocab
         cb_size = model.config.codebook_size
 
@@ -173,109 +192,197 @@ class Zonos2ModelRunner(ModelRunner):
             result.logits_output.hidden_states, forward_batch, is_prefill
         )
         b = len(requests)
+        pool = model._decode_state_pool
+        row_t = pool.prepare_active_rows(requests)
+        # Per-request sampling params (preserves the ZH-CER fix): each request's
+        # own temperature/top_k/top_p/min_p/repetition_penalty, no requests[0]
+        # broadcast. window/codebooks are uniform (requests[0]) as in _rep_window.
+        params = requests[0].data.params
         p = [sr.data.params for sr in requests]
+        dev = hidden.device
 
-        # Decode-only fast path: replay the captured tail graph (head+sample+embed
-        # +hash in one replay -> cuts host dispatch in the host-bound decode loop).
-        # Eager fallback for prefill, uncaptured batch sizes, or non-default params.
-        if (
+        # Compose with the tail CUDA-graph (ZONOS2_FRAME_GRAPH): when armed, run
+        # head+sample+embed+hash as one captured replay, with rep_ids/break_mask
+        # fed from the ON-DEVICE ring (not host-built) so no host work re-enters.
+        use_graph = (
             self._frame_graph
             and not is_prefill
             and model._tail_buckets
             and b <= model._tail_buckets[-1]
             and all(self._params_match(x, model._tail_params) for x in p)
-        ):
-            self._collect_frame_graphed(result, schedule_batch, requests, hidden, p)
-            return
-
-        logits = model.compute_logits(hidden).float()  # [B, 9, 1026]
-
-        # Per-request sampling: temperature / top_k / top_p / min_p / repetition
-        # penalty all come from each request (no requests[0] broadcast / shared
-        # generator), so concurrent requests keep their own params (matches moss).
-        self._break_frame_loops(logits, requests)
-        rep_ids = self._rep_window(requests, n, cb_size, logits.device)
-        dev = logits.device
-        # Largest active top-k computed on the host (params are Python ints) so
-        # the sampler needs no .item() sync in the decode loop.
-        top_k_max = max(
-            (x.top_k for x in p if 0 < x.top_k < model.audio_vocab), default=0
         )
-        # Host flags (params are Python scalars, no GPU sync) so the sampler can
-        # skip whole passes when unused -- top-p defaults off, so its full-vocab
-        # sort is otherwise paid every step.
-        any_top_p = any(0.0 < x.top_p < 1.0 for x in p)
-        any_min_p = any(x.min_p > 0.0 for x in p)
-        codes = self._sampler(
-            logits,
-            temperature=torch.tensor([x.temperature for x in p], device=dev),
-            top_k=torch.tensor([x.top_k for x in p], device=dev),
-            top_p=torch.tensor([x.top_p for x in p], device=dev),
-            min_p=torch.tensor([x.min_p for x in p], device=dev),
-            repetition_penalty=torch.tensor(
-                [x.repetition_penalty for x in p], device=dev
+        if use_graph:
+            rep_ids = self._rep_window_ring(
+                row_t, n, int(params.repetition_window), cb_size, dev
+            )
+            break_mask = self._break_mask_ring(row_t, model.audio_vocab, dev)
+            codes, keys, feedback = model.run_tail_graph(
+                hidden,
+                torch.tensor([x.temperature for x in p], device=dev),
+                torch.tensor([x.top_k for x in p], device=dev),
+                torch.tensor([x.top_p for x in p], device=dev),
+                torch.tensor([x.min_p for x in p], device=dev),
+                torch.tensor([x.repetition_penalty for x in p], device=dev),
+                rep_ids,
+                break_mask,
+            )
+        else:
+            logits = model.compute_logits(hidden).float()  # [B, 9, 1026]
+            rep_ids = self._rep_window(row_t, n, cb_size, params)
+            self._break_frame_loops(logits, row_t)
+            top_k_max = max(
+                (x.top_k for x in p if 0 < x.top_k < model.audio_vocab), default=0
+            )
+            any_top_p = any(0.0 < x.top_p < 1.0 for x in p)
+            any_min_p = any(x.min_p > 0.0 for x in p)
+            codes = self._sampler(
+                logits,
+                temperature=torch.tensor([x.temperature for x in p], device=dev),
+                top_k=torch.tensor([x.top_k for x in p], device=dev),
+                top_p=torch.tensor([x.top_p for x in p], device=dev),
+                min_p=torch.tensor([x.min_p for x in p], device=dev),
+                repetition_penalty=torch.tensor(
+                    [x.repetition_penalty for x in p], device=dev
+                ),
+                top_k_max=top_k_max,
+                rep_token_ids=rep_ids,
+                any_top_p=any_top_p,
+                any_min_p=any_min_p,
+            )  # [B, 9]
+            text_col = torch.full(
+                (b, 1), text_pad, device=codes.device, dtype=torch.long
+            )
+            rows = torch.cat([codes, text_col], dim=1)
+            feedback = model.embed_frames(rows)  # [B, dim]
+            keys = poly_row_hash(rows)  # [B] (< RADIX_HASH_SPACE)
+
+        # Stage next-step feedback into the on-device pool row (one batched scatter).
+        pool.feedback_embeds[row_t] = feedback.detach()
+        # Append this frame to the rep-history ring (read by the rep functions on
+        # the NEXT step; matches the scalar rep_hist.append timing: read-then-append).
+        pool.rep_hist[row_t] = torch.cat(
+            [pool.rep_hist[row_t][:, 1:, :], codes.unsqueeze(1)], dim=1
+        )
+        pool.rep_len[row_t] = torch.clamp_max(pool.rep_len[row_t] + 1, pool.rep_ring)
+
+        # note (Yue Yin): vectorized EOS state machine on the on-device pool rows
+        # (replaces the per-request Python loop + keys.tolist()). Byte-exact to the
+        # scalar loop (unit-verified): eos_frame = max(0, step - rightmost eoa col),
+        # set on the first eoa frame; countdown = n+1 then decremented while > 0;
+        # finished = countdown <= 0; next_ids = radix key, or EOS_SENTINEL when done.
+        jidx = torch.arange(n, device=codes.device)
+        hits = codes == eoa  # [B, n]
+        any_hit = hits.any(dim=1)
+        last_hit_j = (hits.long() * jidx).amax(dim=1)
+        gstep = pool.generation_step[row_t]
+        first_set = any_hit & (~pool.eos_frame_set[row_t])
+        new_eos = torch.clamp_min(gstep - last_hit_j, 0)
+        pool.eos_frame_val[row_t] = torch.where(
+            first_set, new_eos, pool.eos_frame_val[row_t]
+        )
+        pool.eos_countdown[row_t] = torch.where(
+            first_set, torch.full_like(gstep, n + 1), pool.eos_countdown[row_t]
+        )
+        pool.eos_frame_set[row_t] = pool.eos_frame_set[row_t] | first_set
+        cd = pool.eos_countdown[row_t]
+        dec = pool.eos_frame_set[row_t] & (cd > 0)
+        cd = torch.where(dec, cd - 1, cd)
+        pool.eos_countdown[row_t] = cd
+        finished = pool.eos_frame_set[row_t] & (cd <= 0)
+        pool.generation_step[row_t] = gstep + 1
+        next_ids = torch.where(finished, torch.full_like(keys, EOS_SENTINEL), keys)
+        result.next_token_ids = next_ids
+        if schedule_batch is not None:  # async launch publishes output_ids itself
+            schedule_batch.output_ids = next_ids
+
+        # launch_buf snapshots what the (lagged) resolve reads. Pack codes +
+        # the per-row EOS/finished state into one fresh int64 tensor (advanced
+        # indexing already copies, and cat makes a fresh tensor, so it is a
+        # snapshot even though the next launch mutates these pool rows). Record a
+        # CUDA event right after, so resolve's side-stream D2H waits only for this
+        # (codes ready), not the next forward. next_ids is cloned: the base
+        # aliases it onto output_ids, overwritten in place before this resolve.
+        meta = torch.stack(
+            (
+                pool.eos_frame_set[row_t].to(torch.int64),
+                pool.eos_frame_val[row_t],
+                finished.to(torch.int64),
             ),
-            top_k_max=top_k_max,
-            rep_token_ids=rep_ids,
-            any_top_p=any_top_p,
-            any_min_p=any_min_p,
-        )  # [B, 9]
-
-        # Feedback embeddings for the next step: [B, 10] rows (codes + text pad).
-        text_col = torch.full((b, 1), text_pad, device=codes.device, dtype=torch.long)
-        rows = torch.cat([codes, text_col], dim=1)
-        feedback = model.embed_frames(rows)  # [B, dim]
-        keys = poly_row_hash(rows)  # [B] (< RADIX_HASH_SPACE)
-
-        codes_cpu = codes.to("cpu")
-        keys_cpu = keys.tolist()  # one D2H, not B per-row int(keys[i]) syncs
-        self._emit_frames(
-            requests, codes_cpu, keys_cpu, feedback, result, schedule_batch, dev
+            dim=1,
         )
+        packed = torch.cat((codes, meta), dim=1)  # [B, n+3] int64
+        ev = torch.cuda.Event()
+        ev.record()
+        return (requests, packed, n, next_ids.clone(), ev)
 
-    def _emit_frames(
-        self, requests, codes_cpu, keys_cpu, feedback, result, schedule_batch, device
-    ):
-        """Shared per-request bookkeeping for one frame (eager + graph paths):
-        append codes, queue the next feedback embedding, advance the any-of-9 EOS
-        state machine, and set next_token_ids (radix key, or EOS sentinel)."""
-        n = self.model.n_codebooks
-        eoa = self.model.config.eoa_id
-        next_ids = [0] * len(requests)
+    def _collect_resolve(self, launch_buf, result) -> None:
+        # Host half (runs lagged under async, overlapping the next decode forward):
+        # the deferred codes.to('cpu') -> per-request output_codes + eos_frame, and
+        # release-on-finish. Restores next_ids to the launch-time (un-clobbered)
+        # value for the shared finalize tail.
+        if launch_buf is None:
+            return
+        requests, packed, n, next_ids_snap, ev = launch_buf
+        if result is not None:
+            result.next_token_ids = next_ids_snap
+        # Copy on a side stream gated by the launch event: the copy starts as soon
+        # as codes(N) is ready (event recorded before the next forward was queued)
+        # and runs on a separate stream, so this no longer whole-stream-syncs on
+        # forward(N+1). One D2H of the packed [B, n+3] snapshot.
+        if self._copy_stream is None:
+            self._copy_stream = torch.cuda.Stream(device=packed.device)
+        self._copy_stream.wait_event(ev)
+        with torch.cuda.stream(self._copy_stream):
+            packed_cpu = packed.to("cpu", non_blocking=True)
+        self._copy_stream.synchronize()
+        codes_cpu = packed_cpu[:, :n]
+        eos_set_cpu = packed_cpu[:, n]
+        eos_val_cpu = packed_cpu[:, n + 1]
+        finished_cpu = packed_cpu[:, n + 2]
+        pool = self.model._decode_state_pool
         for i, sr in enumerate(requests):
             data = sr.data
-            frame = codes_cpu[i].tolist()
             data.output_codes.append(codes_cpu[i].clone())
-            data.rep_hist.append(frame)
-            # clone: feedback may alias a static graph buffer reused next replay.
-            data.pending_feedback_queue.append(feedback[i].detach().clone())
+            data.eos_frame = int(eos_val_cpu[i]) if bool(eos_set_cpu[i]) else None
+            if bool(finished_cpu[i]):
+                pool.release_row(sr.request_id)
 
-            step = data.generation_step
-            if data.eos_frame is None:
-                hits = [frame[j] == eoa for j in range(n)]
-                if any(hits):
-                    data.eos_frame = max(
-                        0, step - max(j for j, h in enumerate(hits) if h)
-                    )
-                    data.eos_countdown = n + 1
-            finished = False
-            if data.eos_frame is not None:
-                if data.eos_countdown > 0:
-                    data.eos_countdown -= 1
-                finished = data.eos_countdown <= 0
-            data.generation_step += 1
-            next_ids[i] = EOS_SENTINEL if finished else keys_cpu[i]
+    def _rep_window(self, row_t, n, cb_size, params):
+        # Vectorized rep-penalty token window from the on-device history ring.
+        # Byte-exact to the old per-request build (unit-tested): an all -1 window
+        # is a no-op penalty == None, so no special first-step handling is needed.
+        if params.repetition_penalty == 1.0:
+            return None
+        w = params.repetition_window
+        ring = self.model._decode_state_pool.rep_hist[row_t]  # [B, ring, n]
+        t = ring[:, -w:, :].transpose(1, 2)  # last w frames -> [B, n, w]
+        rc = min(params.repetition_codebooks, n)
+        rep = torch.full_like(t, -1)
+        rep[:, :rc] = torch.where(t[:, :rc] < cb_size, t[:, :rc], rep[:, :rc])
+        return rep
 
-        next_ids = torch.tensor(next_ids, dtype=torch.long, device=device)
-        result.next_token_ids = next_ids
-        schedule_batch.output_ids = next_ids
-
-    # ---- tail CUDA-graph path (ZONOS2_FRAME_GRAPH) ----
+    def _break_frame_loops(self, logits, row_t, run: int = 8):
+        # Loop-collapse guard (vectorized over the on-device history ring): mask
+        # the primary-codebook token where a request's full 9-codebook frame has
+        # repeated identically for `run` steps -- a degenerate loop the windowed
+        # rep-penalty misses (validated WER/CER-neutral). Byte-exact to the scalar.
+        pool = self.model._decode_state_pool
+        ring = pool.rep_hist[row_t]  # [B, ring, n]
+        last = ring[:, -1, :]  # [B, n]
+        window = ring[:, -run:, :]  # [B, run, n]
+        all_eq = (window == last.unsqueeze(1)).all(dim=2).all(dim=1)
+        mask = all_eq & (pool.rep_len[row_t] >= run) & (last[:, 0] >= 0)
+        bi = torch.arange(logits.shape[0], device=logits.device)
+        tok = last[:, 0].clamp(min=0)
+        cur = logits[bi, 0, tok]
+        logits[bi, 0, tok] = torch.where(
+            mask, torch.full_like(cur, float("-inf")), cur
+        )
 
     @staticmethod
     def _params_match(a, b) -> bool:
-        """The tail graph bakes the structural sampler flags (top_k_max/any_top_p/
-        any_min_p), so only replay when the request's params match those captured."""
+        # The tail graph bakes the structural sampler flags (top_k_max/any_top_p/
+        # any_min_p), so only replay when the request's params match those captured.
         if b is None:
             return False
         return (
@@ -288,94 +395,34 @@ class Zonos2ModelRunner(ModelRunner):
             and a.repetition_codebooks == b.repetition_codebooks
         )
 
-    def _collect_frame_graphed(self, result, schedule_batch, requests, hidden, p):
-        model = self.model
-        n = model.n_codebooks
-        cb_size = model.config.codebook_size
-        dev = hidden.device
-        rep_ids = self._rep_window_graph(
-            requests, n, int(p[0].repetition_window), cb_size, dev
-        )
-        break_mask = self._break_mask_graph(requests, model.audio_vocab, dev)
-        codes, keys, feedback = model.run_tail_graph(
-            hidden,
-            torch.tensor([x.temperature for x in p], device=dev),
-            torch.tensor([x.top_k for x in p], device=dev),
-            torch.tensor([x.top_p for x in p], device=dev),
-            torch.tensor([x.min_p for x in p], device=dev),
-            torch.tensor([x.repetition_penalty for x in p], device=dev),
-            rep_ids,
-            break_mask,
-        )
-        codes_cpu = codes.to("cpu")
-        keys_cpu = keys.tolist()
-        self._emit_frames(
-            requests, codes_cpu, keys_cpu, feedback, result, schedule_batch, dev
-        )
-
-    def _rep_window_graph(self, requests, n, w, cb_size, device):
-        """Like _rep_window but always returns a fixed [B, n, w] tensor (all -1
-        when there is no history) so the captured graph gets a stable shape."""
-        hist = []
-        for sr in requests:
-            h = sr.data.rep_hist[-w:]
-            if len(h) < w:  # left-pad with -1 (ignored by the penalty)
-                h = [[-1] * n] * (w - len(h)) + h
-            hist.append(h)
-        t = torch.tensor(hist, device=device, dtype=torch.long).transpose(1, 2)
-        rc = min(requests[0].data.params.repetition_codebooks, n)
+    def _rep_window_ring(self, row_t, n, w, cb_size, device):
+        # Fixed-shape [B, n, w] rep window from the on-device ring, feeding the
+        # tail graph's captured rep_ids input (mirrors _rep_window_graph but reads
+        # the GPU ring -- no host rep_hist build). Params are uniform here (graph
+        # replay requires params == _tail_params), so codebooks come from those.
+        ring = self.model._decode_state_pool.rep_hist[row_t]  # [B, ring, n]
+        t = ring[:, -w:, :].transpose(1, 2).contiguous()  # [B, n, w]
+        rc = min(self.model._tail_params.repetition_codebooks, n)
         rep = torch.full_like(t, -1)
         rep[:, :rc] = torch.where(t[:, :rc] < cb_size, t[:, :rc], rep[:, :rc])
         return rep
 
-    def _break_mask_graph(self, requests, vocab, device, run: int = 8):
-        """Additive [B, vocab] codebook-0 mask (-inf at a looping token) mirroring
-        _break_frame_loops, applied inside the graph instead of mutating logits."""
-        mask = torch.zeros(len(requests), vocab, device=device, dtype=torch.float32)
-        for i, sr in enumerate(requests):
-            h = sr.data.rep_hist
-            if len(h) < run:
-                continue
-            last = h[-1]
-            if last[0] < 0:
-                continue
-            if all(h[-j] == last for j in range(1, run + 1)):
-                mask[i, last[0]] = float("-inf")
+    def _break_mask_ring(self, row_t, vocab, device, run: int = 8):
+        # Additive [B, vocab] codebook-0 mask (-inf at a looping token) from the
+        # on-device ring, feeding the tail graph's break_mask input (mirrors
+        # _break_mask_graph + _break_frame_loops, vectorized on the GPU ring).
+        pool = self.model._decode_state_pool
+        ring = pool.rep_hist[row_t]  # [B, ring, n]
+        last = ring[:, -1, :]  # [B, n]
+        window = ring[:, -run:, :]  # [B, run, n]
+        all_eq = (window == last.unsqueeze(1)).all(dim=2).all(dim=1)
+        active = all_eq & (pool.rep_len[row_t] >= run) & (last[:, 0] >= 0)
+        mask = torch.zeros(last.shape[0], vocab, device=device, dtype=torch.float32)
+        tok = last[:, 0].clamp(min=0)
+        vals = torch.where(
+            active,
+            torch.full((last.shape[0],), float("-inf"), device=device),
+            torch.zeros(last.shape[0], device=device),
+        )
+        mask.scatter_(1, tok.unsqueeze(1), vals.unsqueeze(1))
         return mask
-
-    def _rep_window(self, requests, n, cb_size, device):
-        params = requests[0].data.params
-        if params.repetition_penalty == 1.0:
-            return None
-        w = params.repetition_window
-        hist = []
-        for sr in requests:
-            h = sr.data.rep_hist[-w:]
-            if len(h) < w:  # left-pad with -1 (ignored)
-                h = [[-1] * n] * (w - len(h)) + h
-            hist.append(h)
-        if not any(sr.data.rep_hist for sr in requests):
-            return None
-        # [B, W, n] -> [B, n, W]; mask eoa/pad (>= codebook_size); only first rc codebooks
-        t = torch.tensor(hist, device=device, dtype=torch.long).transpose(1, 2)
-        rc = min(params.repetition_codebooks, n)
-        rep = torch.full_like(t, -1)
-        rep[:, :rc] = torch.where(t[:, :rc] < cb_size, t[:, :rc], rep[:, :rc])
-        return rep
-
-    def _break_frame_loops(self, logits, requests, run: int = 8):
-        # Loop-collapse guard: mask the primary-codebook token when a request's
-        # full 9-codebook frame has repeated identically for `run` steps -- a
-        # degenerate loop the windowed rep-penalty misses on long runs. It can
-        # also trip on sustained byte-identical audio (e.g. silence), but masking
-        # one codebook-0 token there is WER/CER-neutral in practice (validated:
-        # EN flat, ZH CER 10.9->9.7); the win is breaking the true collapses.
-        for i, sr in enumerate(requests):
-            h = sr.data.rep_hist
-            if len(h) < run:
-                continue
-            last = h[-1]
-            if last[0] < 0:
-                continue
-            if all(h[-j] == last for j in range(1, run + 1)):
-                logits[i, 0, last[0]] = float("-inf")
