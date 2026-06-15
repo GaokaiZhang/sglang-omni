@@ -10,7 +10,6 @@ stays CUDA-graph-replayable (decode input_ids are row indices). No frame loop.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
@@ -22,7 +21,14 @@ from sglang_omni.scheduling.messages import OutgoingMessage
 
 
 class Zonos2ModelRunner(ModelRunner):
-    def __init__(self, tp_worker: Any, output_processor: Any):
+    def __init__(
+        self,
+        tp_worker: Any,
+        output_processor: Any,
+        *,
+        compile_sampler: bool = False,
+        frame_graph: bool = False,
+    ):
         super().__init__(tp_worker, output_processor)
         self._outbox: Any | None = None
         # The per-request sampler runs eager (outside the backbone graph) and is a
@@ -30,18 +36,11 @@ class Zonos2ModelRunner(ModelRunner):
         # elementwise launches (~6% decode at bs=16 on H100); off by default until
         # validated more widely.
         self._sampler = (
-            torch.compile(sample_tts, dynamic=True)
-            if os.environ.get("ZONOS2_COMPILE_SAMPLER") == "1"
-            else sample_tts
+            torch.compile(sample_tts, dynamic=True) if compile_sampler else sample_tts
         )
         # Opt-in: replay the captured per-frame tail graph (head+sample+embed+hash)
         # instead of the eager tail. Inert unless the model captured tail graphs.
-        self._frame_graph = os.environ.get("ZONOS2_FRAME_GRAPH", "").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
+        self._frame_graph = frame_graph
 
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox

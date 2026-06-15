@@ -136,15 +136,20 @@ _NORMALIZE_CACHE_LOCK = threading.Lock()
 _NORMALIZE_CACHE_MAX = 256
 
 
-def normalization_enabled() -> bool:
-    return os.environ.get("ZONOS2_TTS_NORM", "1") != "0"
+# Set once by the preprocessing stage from its ``tts_norm_cache_dir`` factory arg
+# (None -> the per-user default below). Module-level to match the lazy normalizer
+# singleton, which is built on the first request after the stage is constructed.
+_TTS_NORM_CACHE_ROOT: str | None = None
+
+
+def configure_tts_norm_cache_root(path: str | None) -> None:
+    """Configure the NeMo normalizer cache dir (preprocessing ``tts_norm_cache_dir``)."""
+    global _TTS_NORM_CACHE_ROOT
+    _TTS_NORM_CACHE_ROOT = path or None
 
 
 def _default_cache_root() -> str:
-    return os.environ.get(
-        "ZONOS2_TTS_NORM_CACHE_DIR",
-        os.path.expanduser("~/.cache/zonos2-tts-norm"),
-    )
+    return _TTS_NORM_CACHE_ROOT or os.path.expanduser("~/.cache/zonos2-tts-norm")
 
 
 class TTSTextNormalizer:
@@ -259,9 +264,11 @@ def _get_normalizer():
 
 
 def normalize_text(text: str, language: str | None) -> str:
-    """Written->spoken normalization; returns ``text`` unchanged on any issue."""
-    if not normalization_enabled():
-        return text
+    """Written->spoken normalization; returns ``text`` unchanged on any issue.
+
+    Gated by the preprocessing stage's ``tts_norm`` factory arg (via
+    ``build_prompt_rows(normalize=...)``); not called at all when disabled.
+    """
     if not language or language not in _SERVER_TO_NEMO_LANG:
         return text
     key = (text, language)

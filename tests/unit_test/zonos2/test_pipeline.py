@@ -46,7 +46,7 @@ def test_zonos2_tts_engine_disables_chunked_prefill(monkeypatch) -> None:
             pass
 
     class FakeModelRunner:
-        def __init__(self, model_worker, output_proc) -> None:
+        def __init__(self, model_worker, output_proc, **kwargs) -> None:
             pass
 
         def set_stream_outbox(self, outbox) -> None:

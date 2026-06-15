@@ -109,6 +109,9 @@ def create_sglang_omni_tts_engine_executor(
     gpu_id: int | None = 0,
     dtype: str = "bfloat16",
     mem_fraction_static: float = 0.5,
+    fp8: bool = False,
+    frame_graph: bool = False,
+    compile_sampler: bool = False,
     **_: Any,
 ) -> Any:
     from sglang_omni.models.zonos2.model_runner import Zonos2ModelRunner
@@ -130,10 +133,8 @@ def create_sglang_omni_tts_engine_executor(
 
     # Opt-in dynamic FP8 on the MoE experts (bf16 -> fp8 at load, halving the
     # expert weights); bf16 nn.Linear projections are unaffected. Off by default;
-    # needs sm80+ (native fp8 tensor-core speedup on Hopper/Ada). Parse the flag
-    # explicitly so ZONOS2_FP8=0 disables rather than enabling on truthiness.
-    _fp8_on = os.environ.get("ZONOS2_FP8", "").lower() in ("1", "true", "yes", "on")
-    fp8 = {"quantization": "fp8"} if _fp8_on else {}
+    # needs sm80+ (native fp8 tensor-core speedup on Hopper/Ada).
+    fp8_kwargs = {"quantization": "fp8"} if fp8 else {}
 
     server_args = build_sglang_server_args(
         shim,
@@ -148,7 +149,7 @@ def create_sglang_omni_tts_engine_executor(
         mem_fraction_static=mem_fraction_static,
         sampling_backend="pytorch",
         trust_remote_code=True,
-        **fp8,
+        **fp8_kwargs,
     )
     # Note:(Chenchen Hong) per-frame feedback/EOS state has no rollback, so a
     # non-final chunked-prefill chunk would queue a spurious frame; disable
@@ -180,7 +181,7 @@ def create_sglang_omni_tts_engine_executor(
     # Opt-in tail CUDA graph: capture the per-frame head+sample+embed+hash tail
     # (otherwise eager in the runner). Captured per decode bucket with the default
     # sampling params; the runner falls back to eager for other params.
-    if os.environ.get("ZONOS2_FRAME_GRAPH", "").lower() in ("1", "true", "yes", "on"):
+    if frame_graph:
         from sglang_omni.models.zonos2.text_frontend import TTSSamplingParams
 
         model.capture_tail_graphs([1, 2, 4, 8, 16], TTSSamplingParams())
@@ -190,7 +191,12 @@ def create_sglang_omni_tts_engine_executor(
     )
     request_builder, result_adapter = make_zonos2_scheduler_adapters(model=model)
 
-    runner = Zonos2ModelRunner(model_worker, output_proc)
+    runner = Zonos2ModelRunner(
+        model_worker,
+        output_proc,
+        compile_sampler=compile_sampler,
+        frame_graph=frame_graph,
+    )
     scheduler = OmniScheduler(
         tp_worker=model_worker,
         tree_cache=tree_cache,

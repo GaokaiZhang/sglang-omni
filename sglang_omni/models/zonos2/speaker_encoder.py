@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import os
 import subprocess
 import threading
 import wave
@@ -203,15 +202,20 @@ class SpeakerEncoder:
     cache means a repeated reference audio costs at most one forward.
     """
 
-    def __init__(self, device: str = "cuda", cache_max_items: int = 256):
+    def __init__(
+        self,
+        device: str = "cuda",
+        cache_max_items: int = 256,
+        compile_forward: bool = False,
+    ):
         self.device = device
         self.cache_max_items = int(cache_max_items)
         self._embedder: Qwen3SpeakerEmbedding | None = None
         self._cache: "OrderedDict[str, torch.Tensor]" = OrderedDict()
         self._last_fingerprint: str | None = None
         # note (Yue Yin): opt-in compile kill-switch (default OFF for bit-for-bit
-        # parity), mirroring the ZONOS2_TTS_NORM env idiom in text_frontend.py.
-        self._compile = os.environ.get("ZONOS2_SPK_COMPILE", "0") == "1"
+        # parity); driven by the speaker_encode stage's spk_compile factory arg.
+        self._compile = compile_forward
         # note (Yue Yin): max_concurrency=4 dispatches encode() across threads that
         # share one CUDA model + one LRU; serialize the body to keep it re-entrant.
         self._lock = threading.Lock()

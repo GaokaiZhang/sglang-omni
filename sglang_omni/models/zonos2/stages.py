@@ -10,7 +10,6 @@ Each stage is a SimpleScheduler compute-fn over a Zonos2State dict carried in
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 import numpy as np
@@ -21,7 +20,10 @@ from sglang_omni.models.zonos2.request_builders import (
     build_zonos2_state,
     ref_audio_to_encoder_input,
 )
-from sglang_omni.models.zonos2.text_frontend import build_prompt_rows
+from sglang_omni.models.zonos2.text_frontend import (
+    build_prompt_rows,
+    configure_tts_norm_cache_root,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.audio_payload import audio_waveform_payload
@@ -54,15 +56,22 @@ def _store(payload: StagePayload, state: Zonos2State) -> StagePayload:
 
 
 def create_preprocessing_executor(
-    model_path: str, *, max_concurrency: int = 16, **_: Any
+    model_path: str,
+    *,
+    max_concurrency: int = 16,
+    tts_norm: bool = True,
+    tts_norm_cache_dir: str | None = None,
+    **_: Any,
 ) -> SimpleScheduler:
+    configure_tts_norm_cache_root(tts_norm_cache_dir)
+
     def _preprocess(payload: StagePayload) -> StagePayload:
         state = build_zonos2_state(payload)
         rows = build_prompt_rows(
             state.text,
             language=state.language,
             quality_buckets=_default_quality_list(),
-            normalize=True,
+            normalize=tts_norm,
         )
         state.input_ids = rows.to(torch.long)
         return _store(payload, state)
@@ -79,11 +88,16 @@ def create_speaker_encode_executor(
     device: str = "cuda:0",
     speaker_cache_max_items: int = 256,
     max_concurrency: int = 4,
+    spk_compile: bool = False,
     **_: Any,
 ) -> SimpleScheduler:
     from sglang_omni.models.zonos2.speaker_encoder import SpeakerEncoder
 
-    encoder = SpeakerEncoder(device=device, cache_max_items=speaker_cache_max_items)
+    encoder = SpeakerEncoder(
+        device=device,
+        cache_max_items=speaker_cache_max_items,
+        compile_forward=spk_compile,
+    )
 
     def _speaker(payload: StagePayload) -> StagePayload:
         state = Zonos2State.from_dict(payload.data)
@@ -100,7 +114,12 @@ def create_speaker_encode_executor(
 
 
 def create_vocoder_executor(
-    model_path: str, *, device: str = "cuda:0", **_: Any
+    model_path: str,
+    *,
+    device: str = "cuda:0",
+    dac_batch: bool = False,
+    vocoder_warmup: bool = False,
+    **_: Any,
 ) -> Any:
     from sglang_omni.models.zonos2.streaming_vocoder import (
         Zonos2StreamingVocoderScheduler,
@@ -173,7 +192,7 @@ def create_vocoder_executor(
     # right-padding lets ConvTranspose bleed across items and changes the gate
     # output vs the single decode. Keep it opt-in (default off) until GPU
     # allclose-vs-single parity is confirmed; default path stays single-decode.
-    batch_enabled = os.environ.get("ZONOS2_DAC_BATCH", "0") == "1"
+    batch_enabled = dac_batch
     scheduler = Zonos2StreamingVocoderScheduler(
         device=device,
         compute_fn=_vocode,
@@ -187,7 +206,7 @@ def create_vocoder_executor(
     # off the first request's critical path to startup. N_CODEBOOKS+1 rows keep
     # 2 aligned frames after the de-shear so a real decode warms the kernels.
     # Never fatal -- the lazy load still happens on first decode if this fails.
-    if os.environ.get("ZONOS2_VOCODER_WARMUP", "0") == "1":
+    if vocoder_warmup:
         try:
             decode_to_pcm(
                 torch.zeros((N_CODEBOOKS + 1, N_CODEBOOKS), dtype=torch.long),
