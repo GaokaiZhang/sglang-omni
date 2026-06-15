@@ -131,7 +131,6 @@ text.
 | `top_k` | (model default) | Top-k sampling |
 | `min_p` | (model default) | Min-p sampling |
 | `repetition_penalty` | (model default) | Audio repetition penalty |
-| `seed` | `null` | Non-negative integer for reproducible sampling |
 
 ## Benchmarking
 
