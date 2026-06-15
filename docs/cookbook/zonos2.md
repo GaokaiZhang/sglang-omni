@@ -18,8 +18,9 @@ download the model:
 hf download Zyphra/zonos2
 ```
 
-The processor ships with the checkpoint, so no extra TTS package is needed. Decoding base64
-(data-URI) reference audio additionally requires `soundfile` (`uv pip install soundfile`).
+The processor ships with the checkpoint, so no extra TTS package is needed. Voice cloning
+transcodes reference audio (file, URL, or base64 data-URI) with **ffmpeg**, so `ffmpeg` must
+be on the server's `PATH` (e.g. `apt-get install ffmpeg`).
 
 ## Server Configuration
 
@@ -80,7 +81,7 @@ with open("output.wav", "wb") as f:
 ### Reference Audio Sources
 
 `audio_path` / `ref_audio` may be a local filesystem path readable by the server, an HTTP(S)
-URL, or a base64 **data URI** (`data:audio/wav;base64,<...>`, decoded with `soundfile`):
+URL, or a base64 **data URI** (`data:audio/wav;base64,<...>`, transcoded via `ffmpeg`):
 
 ```json
 {"ref_audio": "data:audio/wav;base64,UklGR.....", "ref_text": "Transcript of the clip."}

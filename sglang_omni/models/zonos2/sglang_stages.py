@@ -10,8 +10,10 @@ key mapping.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import shutil
 import tempfile
 from typing import Any
 
@@ -23,6 +25,7 @@ from sglang_omni.models.zonos2.hf_config import (
 
 def _build_config_shim(model_path: str, cfg: Zonos2Config) -> str:
     shim = tempfile.mkdtemp(prefix="zonos2_sglang_")
+    atexit.register(shutil.rmtree, shim, ignore_errors=True)
     with open(os.path.join(model_path, "params.json")) as f:
         params = json.load(f)
     params.update(
@@ -42,9 +45,17 @@ def _build_config_shim(model_path: str, cfg: Zonos2Config) -> str:
     )
     with open(os.path.join(shim, "config.json"), "w") as f:
         json.dump(params, f)
-    os.symlink(
-        os.path.join(model_path, "model.pth"), os.path.join(shim, "pytorch_model.bin")
-    )
+    src = os.path.join(model_path, "model.pth")
+    dst = os.path.join(shim, "pytorch_model.bin")
+    # Prefer a symlink; fall back to a hardlink, then a copy, where symlinks are
+    # unsupported (some network / Windows filesystems).
+    try:
+        os.symlink(src, dst)
+    except (OSError, NotImplementedError):
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copyfile(src, dst)
     return shim
 
 

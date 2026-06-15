@@ -9,7 +9,6 @@ Each stage is a SimpleScheduler compute-fn over a Zonos2State dict carried in
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 import os
 from typing import Any
@@ -22,11 +21,7 @@ from sglang_omni.models.zonos2.request_builders import (
     build_zonos2_state,
     ref_audio_to_encoder_input,
 )
-from sglang_omni.models.zonos2.text_frontend import (
-    TTSSamplingParams,
-    build_prompt_rows,
-    make_speaker_slot,
-)
+from sglang_omni.models.zonos2.text_frontend import build_prompt_rows
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.audio_payload import audio_waveform_payload
@@ -43,8 +38,6 @@ _QUALITY_FEATURES = [
     "trailing_silence_s",
 ]
 _DEFAULT_QUALITY_BUCKETS = {"trailing_silence_s": 3}
-
-_SAMPLING_FIELD_NAMES = {f.name for f in dataclasses.fields(TTSSamplingParams)}
 
 
 def _default_quality_list() -> list[int | None]:
@@ -101,72 +94,6 @@ def create_speaker_encode_executor(
         return _store(payload, state)
 
     return SimpleScheduler(_speaker, max_concurrency=max_concurrency)
-
-
-# ---- AR decode engine ----
-
-
-def create_sglang_tts_engine_executor(
-    model_path: str,
-    *,
-    gpu_id: int | None = 0,
-    dtype: str = "bfloat16",
-    max_concurrency: int = 16,
-    **_: Any,
-) -> SimpleScheduler:
-    from sglang_omni.models.zonos2.engine import Zonos2Engine
-
-    device = f"cuda:{int(gpu_id)}" if gpu_id is not None else "cuda:0"
-    torch_dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
-    engine = Zonos2Engine.from_pretrained(model_path, device=device, dtype=torch_dtype)
-    cfg = engine.cfg
-    n, audio_pad = cfg.n_codebooks, cfg.audio_pad_id
-    # Conditioning ids occupy the tail of text_vocab:
-    #   ... speaking_rate | quality | bg(clean, noisy) | accurate_mode
-    base = (
-        cfg.text_vocab - cfg.speaking_rate_num_buckets - cfg.quality_num_buckets - 2 - 1
-    )
-    cond = cfg.speaking_rate_num_buckets + cfg.quality_num_buckets
-    bg_noisy_id = base + cond + 1  # clean_speaker_background=False -> noisy
-    accurate_id = base + cond + 2
-
-    def _marker_row(tok: int) -> list[int]:
-        return [audio_pad] * n + [tok]
-
-    def _generate(payload: StagePayload) -> StagePayload:
-        state = Zonos2State.from_dict(payload.data)
-        rows = state.input_ids
-        if not isinstance(rows, torch.Tensor):
-            rows = torch.tensor(rows, dtype=torch.long)
-        rows = rows.to(torch.long)
-
-        speaker_emb = state.speaker_emb
-        if speaker_emb is not None:
-            if not isinstance(speaker_emb, torch.Tensor):
-                speaker_emb = torch.tensor(speaker_emb, dtype=torch.float32)
-            # Train-time prefix order: speaker_slot, bg, accurate, then text.
-            slot = make_speaker_slot().to(torch.long)
-            bg = torch.tensor([_marker_row(bg_noisy_id)], dtype=torch.long)
-            acc = torch.tensor([_marker_row(accurate_id)], dtype=torch.long)
-            rows = torch.cat([slot, bg, acc, rows], dim=0)
-
-        gen = {
-            k: v
-            for k, v in state.generation_kwargs.items()
-            if k in _SAMPLING_FIELD_NAMES
-        }
-        params = TTSSamplingParams(**gen)
-        res = engine.generate_one(
-            rows, params, speaker_emb=speaker_emb, speaker_position=0
-        )
-        frames = res["audio_tokens"]
-        state.audio_codes = torch.tensor(frames, dtype=torch.long) if frames else None
-        state.eos_frame = res["eos_frame"]
-        state.prompt_tokens = int(rows.shape[0])
-        state.completion_tokens = len(frames)
-        return _store(payload, state)
-
-    return SimpleScheduler(_generate, max_concurrency=max_concurrency)
 
 
 # ---- vocoder (DAC 44.1 kHz, terminal) ----

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """SGLang-native ZONOS2 backbone: custom MoE transformer on RadixAttention.
 
-The verified forward math (see modeling.py) ported onto SGLang primitives so the
+The verified forward math ported onto SGLang primitives so the
 AR decode runs under the scheduler with a paged radix KV cache, continuous
 batching, FusedMoE and CUDA-graph capture. The multi-codebook head + per-frame
 sampling/feedback live in the model runner (model_runner.py); this module emits

@@ -1,46 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-codebook TTS sampler.
+"""Per-codebook TTS sampler with per-request sampling params.
 
-Order: repetition penalty, temperature, top-k, softmax, top-p, min-p,
-multinomial (argmax when temperature <= 0). Logits arrive soft-capped.
-"""
+Order: repetition penalty, temperature, top-k, top-p, min-p, then a seeded
+draw (``multinomial_with_seed``) so each request samples from its own
+seed/params regardless of batch composition -- a row's token depends only on
+its own seed and (step, codebook) position, never on its batch neighbours.
+Rows with temperature <= 0 or left fully masked fall back to greedy argmax.
+Logits arrive soft-capped. All masks are vectorized per row (no per-request
+Python loop, no host syncs beyond the single top-k ``max()``)."""
 
 from __future__ import annotations
 
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
+from sglang.srt.layers.sampler import multinomial_with_seed
 
-from sglang_omni.models.zonos2.text_frontend import TTSSamplingParams
-
-
-def _apply_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
-    if p <= 0.0 or p >= 1.0:
-        return probs
-    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    mask = probs_sum - probs_sort > p
-    probs_sort = probs_sort.masked_fill(mask, 0.0)
-    probs = probs.scatter(-1, probs_idx, probs_sort)
-    return probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-
-def _apply_min_p(probs: torch.Tensor, min_p: float) -> torch.Tensor:
-    if min_p <= 0.0:
-        return probs
-    top_probs, _ = probs.max(dim=-1, keepdim=True)
-    probs = probs.masked_fill(probs < (min_p * top_probs), 0.0)
-    return probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+_NEG_INF = float("-inf")
 
 
 def _apply_repetition_penalty(
     logits: torch.Tensor,
     rep_token_ids: Optional[torch.Tensor],
-    penalties: Optional[torch.Tensor],
+    penalties: torch.Tensor,
 ) -> torch.Tensor:
-    """Penalize per-codebook repeats. logits (B,C,V), rep_token_ids (B,C,W)."""
-    if rep_token_ids is None or penalties is None or rep_token_ids.numel() == 0:
+    """Penalize per-codebook repeats. logits (B,C,V), rep_token_ids (B,C,W),
+    penalties (B,) -- one penalty strength per request."""
+    if rep_token_ids is None or rep_token_ids.numel() == 0:
         return logits
     B, C, V = logits.shape
     safe = rep_token_ids.clamp(min=0, max=V - 1).long()
@@ -53,44 +39,95 @@ def _apply_repetition_penalty(
     return torch.where(repeated, adjusted, logits)
 
 
+def _apply_top_k(
+    scores: torch.Tensor, top_k_row: torch.Tensor, max_top_k: int
+) -> torch.Tensor:
+    """Per-row top-k mask; rows with k <= 0 or k >= vocab are left untouched.
+    ``max_top_k`` is the largest active k, supplied by the caller from the host
+    params so this stays sync-free (no ``.item()`` stall in the decode loop)."""
+    vocab = scores.shape[-1]
+    active = (top_k_row > 0) & (top_k_row < vocab)
+    k_clamped = top_k_row.clamp(min=1, max=vocab)
+    topk_scores, _ = torch.topk(scores, k=max_top_k, dim=-1)
+    gather_k = torch.where(active, k_clamped, torch.ones_like(k_clamped))
+    gather_k = gather_k.clamp(min=1, max=max_top_k)
+    kth = topk_scores.gather(1, (gather_k - 1).unsqueeze(1))
+    threshold = torch.where(active.unsqueeze(1), kth, torch.full_like(kth, _NEG_INF))
+    return scores.masked_fill(scores < threshold, _NEG_INF)
+
+
+def _apply_top_p(scores: torch.Tensor, top_p_row: torch.Tensor) -> torch.Tensor:
+    """Per-row nucleus mask; rows with p <= 0 or p >= 1 are left untouched."""
+    sorted_scores, sorted_indices = torch.sort(scores, descending=True, dim=-1)
+    probs = torch.softmax(sorted_scores, dim=-1)
+    cumulative = torch.cumsum(probs, dim=-1)
+    remove = cumulative > top_p_row.unsqueeze(1)
+    remove[..., 1:] = remove[..., :-1].clone()
+    remove[..., 0] = False
+    remove = remove & ((top_p_row > 0.0) & (top_p_row < 1.0)).unsqueeze(1)
+    remove_scattered = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+        -1, sorted_indices, remove
+    )
+    return scores.masked_fill(remove_scattered, _NEG_INF)
+
+
+def _apply_min_p(scores: torch.Tensor, min_p_row: torch.Tensor) -> torch.Tensor:
+    """Per-row min-p mask (relative to the row's max prob); min_p <= 0 untouched."""
+    probs = torch.softmax(scores, dim=-1)
+    top = probs.max(dim=-1, keepdim=True).values
+    remove = probs < (min_p_row.clamp(min=0.0).unsqueeze(1) * top)
+    return scores.masked_fill(remove, _NEG_INF)
+
+
 @torch.no_grad()
 def sample_tts(
     logits: torch.Tensor,
-    params: TTSSamplingParams,
+    *,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    min_p: torch.Tensor,
+    repetition_penalty: torch.Tensor,
+    seeds: torch.Tensor,
+    positions: torch.Tensor,
+    top_k_max: int,
     rep_token_ids: Optional[torch.Tensor] = None,
-    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
-    """logits (B, C, V) soft-capped -> sampled codes (B, C) int64."""
+    """logits (B, C, V) soft-capped -> sampled codes (B, C) int64.
+
+    All sampling params are per-request (B,) tensors; ``seeds`` is the per-request
+    sampling seed and ``positions`` the per-request decode step (combined with the
+    codebook index so the 9 codebooks decorrelate within a step). ``top_k_max`` is
+    the largest active top-k across the batch (host int; 0 disables top-k)."""
     B, C, V = logits.shape
     device = logits.device
-    penalties = (
-        torch.full((B,), params.repetition_penalty, device=device)
-        if rep_token_ids is not None and params.repetition_penalty != 1.0
-        else None
+    logits = _apply_repetition_penalty(logits, rep_token_ids, repetition_penalty)
+
+    def _rows(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        return t.to(device=device, dtype=dtype).repeat_interleave(C)
+
+    temp_row = _rows(temperature, torch.float32)
+    do_sample = temp_row > 0
+    safe_temp = torch.where(do_sample, temp_row, torch.ones_like(temp_row))
+    scores = logits.reshape(B * C, V).float() / safe_temp.unsqueeze(1)
+    if top_k_max > 0:
+        scores = _apply_top_k(scores, _rows(top_k, torch.long), top_k_max)
+    scores = _apply_top_p(scores, _rows(top_p, torch.float32))
+    scores = _apply_min_p(scores, _rows(min_p, torch.float32))
+
+    # Per-(request, codebook) positions decorrelate the 9 codebooks within a
+    # step; per-request seeds decorrelate requests. multinomial_with_seed treats
+    # its input as weights, so pass probs (masked tokens are 0 -> never drawn).
+    seed_row = _rows(seeds, torch.long)
+    cb = torch.arange(C, device=device, dtype=torch.long).repeat(B)
+    pos_row = (
+        positions.to(device=device, dtype=torch.long).repeat_interleave(C) * C + cb
     )
-    logits = _apply_repetition_penalty(logits, rep_token_ids, penalties)
 
-    if params.temperature <= 0:
-        return torch.argmax(logits, dim=-1)
-
-    logits = logits / max(params.temperature, 1e-8)
-    flat = logits.view(B * C, V)
-    if 0 < params.top_k < V:
-        values, _ = torch.topk(flat, params.top_k, dim=-1)
-        kth = values[..., -1].unsqueeze(-1)
-        flat = flat.masked_fill(flat < kth, float("-inf"))
-    probs = F.softmax(flat, dim=-1)
-    if 0.0 < params.top_p < 1.0:
-        probs = _apply_top_p(probs, params.top_p)
-    if params.min_p > 0.0:
-        probs = _apply_min_p(probs, params.min_p)
-
-    # Fall back to greedy on any all-zero row. Done unconditionally (no
-    # host sync on invalid.any()): where() is a no-op when nothing is invalid.
-    invalid = (probs.sum(dim=-1) <= 0).unsqueeze(-1)
-    fb = torch.zeros_like(probs)
-    fb.scatter_(-1, flat.argmax(dim=-1, keepdim=True), 1.0)
-    probs = torch.where(invalid, fb, probs)
-
-    nxt = torch.multinomial(probs, num_samples=1, generator=generator)
-    return nxt.view(B, C)
+    probs = torch.nan_to_num(
+        torch.softmax(scores, dim=-1), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    fallback = (~do_sample) | (probs.sum(dim=-1) <= 0)
+    greedy = torch.argmax(scores, dim=-1)
+    seeded = multinomial_with_seed(probs, seed_row, pos_row).view(-1)
+    return torch.where(fallback, greedy, seeded).view(B, C)

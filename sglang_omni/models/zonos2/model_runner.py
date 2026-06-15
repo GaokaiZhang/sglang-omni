@@ -79,6 +79,11 @@ class Zonos2ModelRunner(ModelRunner):
             return
         dim = self.model.config.dim
         buf = self.model._decode_input_embedding.weight
+        if bs > buf.shape[0]:
+            raise RuntimeError(
+                f"decode batch {bs} exceeds the staged feedback buffer "
+                f"({buf.shape[0]} rows); raise max_running_requests."
+            )
         rows = []
         for sr in requests:
             q = sr.data.pending_feedback_queue
@@ -154,17 +159,34 @@ class Zonos2ModelRunner(ModelRunner):
         logits = model.compute_logits(hidden).float()  # [B, 9, 1026]
         b = len(requests)
 
-        # Batched per-codebook sampling. The benchmark uses uniform sampling
-        # params; a per-request seed falls back to that request's generator.
-        params = requests[0].data.params
-        rep_ids = self._rep_window(requests, n, cb_size, logits.device)
+        # Per-request sampling: temperature / top_k / top_p / min_p / repetition
+        # penalty and seed all come from each request (no requests[0] broadcast
+        # or shared generator), so concurrent requests keep their own params and
+        # reproducible seeds regardless of batch composition (matches moss_tts).
         self._break_frame_loops(logits, requests)
-        gen = next(
-            (sr.data.generator for sr in requests if sr.data.generator is not None),
-            None,
+        rep_ids = self._rep_window(requests, n, cb_size, logits.device)
+        dev = logits.device
+        p = [sr.data.params for sr in requests]
+        # Largest active top-k computed on the host (params are Python ints) so
+        # the sampler needs no .item() sync in the decode loop.
+        top_k_max = max(
+            (x.top_k for x in p if 0 < x.top_k < model.audio_vocab), default=0
         )
         codes = sample_tts(
-            logits, params, rep_token_ids=rep_ids, generator=gen
+            logits,
+            temperature=torch.tensor([x.temperature for x in p], device=dev),
+            top_k=torch.tensor([x.top_k for x in p], device=dev),
+            top_p=torch.tensor([x.top_p for x in p], device=dev),
+            min_p=torch.tensor([x.min_p for x in p], device=dev),
+            repetition_penalty=torch.tensor(
+                [x.repetition_penalty for x in p], device=dev
+            ),
+            seeds=torch.tensor([sr.data.sampling_seed for sr in requests], device=dev),
+            positions=torch.tensor(
+                [sr.data.generation_step for sr in requests], device=dev
+            ),
+            top_k_max=top_k_max,
+            rep_token_ids=rep_ids,
         )  # [B, 9]
 
         # Feedback embeddings for the next step: [B, 10] rows (codes + text pad).
