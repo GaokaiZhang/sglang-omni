@@ -213,6 +213,7 @@ def create_sglang_omni_tts_engine_executor(
         model_runner=runner,
         request_builder=request_builder,
         result_adapter=result_adapter,
+        enable_async_decode=async_decode,
     )
     runner.set_stream_outbox(scheduler.outbox)
     return scheduler
