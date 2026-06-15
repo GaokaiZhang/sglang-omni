@@ -3,13 +3,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-# ---------------------------------------------------------------------------
-# Shared / Common
-# ---------------------------------------------------------------------------
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class UsageResponse(BaseModel):
@@ -18,11 +14,6 @@ class UsageResponse(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
-
-
-# ---------------------------------------------------------------------------
-# Chat Completion
-# ---------------------------------------------------------------------------
 
 
 class ChatMessage(BaseModel):
@@ -155,15 +146,35 @@ class ChatCompletionStreamResponse(BaseModel):
     usage: UsageResponse | None = None
 
 
-# ---------------------------------------------------------------------------
-# Speech (TTS)
-# ---------------------------------------------------------------------------
+SUPPORTED_TTS_RESPONSE_FORMATS = frozenset({"wav", "mp3", "flac", "pcm", "aac", "opus"})
+SUPPORTED_TTS_LANGUAGES = frozenset(
+    {
+        "Auto",
+        "Chinese",
+        "English",
+        "Japanese",
+        "Korean",
+        "German",
+        "French",
+        "Russian",
+        "Portuguese",
+        "Spanish",
+        "Italian",
+    }
+)
+SUPPORTED_TTS_TASK_TYPES = frozenset({"Base", "CustomVoice", "VoiceDesign"})
+TTS_SPEED_MIN = 0.25
+TTS_SPEED_MAX = 4.0
 
 
 class SpeechReference(BaseModel):
     """Reference item for voice cloning in /v1/audio/speech."""
 
     audio_path: str | None = None
+    ref_audio: str | None = None
+    audio: str | None = None
+    data: str | None = None
+    media_type: str | None = None
     text: str | None = None
     vq_codes: list[list[int]] | list[int] | None = None
 
@@ -180,11 +191,13 @@ class CreateSpeechRequest(BaseModel):
     # Standard OpenAI fields
     model: str | None = None
     input: str
-    voice: str = "default"
+    voice: str = Field(
+        default="default",
+        validation_alias=AliasChoices("voice", "speaker"),
+    )
     response_format: str = "wav"
     speed: float = 1.0
     stream: bool = False
-    stream_format: Literal["sse", "audio"] = "sse"
 
     # Advanced TTS extensions
     task_type: str | None = None  # e.g. "Base", "CustomVoice", "VoiceDesign"
@@ -195,6 +208,7 @@ class CreateSpeechRequest(BaseModel):
     ref_audio: str | None = None  # path or URL to reference audio
     ref_text: str | None = None  # transcript of reference audio
     references: list[SpeechReference] | None = None  # S2-Pro-style refs
+    x_vector_only_mode: bool | None = None
     token_count: int | None = None  # MOSS-TTS duration token target
     duration_tokens: int | None = None  # alias for token_count
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
@@ -210,30 +224,11 @@ class CreateSpeechRequest(BaseModel):
     # Per-stage overrides (sglang-omni specific)
     stage_params: dict[str, dict[str, Any]] | None = None
 
-    @model_validator(mode="after")
-    def validate_stream_format(self) -> "CreateSpeechRequest":
-        if self.stream_format == "audio":
-            if not self.stream:
-                raise ValueError('stream_format="audio" requires stream=true')
-            if self.response_format.lower() != "pcm":
-                raise ValueError('stream_format="audio" requires response_format="pcm"')
-        return self
-
-
-# ---------------------------------------------------------------------------
-# Audio transcription (ASR)
-# ---------------------------------------------------------------------------
-
 
 class TranscriptionResponse(BaseModel):
     """OpenAI-compatible transcription response."""
 
     text: str
-
-
-# ---------------------------------------------------------------------------
-# Model listing
-# ---------------------------------------------------------------------------
 
 
 class ModelPermission(BaseModel):

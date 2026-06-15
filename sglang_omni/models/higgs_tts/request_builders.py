@@ -199,6 +199,7 @@ def make_higgs_scheduler_adapters(
 
 __all__ = [
     "HiggsSGLangRequestData",
+    "INITIAL_CODEC_CHUNK_FRAMES_PARAM",
     "apply_higgs_result",
     "build_higgs_stream_metadata",
     "build_sglang_higgs_request",

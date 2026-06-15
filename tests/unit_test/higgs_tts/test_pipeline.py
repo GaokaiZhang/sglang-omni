@@ -426,6 +426,7 @@ def test_higgs_model_runner_emits_latched_stream_metadata() -> None:
             "stream": True,
             "num_codebooks": 3,
             "codebook_size": 17,
+            "initial_codec_chunk_frames": 2,
         },
     )
     result = SimpleNamespace(
@@ -446,6 +447,7 @@ def test_higgs_model_runner_emits_latched_stream_metadata() -> None:
         "stream": True,
         "num_codebooks": 3,
         "codebook_size": 17,
+        "initial_codec_chunk_frames": 2,
     }
 
 
@@ -835,6 +837,50 @@ def test_higgs_streaming_vocoder_emits_compact_chunks_and_slim_final() -> None:
     }
     assert "req" not in scheduler._pending_done
     assert "req" not in scheduler._stream_states
+
+
+def test_higgs_streaming_vocoder_honors_initial_codec_chunk_frames() -> None:
+    raw_codes = torch.tensor(
+        [
+            [1, 8, 9],
+            [2, 3, 10],
+            [4, 11, 12],
+            [1, 2, 3],
+        ],
+        dtype=torch.long,
+    )
+    delayed = apply_delay_pattern(raw_codes)
+    codec = _FakeHiggsStreamingCodec(samples_per_frame=4)
+    scheduler = HiggsStreamingVocoderScheduler(
+        codec,
+        stream_stride=8,
+        stream_followup_stride=8,
+        stream_holdback_tokens=0,
+    )
+    payload = _higgs_stream_payload(
+        "req",
+        stream=True,
+        delayed_rows=delayed.tolist(),
+        codebook_size=20,
+        initial_codec_chunk_frames=1,
+    )
+
+    scheduler._on_streaming_new_request("req", payload)
+    for idx, row in enumerate(delayed[:2]):
+        item = _higgs_stream_item(row)
+        item.chunk_id = idx
+        scheduler._on_chunk("req", item)
+    assert not _drain_higgs_outbox(scheduler)
+
+    item = _higgs_stream_item(delayed[2])
+    item.chunk_id = 2
+    scheduler._on_chunk("req", item)
+    messages = _drain_higgs_outbox(scheduler)
+
+    assert len(messages) == 1
+    audio = np.frombuffer(messages[0].data["audio_waveform"], dtype=np.float32)
+    assert audio.size == 4
+    assert codec.decode_inputs[0].shape[0] == 1
 
 
 def test_higgs_streaming_vocoder_matches_full_decode_with_codec_tail() -> None:

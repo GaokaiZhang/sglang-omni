@@ -407,7 +407,7 @@ def create_preprocessing_executor(
     encode_batch_size: int = 8,
     encode_batch_wait_ms: int = 4,
     ref_audio_cache: bool = True,
-    ref_audio_cache_max_items: int = 256,
+    ref_audio_cache_max_items: int = 8192,
     ref_audio_cache_max_bytes: int = 64 * 1024 * 1024,
 ) -> SimpleScheduler:
     # MOSS_REF_AUDIO_CACHE=0 disables the cache at startup (ops kill switch / A-B

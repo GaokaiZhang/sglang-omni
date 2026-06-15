@@ -8,6 +8,9 @@ import yaml
 
 from sglang_omni.config import PipelineConfig
 from sglang_omni.config.manager import ConfigManager
+from sglang_omni.preprocessing.resource_connector import (
+    resolve_allowed_local_media_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +219,24 @@ def _validate_encoder_mem_reserve(value: float | None) -> float | None:
     if not 0.0 <= value < 1.0:
         raise typer.BadParameter("--encoder-mem-reserve must be in [0, 1)")
     return float(value)
+
+
+def _validate_allowed_local_media_path(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return str(resolve_allowed_local_media_path(value))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _normalize_allowed_media_domains(values: list[str] | None) -> list[str]:
+    domains: list[str] = []
+    for value in values or []:
+        domains.extend(
+            part.strip().lower() for part in value.split(",") if part.strip()
+        )
+    return domains
 
 
 def apply_mem_fraction_cli_overrides(
@@ -836,6 +857,29 @@ def serve(
     model_name: Annotated[
         str, typer.Option(help="Model name for /v1/models (default: pipeline name).")
     ] = None,
+    allowed_local_media_path: Annotated[
+        str | None,
+        typer.Option(
+            "--allowed-local-media-path",
+            "--allowed_local_media_path",
+            help=(
+                "Directory allowed for file:// media references in TTS requests. "
+                "Local file references are disabled when this is omitted."
+            ),
+        ),
+    ] = None,
+    allowed_media_domain: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--allowed-media-domain",
+            "--allowed_media_domain",
+            help=(
+                "Restrict remote media references to this domain. Repeat the "
+                "flag to allow multiple domains. Remote HTTP(S) references "
+                "are disabled when this is omitted."
+            ),
+        ),
+    ] = None,
     mem_fraction_static: Annotated[
         float | None,
         typer.Option(
@@ -1135,4 +1179,8 @@ def serve(
         model_name=model_name,
         log_level=log_level,
         enable_realtime=enable_realtime,
+        allowed_local_media_path=_validate_allowed_local_media_path(
+            allowed_local_media_path
+        ),
+        allowed_media_domains=_normalize_allowed_media_domains(allowed_media_domain),
     )

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import replace
 from typing import Any, AsyncIterator, Callable
@@ -181,6 +182,7 @@ class Client:
         request_id: str,
         response_format: str = "wav",
         speed: float = 1.0,
+        allow_format_fallback: bool = True,
     ) -> SpeechResult:
         """Run a TTS request and return encoded audio bytes.
 
@@ -214,11 +216,14 @@ class Client:
         encode_kwargs: dict[str, Any] = {
             "response_format": response_format,
             "speed": speed,
+            "allow_format_fallback": allow_format_fallback,
         }
         if sample_rate is not None:
             encode_kwargs["sample_rate"] = sample_rate
 
-        audio_bytes, mime_type = encode_audio(audio_data, **encode_kwargs)
+        audio_bytes, mime_type = await asyncio.to_thread(
+            encode_audio, audio_data, **encode_kwargs
+        )
 
         # Derive actual format from MIME type (encode_audio may fall back
         # to WAV if the requested codec is unavailable).

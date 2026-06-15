@@ -49,6 +49,9 @@ tests/
     ├── ming_omni/
     │   ├── test_omni_serve.py
     │   ├── test_pipeline.py
+    │   ├── test_streaming_decode.py
+    │   ├── test_streaming_e2e_glue.py
+    │   ├── test_streaming_speech_config.py
     │   ├── test_talker.py
     │   ├── test_talker_voice_validation.py
     │   ├── test_thinker.py
@@ -157,7 +160,7 @@ Relevant model CI ownership:
   summary style as the other benchmark stages: `ASR WER Benchmark Result`
   followed by `ASR Speed Benchmark Result`.
 - `utils.py`: shared fixture/helpers for talker/TTS WER CI —
-  stops the upstream model server, runs `ensure_gpus_idle.sh`, then launches
+  stops the upstream model server, runs `delete_gpu_process.sh --kill-orphans`, then launches
   a Qwen3-ASR router. It also owns the WER ASR concurrency constant
   (`QWEN3_ASR_WER_CONCURRENCY`, currently 32). Used by Qwen3 talker WER tests
   and TTS WER tests instead of the in-process transformers Whisper pipeline.
@@ -173,7 +176,7 @@ Relevant model CI ownership:
   an earlier suite does not skip later ones; only a failed setup blocks the chain.
   Full WER sweep: `.github/scripts/run_all_wer_ci_aligned.sh` (milestones on
   stdout; details in `/tmp/wer_ci_qwen3.log` and `/tmp/wer_ci_tts.log`).
-- GPU handoff between stages: `.github/scripts/ensure_gpus_idle.sh` (kills orphan
+- GPU handoff between stages: `.github/scripts/delete_gpu_process.sh --kill-orphans` (kills orphan
   spawn/router workers, waits for VRAM below threshold).
 - `qwen3_omni_vision_sglang_env`: session-scoped SGLang dist + DP-attention
   init from `conftest.py`, shared by every Qwen3-Omni vision-encoder benchmark
@@ -294,6 +297,19 @@ that happened to contain an older version of the test.
   - Bailing tokenizer loader fallback for vocab compatibility
   - TP topology validation (rank-specific stage specs, talker/thinker GPU collision detection, server_args alignment before infra init)
   - vision encoder `patch_embed` numerical equivalence: `nn.Conv3d` vs `F.linear` reshape at the substitution boundary, using synthetic weights without loading real Ming checkpoints.
+  - streaming text decode (`MingStreamingDetokenizeScheduler` /
+    `make_text_stream_output_builder`): per-token detokenization and delta
+    emission with UTF-8 multibyte boundary safety, streaming vs. non-streaming
+    final-result shape, stream-completion ordering races, per-request failure
+    isolation, bounded orphan `_state` eviction with abort cleanup, and
+    text-stream output gating on the `stream` flag, chunked prefill, and
+    text-vs-audio-only output modalities
+  - streaming speech glue and topology: thinker text/combined stream builders
+    fanning token ids to decode and text to the segmenter (audio-only kept off
+    decode), client merge of decode deltas with the talker stream, and
+    `MingOmniStreamingSpeechPipelineConfig` wiring (segmenter between thinker and
+    talker, terminal talker-stream stage, thinker/talker GPU-range collision
+    rejection, streaming variant exposure).
 
 - `unit_test/qwen3_tts/`: Qwen3-TTS unit tests:
   - pipeline config and registry contracts

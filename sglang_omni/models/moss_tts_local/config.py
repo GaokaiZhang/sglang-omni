@@ -21,7 +21,7 @@ def _stages(*, codec_device: str) -> list[StageConfig]:
             factory_args={
                 "device": codec_device,
                 "ref_audio_cache": True,
-                "ref_audio_cache_max_items": 256,
+                "ref_audio_cache_max_items": 8192,
                 "ref_audio_cache_max_bytes": 64 * 1024 * 1024,
             },
             gpu=0,
