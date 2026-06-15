@@ -281,22 +281,28 @@ class SpeakerEncoder:
         """
         wav, sr, key = self._load_waveform(ref_audio, sample_rate)
 
+        # note (Yue Yin): hold the lock only for the cache + lazy embedder init,
+        # NOT the 0.3-0.5s read-only forward -- otherwise the 4 encode threads
+        # (max_concurrency=4) serialize on it and collapse to ~1.
         with self._lock:
             self._last_fingerprint = key
-
             cached = self._cache.get(key)
             if cached is not None:
                 self._cache.move_to_end(key)
                 # clone so callers can't mutate the cached tensor
                 return cached.clone()
-
             embedder = self._get_embedder()
-            with torch.inference_mode():
-                output = embedder(wav, sr)
 
-            emb = self._select_embedding(output)
+        with torch.inference_mode():
+            output = embedder(wav, sr)
+        emb = self._select_embedding(output)
+
+        # note (Yue Yin): benign race -- two threads with the same key both
+        # compute and the second _cache_put overwrites; the forward is
+        # deterministic so the emb is identical and the cache stays correct.
+        with self._lock:
             self._cache_put(key, emb)
-            return emb.clone()
+        return emb.clone()
 
     def fingerprint(self) -> str | None:
         """Content-hash string of the most recent :meth:`encode` call."""

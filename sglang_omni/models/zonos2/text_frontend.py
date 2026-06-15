@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -126,6 +127,13 @@ _SPACE_PUNCT_RE = re.compile(r" +([.!?,;:])(?=\s|$)")
 _MOSES_POSTPROCESS_LANGS = {"en", "zh", "ja", "ko"}
 
 _NORMALIZER = None
+
+# note (Yue Yin): normalize_text is a pure function of (text, language), so an
+# LRU spares the NeMo FST pipeline on repeated prompts (batched evals, retries).
+# Cap mirrors the speaker-encoder cache (256).
+_NORMALIZE_CACHE: "OrderedDict[tuple[str, str], str]" = OrderedDict()
+_NORMALIZE_CACHE_LOCK = threading.Lock()
+_NORMALIZE_CACHE_MAX = 256
 
 
 def normalization_enabled() -> bool:
@@ -256,16 +264,27 @@ def normalize_text(text: str, language: str | None) -> str:
         return text
     if not language or language not in _SERVER_TO_NEMO_LANG:
         return text
+    key = (text, language)
+    with _NORMALIZE_CACHE_LOCK:
+        cached = _NORMALIZE_CACHE.get(key)
+        if cached is not None:
+            _NORMALIZE_CACHE.move_to_end(key)
+            return cached
     normalizer = _get_normalizer()
     if normalizer is None:
         return text
     try:
         result = normalizer.normalize(text, language)
     except Exception:  # noqa: BLE001 - normalization must never fail a request
-        return text
-    if isinstance(result, str) and result.strip():
-        return result
-    return text
+        result = text
+    if not (isinstance(result, str) and result.strip()):
+        result = text
+    with _NORMALIZE_CACHE_LOCK:
+        _NORMALIZE_CACHE[key] = result
+        _NORMALIZE_CACHE.move_to_end(key)
+        while len(_NORMALIZE_CACHE) > _NORMALIZE_CACHE_MAX:
+            _NORMALIZE_CACHE.popitem(last=False)
+    return result
 
 
 def text_to_byte_ids(text: str) -> list[int]:

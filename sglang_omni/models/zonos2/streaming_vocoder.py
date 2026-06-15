@@ -110,6 +110,10 @@ class _Zonos2OLADecoder:
         self.emitted = 0  # next aligned frame to emit
         self.decoded_to = 0  # right edge of decoded frames (== emitted + overlap)
         self.tail: torch.Tensor | None = None  # held PCM for the overlap region
+        # note (Yue Yin): the cross-fade window is fixed for the decoder's life
+        # (overlap*hop), so build the raised-cosine ramps once instead of per chunk.
+        hold = self.overlap * self.hop
+        self._ramp_up, self._ramp_down = self._ramps(hold) if hold > 0 else (None, None)
 
     def add(self, rows: list[torch.Tensor]) -> None:
         self.rows.extend(rows)
@@ -154,7 +158,7 @@ class _Zonos2OLADecoder:
             if pcm.numel() == 0:
                 break
             if self.tail is not None and hold > 0 and pcm.numel() >= hold:
-                up, down = self._ramps(hold)
+                up, down = self._ramp_up, self._ramp_down
                 pcm = pcm.clone()
                 pcm[:hold] = self.tail * down + pcm[:hold] * up
             if flush:
@@ -166,7 +170,9 @@ class _Zonos2OLADecoder:
                 break
             if pcm.numel() > hold:
                 chunks.append(pcm[: pcm.numel() - hold].contiguous())
-            self.tail = pcm[pcm.numel() - hold :].clone() if hold > 0 else None
+            # note (Yue Yin): the decoder owns pcm's lifetime; the tail is only
+            # read (cross-faded) next chunk, never mutated, so a view is safe.
+            self.tail = pcm[pcm.numel() - hold :] if hold > 0 else None
             self.emitted = hi - ovl
             self.decoded_to = hi
         return chunks
