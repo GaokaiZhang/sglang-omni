@@ -114,6 +114,10 @@ def create_sglang_omni_tts_engine_executor(
         trust_remote_code=True,
         **fp8,
     )
+    # Note:(Chenchen Hong) per-frame feedback/EOS state has no rollback, so a
+    # non-final chunked-prefill chunk would queue a spurious frame; disable
+    # chunking after construction (mirrors the Qwen3-Omni talker).
+    server_args.chunked_prefill_size = 0
 
     # Defer graph capture until weights are loaded and the runner is wired.
     want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
