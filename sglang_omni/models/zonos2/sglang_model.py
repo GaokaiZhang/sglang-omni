@@ -18,6 +18,9 @@ import torch.nn.functional as F
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 from sglang_omni.models.zonos2.hf_config import Zonos2Config
+from sglang_omni.models.zonos2.radix_hash import poly_row_hash
+from sglang_omni.models.zonos2.sampler import sample_tts
+from sglang_omni.models.zonos2.text_frontend import TTSSamplingParams
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.layers import (
     RadixAttention,
@@ -251,6 +254,18 @@ class Zonos2SGLangModel(nn.Module):
             False
         )  # inference-only; sglang in-place ops reject grad tensors
 
+        # Opt-in tail CUDA graph (ZONOS2_FRAME_GRAPH): captures the launch-heavy
+        # per-frame tail (head GEMM + per-request sample + embed + radix hash) into
+        # one replay per decode bucket, cutting host dispatch in the host-bound
+        # decode loop. Built by capture_tail_graphs; empty -> eager runner path.
+        self._tail_buckets: list[int] = []
+        self._tail_graphs: dict[int, Any] = {}
+        self._tail_params: Optional[TTSSamplingParams] = None
+        self._tail_top_k_max: int = 0
+        self._tail_any_top_p: bool = False
+        self._tail_any_min_p: bool = False
+        self._cg: dict[str, torch.Tensor] = {}
+
     @property
     def device(self) -> torch.device:
         return self.embedders[0].weight.device
@@ -320,6 +335,104 @@ class Zonos2SGLangModel(nn.Module):
         logits = F.linear(hidden, self.multi_output)
         logits = logits.view(*logits.shape[:-1], self.n_codebooks, self.audio_vocab)
         return softcap(logits, self.config.loss_softcap)
+
+    # ---- opt-in tail CUDA graph (ZONOS2_FRAME_GRAPH) ----
+
+    @torch.no_grad()
+    def _tail_compute(self, bs: int) -> None:
+        """Graph-capturable per-frame tail over the first ``bs`` static rows: head
+        GEMM -> break-mask -> per-request sample (torch.multinomial, capturable)
+        -> embed -> radix hash. Reads/writes the ``_cg`` buffers in place."""
+        cg = self._cg
+        logits = self.compute_logits(cg["hidden"][:bs]).float()
+        logits[:, 0].add_(cg["break_mask"][:bs])
+        codes = sample_tts(
+            logits,
+            temperature=cg["temperature"][:bs],
+            top_k=cg["top_k"][:bs],
+            top_p=cg["top_p"][:bs],
+            min_p=cg["min_p"][:bs],
+            repetition_penalty=cg["rep_pen"][:bs],
+            top_k_max=self._tail_top_k_max,
+            rep_token_ids=cg["rep_ids"][:bs],
+            any_top_p=self._tail_any_top_p,
+            any_min_p=self._tail_any_min_p,
+        )
+        text_col = torch.full(
+            (bs, 1), self.config.text_vocab, device=codes.device, dtype=torch.long
+        )
+        rows = torch.cat([codes, text_col], dim=1)
+        cg["codes"][:bs].copy_(codes)
+        cg["feedback"][:bs].copy_(self.embed_frames(rows))
+        cg["keys"][:bs].copy_(poly_row_hash(rows))
+
+    @torch.no_grad()
+    def capture_tail_graphs(
+        self, buckets: list[int], params: TTSSamplingParams
+    ) -> None:
+        """Allocate static buffers + bake the structural sampler flags, then
+        capture one tail graph per batch bucket."""
+        n, dim, V = self.n_codebooks, self.config.dim, self.audio_vocab
+        W = int(params.repetition_window)
+        mb = max(buckets)
+        dev, dt = self.device, self.dtype
+        f32, i64 = torch.float32, torch.long
+        self._cg = {
+            "hidden": torch.zeros(mb, dim, device=dev, dtype=dt),
+            "temperature": torch.full((mb,), params.temperature, device=dev, dtype=f32),
+            "top_k": torch.full((mb,), params.top_k, device=dev, dtype=i64),
+            "top_p": torch.full((mb,), params.top_p, device=dev, dtype=f32),
+            "min_p": torch.full((mb,), params.min_p, device=dev, dtype=f32),
+            "rep_pen": torch.full(
+                (mb,), params.repetition_penalty, device=dev, dtype=f32
+            ),
+            "rep_ids": torch.full((mb, n, W), -1, device=dev, dtype=i64),
+            "break_mask": torch.zeros(mb, V, device=dev, dtype=f32),
+            "codes": torch.zeros(mb, n, device=dev, dtype=i64),
+            "keys": torch.zeros(mb, device=dev, dtype=i64),
+            "feedback": torch.zeros(mb, dim, device=dev, dtype=dt),
+        }
+        self._tail_params = params
+        self._tail_top_k_max = params.top_k if 0 < params.top_k < V else 0
+        self._tail_any_top_p = 0.0 < params.top_p < 1.0
+        self._tail_any_min_p = params.min_p > 0.0
+        self._tail_buckets = sorted(buckets)
+        self._tail_graphs = {}
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for bs in self._tail_buckets:
+                for _ in range(3):
+                    self._tail_compute(bs)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        for bs in self._tail_buckets:
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self._tail_compute(bs)
+            self._tail_graphs[bs] = g
+        torch.cuda.synchronize()
+
+    @torch.no_grad()
+    def run_tail_graph(
+        self, hidden, temperature, top_k, top_p, min_p, rep_pen, rep_ids, break_mask
+    ):
+        """Stage inputs into the static buffers, replay the bs-bucket graph (padded
+        up to the next bucket; extra rows compute on stale data and are ignored),
+        and return views of (codes [bs,n], keys [bs], feedback [bs,dim])."""
+        bs = hidden.shape[0]
+        bucket = next(g for g in self._tail_buckets if g >= bs)
+        cg = self._cg
+        cg["hidden"][:bs].copy_(hidden)
+        cg["temperature"][:bs].copy_(temperature)
+        cg["top_k"][:bs].copy_(top_k)
+        cg["top_p"][:bs].copy_(top_p)
+        cg["min_p"][:bs].copy_(min_p)
+        cg["rep_pen"][:bs].copy_(rep_pen)
+        cg["rep_ids"][:bs].copy_(rep_ids)
+        cg["break_mask"][:bs].copy_(break_mask)
+        self._tail_graphs[bucket].replay()
+        return cg["codes"][:bs], cg["keys"][:bs], cg["feedback"][:bs]
 
     @torch.no_grad()
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:

@@ -34,6 +34,14 @@ class Zonos2ModelRunner(ModelRunner):
             if os.environ.get("ZONOS2_COMPILE_SAMPLER") == "1"
             else sample_tts
         )
+        # Opt-in: replay the captured per-frame tail graph (head+sample+embed+hash)
+        # instead of the eager tail. Inert unless the model captured tail graphs.
+        self._frame_graph = os.environ.get("ZONOS2_FRAME_GRAPH", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
 
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
@@ -159,24 +167,36 @@ class Zonos2ModelRunner(ModelRunner):
     ):
         model = self.model
         n = model.n_codebooks
-        eoa = model.config.eoa_id
         text_pad = model.config.text_vocab
         cb_size = model.config.codebook_size
 
         hidden = self._last_token_hidden(
             result.logits_output.hidden_states, forward_batch, is_prefill
         )
-        logits = model.compute_logits(hidden).float()  # [B, 9, 1026]
         b = len(requests)
+        p = [sr.data.params for sr in requests]
+
+        # Decode-only fast path: replay the captured tail graph (head+sample+embed
+        # +hash in one replay -> cuts host dispatch in the host-bound decode loop).
+        # Eager fallback for prefill, uncaptured batch sizes, or non-default params.
+        if (
+            self._frame_graph
+            and not is_prefill
+            and model._tail_buckets
+            and b <= model._tail_buckets[-1]
+            and all(self._params_match(x, model._tail_params) for x in p)
+        ):
+            self._collect_frame_graphed(result, schedule_batch, requests, hidden, p)
+            return
+
+        logits = model.compute_logits(hidden).float()  # [B, 9, 1026]
 
         # Per-request sampling: temperature / top_k / top_p / min_p / repetition
-        # penalty and seed all come from each request (no requests[0] broadcast
-        # or shared generator), so concurrent requests keep their own params and
-        # reproducible seeds regardless of batch composition (matches moss_tts).
+        # penalty all come from each request (no requests[0] broadcast / shared
+        # generator), so concurrent requests keep their own params (matches moss).
         self._break_frame_loops(logits, requests)
         rep_ids = self._rep_window(requests, n, cb_size, logits.device)
         dev = logits.device
-        p = [sr.data.params for sr in requests]
         # Largest active top-k computed on the host (params are Python ints) so
         # the sampler needs no .item() sync in the decode loop.
         top_k_max = max(
@@ -210,13 +230,26 @@ class Zonos2ModelRunner(ModelRunner):
 
         codes_cpu = codes.to("cpu")
         keys_cpu = keys.tolist()  # one D2H, not B per-row int(keys[i]) syncs
-        next_ids = [0] * b
+        self._emit_frames(
+            requests, codes_cpu, keys_cpu, feedback, result, schedule_batch, dev
+        )
+
+    def _emit_frames(
+        self, requests, codes_cpu, keys_cpu, feedback, result, schedule_batch, device
+    ):
+        """Shared per-request bookkeeping for one frame (eager + graph paths):
+        append codes, queue the next feedback embedding, advance the any-of-9 EOS
+        state machine, and set next_token_ids (radix key, or EOS sentinel)."""
+        n = self.model.n_codebooks
+        eoa = self.model.config.eoa_id
+        next_ids = [0] * len(requests)
         for i, sr in enumerate(requests):
             data = sr.data
             frame = codes_cpu[i].tolist()
             data.output_codes.append(codes_cpu[i].clone())
             data.rep_hist.append(frame)
-            data.pending_feedback_queue.append(feedback[i].detach())
+            # clone: feedback may alias a static graph buffer reused next replay.
+            data.pending_feedback_queue.append(feedback[i].detach().clone())
 
             step = data.generation_step
             if data.eos_frame is None:
@@ -234,9 +267,82 @@ class Zonos2ModelRunner(ModelRunner):
             data.generation_step += 1
             next_ids[i] = EOS_SENTINEL if finished else keys_cpu[i]
 
-        next_ids = torch.tensor(next_ids, dtype=torch.long, device=logits.device)
+        next_ids = torch.tensor(next_ids, dtype=torch.long, device=device)
         result.next_token_ids = next_ids
         schedule_batch.output_ids = next_ids
+
+    # ---- tail CUDA-graph path (ZONOS2_FRAME_GRAPH) ----
+
+    @staticmethod
+    def _params_match(a, b) -> bool:
+        """The tail graph bakes the structural sampler flags (top_k_max/any_top_p/
+        any_min_p), so only replay when the request's params match those captured."""
+        if b is None:
+            return False
+        return (
+            a.temperature == b.temperature
+            and a.top_k == b.top_k
+            and a.top_p == b.top_p
+            and a.min_p == b.min_p
+            and a.repetition_penalty == b.repetition_penalty
+            and a.repetition_window == b.repetition_window
+            and a.repetition_codebooks == b.repetition_codebooks
+        )
+
+    def _collect_frame_graphed(self, result, schedule_batch, requests, hidden, p):
+        model = self.model
+        n = model.n_codebooks
+        cb_size = model.config.codebook_size
+        dev = hidden.device
+        rep_ids = self._rep_window_graph(
+            requests, n, int(p[0].repetition_window), cb_size, dev
+        )
+        break_mask = self._break_mask_graph(requests, model.audio_vocab, dev)
+        codes, keys, feedback = model.run_tail_graph(
+            hidden,
+            torch.tensor([x.temperature for x in p], device=dev),
+            torch.tensor([x.top_k for x in p], device=dev),
+            torch.tensor([x.top_p for x in p], device=dev),
+            torch.tensor([x.min_p for x in p], device=dev),
+            torch.tensor([x.repetition_penalty for x in p], device=dev),
+            rep_ids,
+            break_mask,
+        )
+        codes_cpu = codes.to("cpu")
+        keys_cpu = keys.tolist()
+        self._emit_frames(
+            requests, codes_cpu, keys_cpu, feedback, result, schedule_batch, dev
+        )
+
+    def _rep_window_graph(self, requests, n, w, cb_size, device):
+        """Like _rep_window but always returns a fixed [B, n, w] tensor (all -1
+        when there is no history) so the captured graph gets a stable shape."""
+        hist = []
+        for sr in requests:
+            h = sr.data.rep_hist[-w:]
+            if len(h) < w:  # left-pad with -1 (ignored by the penalty)
+                h = [[-1] * n] * (w - len(h)) + h
+            hist.append(h)
+        t = torch.tensor(hist, device=device, dtype=torch.long).transpose(1, 2)
+        rc = min(requests[0].data.params.repetition_codebooks, n)
+        rep = torch.full_like(t, -1)
+        rep[:, :rc] = torch.where(t[:, :rc] < cb_size, t[:, :rc], rep[:, :rc])
+        return rep
+
+    def _break_mask_graph(self, requests, vocab, device, run: int = 8):
+        """Additive [B, vocab] codebook-0 mask (-inf at a looping token) mirroring
+        _break_frame_loops, applied inside the graph instead of mutating logits."""
+        mask = torch.zeros(len(requests), vocab, device=device, dtype=torch.float32)
+        for i, sr in enumerate(requests):
+            h = sr.data.rep_hist
+            if len(h) < run:
+                continue
+            last = h[-1]
+            if last[0] < 0:
+                continue
+            if all(h[-j] == last for j in range(1, run + 1)):
+                mask[i, last[0]] = float("-inf")
+        return mask
 
     def _rep_window(self, requests, n, cb_size, device):
         params = requests[0].data.params

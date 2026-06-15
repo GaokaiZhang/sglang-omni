@@ -176,6 +176,15 @@ def create_sglang_omni_tts_engine_executor(
     if want_cuda_graph:
         server_args.disable_cuda_graph = False
         model_worker.model_runner.init_device_graphs()
+
+    # Opt-in tail CUDA graph: capture the per-frame head+sample+embed+hash tail
+    # (otherwise eager in the runner). Captured per decode bucket with the default
+    # sampling params; the runner falls back to eager for other params.
+    if os.environ.get("ZONOS2_FRAME_GRAPH", "").lower() in ("1", "true", "yes", "on"):
+        from sglang_omni.models.zonos2.text_frontend import TTSSamplingParams
+
+        model.capture_tail_graphs([1, 2, 4, 8, 16], TTSSamplingParams())
+
     output_proc = SGLangOutputProcessor(
         capture_hidden=False, capture_hidden_layers=None, model=model
     )
