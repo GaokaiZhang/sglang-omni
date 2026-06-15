@@ -196,10 +196,6 @@ class Zonos2ModelRunner(ModelRunner):
             repetition_penalty=torch.tensor(
                 [x.repetition_penalty for x in p], device=dev
             ),
-            seeds=torch.tensor([sr.data.sampling_seed for sr in requests], device=dev),
-            positions=torch.tensor(
-                [sr.data.generation_step for sr in requests], device=dev
-            ),
             top_k_max=top_k_max,
             rep_token_ids=rep_ids,
             any_top_p=any_top_p,

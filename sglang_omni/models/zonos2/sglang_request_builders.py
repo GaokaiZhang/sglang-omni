@@ -8,7 +8,6 @@ per-request decode state (codes, feedback queue, EOS) through the runner.
 
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -21,15 +20,6 @@ from sglang_omni.models.zonos2.radix_hash import RADIX_HASH_SPACE, poly_row_hash
 from sglang_omni.models.zonos2.text_frontend import TTSSamplingParams, make_speaker_slot
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
-
-_SEED_MASK = 0x7FFFFFFF
-
-
-def _new_sampling_seed() -> int:
-    """Fresh per-request seed so concurrent requests decorrelate when the caller
-    gives no explicit seed (the seeded sampler is otherwise deterministic)."""
-    return int.from_bytes(os.urandom(4), "little") & _SEED_MASK
-
 
 _SAMPLING_FIELDS = {
     "temperature",
@@ -52,7 +42,6 @@ class Zonos2SGLangRequestData(SGLangARRequestData):
     speaker_position: int = -1
     params: TTSSamplingParams = field(default_factory=TTSSamplingParams)
     generator: Any = None
-    sampling_seed: int = field(default_factory=_new_sampling_seed)
     output_codes: list = field(default_factory=list)
     rep_hist: list = field(default_factory=list)
     eos_frame: int | None = None
@@ -156,11 +145,6 @@ def build_sglang_zonos2_request(
         speaker_position=speaker_position,
         params=params,
         generator=gen,
-        sampling_seed=(
-            int(params.seed) & _SEED_MASK
-            if params.seed is not None
-            else _new_sampling_seed()
-        ),
         engine_start_s=time.perf_counter(),
     )
     data.stage_payload = payload

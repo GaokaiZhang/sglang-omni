@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-codebook TTS sampler with per-request sampling params.
 
-Order: repetition penalty, temperature, top-k, top-p, min-p, then a seeded
-draw (``multinomial_with_seed``) so each request samples from its own
-seed/params regardless of batch composition -- a row's token depends only on
-its own seed and (step, codebook) position, never on its batch neighbours.
-Rows with temperature <= 0 or left fully masked fall back to greedy argmax.
-Logits arrive soft-capped. All masks are vectorized per row (no per-request
-Python loop, no host syncs beyond the single top-k ``max()``)."""
+Order: repetition penalty, temperature, top-k, top-p, min-p, then ``torch.multinomial``.
+Each request applies its own temperature/top_k/top_p/min_p/repetition_penalty
+(vectorized per row, no per-request Python loop). The draw uses torch.multinomial
+(the default RNG): a per-request seeded hash-Gumbel draw was tried but regressed
+ZH CER (~9.7 -> ~12.6, catastrophic samples doubled), so it was reverted. Rows
+with temperature <= 0 or left fully masked fall back to greedy argmax. Logits
+arrive soft-capped."""
 
 from __future__ import annotations
 
 from typing import Optional
 
 import torch
-from sglang.srt.layers.sampler import multinomial_with_seed
 
 _NEG_INF = float("-inf")
 
@@ -88,8 +87,6 @@ def sample_tts(
     top_p: torch.Tensor,
     min_p: torch.Tensor,
     repetition_penalty: torch.Tensor,
-    seeds: torch.Tensor,
-    positions: torch.Tensor,
     top_k_max: int,
     rep_token_ids: Optional[torch.Tensor] = None,
     any_top_p: bool = True,
@@ -97,10 +94,10 @@ def sample_tts(
 ) -> torch.Tensor:
     """logits (B, C, V) soft-capped -> sampled codes (B, C) int64.
 
-    All sampling params are per-request (B,) tensors; ``seeds`` is the per-request
-    sampling seed and ``positions`` the per-request decode step (combined with the
-    codebook index so the 9 codebooks decorrelate within a step). ``top_k_max`` is
-    the largest active top-k across the batch (host int; 0 disables top-k)."""
+    temperature/top_k/top_p/min_p/repetition_penalty are per-request (B,) tensors.
+    ``top_k_max`` is the largest active top-k across the batch (host int; 0 disables
+    top-k). ``any_top_p``/``any_min_p`` are host flags to skip those passes when no
+    in-flight request uses them."""
     B, C, V = logits.shape
     device = logits.device
     logits = _apply_repetition_penalty(logits, rep_token_ids, repetition_penalty)
@@ -121,19 +118,17 @@ def sample_tts(
     if any_min_p:
         scores = _apply_min_p(scores, _rows(min_p, torch.float32))
 
-    # Per-(request, codebook) positions decorrelate the 9 codebooks within a
-    # step; per-request seeds decorrelate requests. multinomial_with_seed treats
-    # its input as weights, so pass probs (masked tokens are 0 -> never drawn).
-    seed_row = _rows(seeds, torch.long)
-    cb = torch.arange(C, device=device, dtype=torch.long).repeat(B)
-    pos_row = (
-        positions.to(device=device, dtype=torch.long).repeat_interleave(C) * C + cb
-    )
-
     probs = torch.nan_to_num(
         torch.softmax(scores, dim=-1), nan=0.0, posinf=0.0, neginf=0.0
     )
     fallback = (~do_sample) | (probs.sum(dim=-1) <= 0)
     greedy = torch.argmax(scores, dim=-1)
-    seeded = multinomial_with_seed(probs, seed_row, pos_row).view(-1)
-    return torch.where(fallback, greedy, seeded).view(B, C)
+    # Draw with torch.multinomial (proper RNG). The seeded hash-Gumbel path
+    # (multinomial_with_seed) regressed ZH CER (~9.7 -> ~12.6, catastrophic
+    # samples doubled). Replace fallback rows with a greedy one-hot so
+    # multinomial never sees a zero-sum row.
+    onehot = torch.zeros_like(probs)
+    onehot.scatter_(-1, greedy.unsqueeze(-1), 1.0)
+    probs = torch.where(fallback.unsqueeze(-1), onehot, probs)
+    drawn = torch.multinomial(probs, num_samples=1).view(-1)
+    return drawn.view(B, C)
