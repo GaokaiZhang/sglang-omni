@@ -68,6 +68,41 @@ def _register_zonos2_autoconfig() -> None:
         pass  # already registered
 
 
+def _install_tuned_moe_configs() -> None:
+    # note (Yue Yin): the fused-MoE Triton kernel (46% of decode GPU time,
+    # profiled) ships no config for this deployment shape (E=16,N=3072 on H100),
+    # so it falls back to get_default_config -> "Performance might be sub-optimal".
+    # Install the bundled tuned configs into sglang's config dir so the kernel
+    # picks them up. Quality-neutral (kernel tiling only); never clobbers an
+    # existing config; device/triton-version-keyed filenames auto-ignore on a
+    # mismatch (falls back to default). Best-effort: never block startup.
+    import shutil
+
+    try:
+        from sglang.srt.layers.moe.moe_runner.triton_utils import (
+            fused_moe_triton_config as _fc,
+        )
+
+        dst_root = os.path.join(
+            os.path.dirname(os.path.realpath(_fc.__file__)), "configs"
+        )
+        src_root = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), "moe_configs"
+        )
+        for vdir in os.listdir(src_root):
+            sdir = os.path.join(src_root, vdir)
+            if not os.path.isdir(sdir):
+                continue
+            ddir = os.path.join(dst_root, vdir)
+            os.makedirs(ddir, exist_ok=True)
+            for fn in os.listdir(sdir):
+                dst = os.path.join(ddir, fn)
+                if not os.path.exists(dst):
+                    shutil.copy2(os.path.join(sdir, fn), dst)
+    except Exception:
+        pass
+
+
 def create_sglang_omni_tts_engine_executor(
     model_path: str,
     *,
@@ -89,6 +124,7 @@ def create_sglang_omni_tts_engine_executor(
 
     cfg = load_zonos2_pretrained_config(model_path)
     _register_zonos2_autoconfig()
+    _install_tuned_moe_configs()
     shim = _build_config_shim(model_path, cfg)
     gpu = int(gpu_id) if gpu_id is not None else 0
 
