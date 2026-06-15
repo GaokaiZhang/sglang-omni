@@ -10,6 +10,7 @@ stays CUDA-graph-replayable (decode input_ids are row indices). No frame loop.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -24,6 +25,15 @@ class Zonos2ModelRunner(ModelRunner):
     def __init__(self, tp_worker: Any, output_processor: Any):
         super().__init__(tp_worker, output_processor)
         self._outbox: Any | None = None
+        # The per-request sampler runs eager (outside the backbone graph) and is a
+        # large slice of the decode step. Opt-in torch.compile fuses its
+        # elementwise launches (~6% decode at bs=16 on H100); off by default until
+        # validated more widely.
+        self._sampler = (
+            torch.compile(sample_tts, dynamic=True)
+            if os.environ.get("ZONOS2_COMPILE_SAMPLER") == "1"
+            else sample_tts
+        )
 
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
@@ -172,7 +182,12 @@ class Zonos2ModelRunner(ModelRunner):
         top_k_max = max(
             (x.top_k for x in p if 0 < x.top_k < model.audio_vocab), default=0
         )
-        codes = sample_tts(
+        # Host flags (params are Python scalars, no GPU sync) so the sampler can
+        # skip whole passes when unused -- top-p defaults off, so its full-vocab
+        # sort is otherwise paid every step.
+        any_top_p = any(0.0 < x.top_p < 1.0 for x in p)
+        any_min_p = any(x.min_p > 0.0 for x in p)
+        codes = self._sampler(
             logits,
             temperature=torch.tensor([x.temperature for x in p], device=dev),
             top_k=torch.tensor([x.top_k for x in p], device=dev),
@@ -187,6 +202,8 @@ class Zonos2ModelRunner(ModelRunner):
             ),
             top_k_max=top_k_max,
             rep_token_ids=rep_ids,
+            any_top_p=any_top_p,
+            any_min_p=any_min_p,
         )  # [B, 9]
 
         # Feedback embeddings for the next step: [B, 10] rows (codes + text pad).

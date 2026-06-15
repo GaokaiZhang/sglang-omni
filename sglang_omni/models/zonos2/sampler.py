@@ -92,6 +92,8 @@ def sample_tts(
     positions: torch.Tensor,
     top_k_max: int,
     rep_token_ids: Optional[torch.Tensor] = None,
+    any_top_p: bool = True,
+    any_min_p: bool = True,
 ) -> torch.Tensor:
     """logits (B, C, V) soft-capped -> sampled codes (B, C) int64.
 
@@ -112,8 +114,12 @@ def sample_tts(
     scores = logits.reshape(B * C, V).float() / safe_temp.unsqueeze(1)
     if top_k_max > 0:
         scores = _apply_top_k(scores, _rows(top_k, torch.long), top_k_max)
-    scores = _apply_top_p(scores, _rows(top_p, torch.float32))
-    scores = _apply_min_p(scores, _rows(min_p, torch.float32))
+    # any_top_p / any_min_p are host-computed flags (params are Python scalars),
+    # so no GPU sync. top-p's full-vocab sort is pure waste when no row uses it.
+    if any_top_p:
+        scores = _apply_top_p(scores, _rows(top_p, torch.float32))
+    if any_min_p:
+        scores = _apply_min_p(scores, _rows(min_p, torch.float32))
 
     # Per-(request, codebook) positions decorrelate the 9 codebooks within a
     # step; per-request seeds decorrelate requests. multinomial_with_seed treats
