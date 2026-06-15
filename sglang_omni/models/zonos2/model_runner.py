@@ -375,9 +375,7 @@ class Zonos2ModelRunner(ModelRunner):
         bi = torch.arange(logits.shape[0], device=logits.device)
         tok = last[:, 0].clamp(min=0)
         cur = logits[bi, 0, tok]
-        logits[bi, 0, tok] = torch.where(
-            mask, torch.full_like(cur, float("-inf")), cur
-        )
+        logits[bi, 0, tok] = torch.where(mask, torch.full_like(cur, float("-inf")), cur)
 
     @staticmethod
     def _params_match(a, b) -> bool:
