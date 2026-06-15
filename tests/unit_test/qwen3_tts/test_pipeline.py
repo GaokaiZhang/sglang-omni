@@ -30,6 +30,10 @@ from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+from sglang_omni.scheduling.speaker_cache import (
+    SpeakerCacheKey,
+    get_speaker_artifact_cache,
+)
 from sglang_omni.scheduling.types import RequestOutput
 
 
@@ -230,6 +234,31 @@ def test_qwen3_tts_config_and_registry_contracts() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("model_path", "expected"),
+    [
+        ("Qwen/Qwen3-TTS-12Hz-0.6B-Base", True),
+        ("Qwen/Qwen3-TTS-12Hz-1.7B-Base/", True),
+        ("/models/Qwen3-TTS-12Hz-0.6B-Base/snapshots/abc123", True),
+        ("/models/qwen3_tts_12hz_1_7b_base/checkpoint", True),
+        ("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", False),
+        ("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", False),
+        ("/models/Qwen3-TTS-12Hz-0.6B-CustomVoice/snapshots/abc123", False),
+        ("/models/qwen3_tts_base/Qwen3-TTS-12Hz-0.6B-CustomVoice", False),
+        ("/models/qwen3_tts_base/Qwen3-TTS-12Hz-1.7B-VoiceDesign", False),
+        ("model", False),
+    ],
+)
+def test_qwen3_tts_base_path_detection_for_uploaded_voice_requirement(
+    model_path: str,
+    expected: bool,
+) -> None:
+    config = Qwen3TTSPipelineConfig(model_path=model_path)
+
+    assert config.requires_uploaded_voice_for_named_voice() is expected
+    assert config.supports_uploaded_voice_references() is expected
+
+
 def test_qwen3_tts_state_round_trip_preserves_request_fields() -> None:
     state = Qwen3TTSState(
         text="hello",
@@ -240,6 +269,8 @@ def test_qwen3_tts_state_round_trip_preserves_request_fields() -> None:
         instructions="warm",
         ref_audio="voice.wav",
         ref_text="reference",
+        uploaded_voice_name="guide",
+        uploaded_voice_created_at=7,
         generation_kwargs={"max_new_tokens": 128, "temperature": 0.7},
         audio_codes=[[1, 2], [3, 4]],
         ref_code_len=1,
@@ -255,6 +286,8 @@ def test_qwen3_tts_state_round_trip_preserves_request_fields() -> None:
     assert restored.instructions == "warm"
     assert restored.ref_audio == "voice.wav"
     assert restored.ref_text == "reference"
+    assert restored.uploaded_voice_name == "guide"
+    assert restored.uploaded_voice_created_at == 7
     assert restored.generation_kwargs["max_new_tokens"] == 128
     assert restored.audio_codes == [[1, 2], [3, 4]]
     assert restored.ref_code_len == 1
@@ -439,6 +472,203 @@ def test_qwen3_tts_preprocessing_does_not_mutate_global_rng(
     )
 
     assert prepared.state.seed is None
+
+
+def test_qwen3_tts_uploaded_voice_clone_prompt_uses_shared_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = get_speaker_artifact_cache()
+    cache.clear()
+    calls = 0
+
+    class FakePrompt:
+        ref_text = "reference"
+
+    class FakeWrapper:
+        def create_voice_clone_prompt(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            return [FakePrompt()]
+
+        def _prompt_items_to_voice_clone_prompt(self, prompt_items):
+            del prompt_items
+            return {
+                "ref_code": [torch.ones((1, 2), dtype=torch.long)],
+                "ref_spk_embedding": [torch.ones(4)],
+                "icl_mode": [True],
+            }
+
+        def _tokenize_texts(self, texts):
+            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
+
+        def _build_assistant_text(self, text):
+            return text
+
+        def _build_ref_text(self, text):
+            return text
+
+        def _merge_generate_kwargs(self, **kwargs):
+            return kwargs
+
+    class FakeModel:
+        device = torch.device("cpu")
+        root_config = SimpleNamespace(tts_pad_token_id=0)
+        model = SimpleNamespace(_feedback_buffer=torch.empty((1, 4)))
+
+        def build_voice_clone_inputs(self, **kwargs):
+            assert kwargs["voice_clone_prompt"]["icl_mode"] == [True]
+            return (
+                torch.ones((1, 2, 4)),
+                torch.ones((1, 2), dtype=torch.long),
+                torch.ones((1, 1, 4)),
+                None,
+            )
+
+        def get_text_embeddings(self):
+            return lambda ids: torch.ones((*ids.shape, 4), device=ids.device)
+
+        def text_projection(self, embeds):
+            return embeds
+
+    monkeypatch.setattr(
+        qwen3_request_builders,
+        "_build_qwen3_tts_pad_embed",
+        lambda model: torch.zeros(4),
+    )
+
+    def make_uploaded_payload(created_at: int) -> StagePayload:
+        return make_payload(
+            inputs="target",
+            tts_params={
+                "ref_audio": "voice.wav",
+                "ref_text": "reference",
+                "uploaded_voice_name": "guide",
+                "uploaded_voice_created_at": created_at,
+            },
+        )
+
+    qwen3_request_builders._prepare_qwen3_tts_request(
+        make_uploaded_payload(7),
+        model=FakeModel(),
+        wrapper=FakeWrapper(),
+    )
+    cached = cache.get(
+        SpeakerCacheKey("qwen3_tts_icl", "guide", 7, "voice_clone_prompt")
+    )
+    assert isinstance(cached, dict)
+    assert cached["artifact_type"] == "qwen3_tts_voice_clone_prompt"
+    assert cached["ref_spk_embedding"][0].device.type == "cpu"
+    assert cached["ref_code"][0].device.type == "cpu"
+
+    qwen3_request_builders._prepare_qwen3_tts_request(
+        make_uploaded_payload(7),
+        model=FakeModel(),
+        wrapper=FakeWrapper(),
+    )
+    qwen3_request_builders._prepare_qwen3_tts_request(
+        make_uploaded_payload(8),
+        model=FakeModel(),
+        wrapper=FakeWrapper(),
+    )
+    cache.clear_voice("guide")
+    qwen3_request_builders._prepare_qwen3_tts_request(
+        make_uploaded_payload(8),
+        model=FakeModel(),
+        wrapper=FakeWrapper(),
+    )
+
+    assert calls == 3
+
+
+def test_qwen3_tts_uploaded_voice_x_vector_cache_omits_ref_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = get_speaker_artifact_cache()
+    cache.clear()
+    calls = 0
+
+    class FakePrompt:
+        ref_text = None
+
+    class FakeWrapper:
+        def create_voice_clone_prompt(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            assert kwargs["x_vector_only_mode"] is True
+            return [FakePrompt()]
+
+        def _prompt_items_to_voice_clone_prompt(self, prompt_items):
+            del prompt_items
+            return {
+                "ref_code": [None],
+                "ref_spk_embedding": [torch.ones(4)],
+                "icl_mode": [False],
+            }
+
+        def _tokenize_texts(self, texts):
+            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
+
+        def _build_assistant_text(self, text):
+            return text
+
+        def _merge_generate_kwargs(self, **kwargs):
+            return kwargs
+
+    class FakeModel:
+        device = torch.device("cpu")
+        root_config = SimpleNamespace(tts_pad_token_id=0)
+        model = SimpleNamespace(_feedback_buffer=torch.empty((1, 4)))
+
+        def build_voice_clone_inputs(self, **kwargs):
+            assert kwargs["voice_clone_prompt"]["icl_mode"] == [False]
+            assert kwargs["voice_clone_prompt"].get("ref_code") in (None, [None])
+            return (
+                torch.ones((1, 2, 4)),
+                torch.ones((1, 2), dtype=torch.long),
+                torch.ones((1, 1, 4)),
+                None,
+            )
+
+        def get_text_embeddings(self):
+            return lambda ids: torch.ones((*ids.shape, 4), device=ids.device)
+
+        def text_projection(self, embeds):
+            return embeds
+
+    monkeypatch.setattr(
+        qwen3_request_builders,
+        "_build_qwen3_tts_pad_embed",
+        lambda model: torch.zeros(4),
+    )
+
+    payload = make_payload(
+        inputs="target",
+        tts_params={
+            "ref_audio": "voice.wav",
+            "uploaded_voice_name": "guide",
+            "uploaded_voice_created_at": 9,
+            "x_vector_only_mode": True,
+        },
+    )
+
+    qwen3_request_builders._prepare_qwen3_tts_request(
+        payload,
+        model=FakeModel(),
+        wrapper=FakeWrapper(),
+    )
+    cached = cache.get(
+        SpeakerCacheKey("qwen3_tts_xvec", "guide", 9, "voice_clone_prompt")
+    )
+    assert isinstance(cached, dict)
+    assert "ref_code" not in cached
+
+    qwen3_request_builders._prepare_qwen3_tts_request(
+        payload,
+        model=FakeModel(),
+        wrapper=FakeWrapper(),
+    )
+
+    assert calls == 1
 
 
 def test_qwen3_tts_public_seed_derivation_is_stable() -> None:

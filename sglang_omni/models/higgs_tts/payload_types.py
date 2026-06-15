@@ -23,6 +23,8 @@ class HiggsTtsState:
     reference_text: str | None = None
     reference_waveform: Any | None = None  # mono 24 kHz [1, 1, L] torch.Tensor
     reference_code_cache_key: str | None = None
+    uploaded_voice_name: str | None = None
+    uploaded_voice_created_at: int | None = None
 
     num_codebooks: int = 8
     codebook_size: int = 1026  # 1024 data + <|boc|> + <|eoc|>
@@ -62,6 +64,10 @@ class HiggsTtsState:
             data["reference_waveform"] = self.reference_waveform
         if self.reference_code_cache_key is not None:
             data["reference_code_cache_key"] = self.reference_code_cache_key
+        if self.uploaded_voice_name is not None:
+            data["uploaded_voice_name"] = self.uploaded_voice_name
+        if self.uploaded_voice_created_at is not None:
+            data["uploaded_voice_created_at"] = self.uploaded_voice_created_at
         for key in ("top_p", "top_k", "seed"):
             value = getattr(self, key)
             if value is not None:
@@ -86,6 +92,8 @@ class HiggsTtsState:
             reference_text=data.get("reference_text"),
             reference_waveform=data.get("reference_waveform"),
             reference_code_cache_key=data.get("reference_code_cache_key"),
+            uploaded_voice_name=data.get("uploaded_voice_name"),
+            uploaded_voice_created_at=data.get("uploaded_voice_created_at"),
             num_codebooks=data.get("num_codebooks", 8),
             codebook_size=data.get("codebook_size", 1026),
             max_new_tokens=data.get("max_new_tokens", 2048),

@@ -7,7 +7,7 @@ import base64
 import binascii
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from pydantic import ValidationError
@@ -28,6 +28,12 @@ from sglang_omni.serve.protocol import (
 )
 from sglang_omni.serve.speech_errors import bad_request, service_unavailable
 
+if TYPE_CHECKING:
+    from sglang_omni.serve.speech_voices import (
+        SpeakerSampleStore,
+        UploadedVoiceReference,
+    )
+
 _TTS_LANGUAGE_ALIASES = {
     language.lower(): language for language in SUPPORTED_TTS_LANGUAGES
 }
@@ -45,6 +51,7 @@ RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 1
 class PreparedSpeechRequest:
     request: CreateSpeechRequest
     reference_descriptors: list[dict[str, Any]]
+    uploaded_voice: "UploadedVoiceReference | None" = None
 
 
 class SpeechRequestValidator:
@@ -54,10 +61,21 @@ class SpeechRequestValidator:
         self,
         *,
         default_model: str,
+        requires_uploaded_voice_for_named_voice: bool = False,
+        supports_uploaded_voice_references: bool = True,
         allowed_local_media_path: str | Path | None = None,
         allowed_media_domains: list[str] | None = None,
+        voice_store: "SpeakerSampleStore | None" = None,
     ) -> None:
         self.default_model = default_model
+        self.requires_uploaded_voice_for_named_voice = (
+            requires_uploaded_voice_for_named_voice
+        )
+        self.supports_uploaded_voice_references = (
+            supports_uploaded_voice_references
+            or requires_uploaded_voice_for_named_voice
+        )
+        self.voice_store = voice_store
         self.reference_connector = MultiModalResourceConnector(
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
@@ -68,18 +86,14 @@ class SpeechRequestValidator:
     def parse_request(self, payload: Any) -> CreateSpeechRequest:
         """Parse and validate a raw HTTP payload."""
 
-        if not isinstance(payload, dict):
-            raise bad_request("speech request body must be a JSON object")
-        self._validate_raw_payload(payload)
-        try:
-            request = CreateSpeechRequest.model_validate(payload)
-        except ValidationError as exc:
-            raise bad_request(_validation_error_message(exc)) from exc
-        return self.prepare_request(request)
+        return self.prepare_request(self._parse_raw_request(payload))
 
     def parse_generation_request(self, payload: Any) -> PreparedSpeechRequest:
         """Parse and prepare a raw HTTP payload for GenerateRequest lowering."""
 
+        return self.prepare_generation_request(self._parse_raw_request(payload))
+
+    def _parse_raw_request(self, payload: Any) -> CreateSpeechRequest:
         if not isinstance(payload, dict):
             raise bad_request("speech request body must be a JSON object")
         self._validate_raw_payload(payload)
@@ -87,7 +101,7 @@ class SpeechRequestValidator:
             request = CreateSpeechRequest.model_validate(payload)
         except ValidationError as exc:
             raise bad_request(_validation_error_message(exc)) from exc
-        return self.prepare_generation_request(request)
+        return request
 
     def prepare_request(self, request: CreateSpeechRequest) -> CreateSpeechRequest:
         """Validate and normalize a request that was already parsed."""
@@ -139,6 +153,7 @@ class SpeechRequestValidator:
             param=INITIAL_CODEC_CHUNK_FRAMES_PARAM,
         )
         _validate_non_negative_int(request.seed, param="seed")
+        uploaded_voice = self._resolve_uploaded_voice_reference(request)
 
         ref_audio = request.ref_audio
         if ref_audio is not None:
@@ -162,11 +177,18 @@ class SpeechRequestValidator:
                 descriptor = dict(descriptor)
                 descriptor["text"] = request.ref_text
             reference_descriptors.append(descriptor)
+        elif uploaded_voice is not None:
+            descriptor = _uploaded_voice_reference_dict(uploaded_voice)
+            if uploaded_voice.voice.ref_text is not None:
+                descriptor["text"] = uploaded_voice.voice.ref_text
+            reference_descriptors.append(descriptor)
+            updates["task_type"] = "Base"
 
         prepared_request = request.model_copy(update=updates)
         return PreparedSpeechRequest(
             request=prepared_request,
             reference_descriptors=reference_descriptors,
+            uploaded_voice=uploaded_voice,
         )
 
     def build_generate_request(
@@ -175,6 +197,7 @@ class SpeechRequestValidator:
         *,
         validate: bool = True,
         reference_descriptors: list[dict[str, Any]] | None = None,
+        uploaded_voice: "UploadedVoiceReference | None" = None,
     ) -> GenerateRequest:
         """Convert a validated speech request into a client GenerateRequest."""
 
@@ -182,6 +205,9 @@ class SpeechRequestValidator:
             prepared = self.prepare_generation_request(request)
             request = prepared.request
             reference_descriptors = prepared.reference_descriptors
+            uploaded_voice = prepared.uploaded_voice
+        elif uploaded_voice is None and reference_descriptors is None:
+            uploaded_voice = self._resolve_uploaded_voice_reference(request)
 
         return GenerateRequest(
             model=request.model or self.default_model,
@@ -193,9 +219,40 @@ class SpeechRequestValidator:
             output_modalities=["audio"],
             metadata={
                 "task": "tts",
-                "tts_params": _build_tts_params(request),
+                "tts_params": _build_tts_params(
+                    request,
+                    uploaded_voice=uploaded_voice,
+                ),
             },
         )
+
+    def _resolve_uploaded_voice_reference(
+        self, request: CreateSpeechRequest
+    ) -> "UploadedVoiceReference | None":
+        if (
+            self.voice_store is None
+            or not self.supports_uploaded_voice_references
+            or request.ref_audio is not None
+            or request.references
+        ):
+            return None
+        if not request.voice or request.voice.lower() == "default":
+            return None
+        uploaded_voice = self.voice_store.resolve_reference(request.voice)
+        if uploaded_voice is None and self.requires_uploaded_voice_for_named_voice:
+            raise bad_request(
+                f"Unknown voice '{request.voice}'. Upload a voice first via "
+                "POST /v1/audio/voices, or use ref_audio + ref_text.",
+                param="voice",
+            )
+        if uploaded_voice is not None:
+            task_type = request.task_type
+            if task_type is not None and _normalize_task_type(task_type) != "Base":
+                raise bad_request(
+                    "uploaded voice requests require task_type='Base'",
+                    param="task_type",
+                )
+        return uploaded_voice
 
     def _validate_raw_payload(self, payload: dict[str, Any]) -> None:
         for field_name in (
@@ -313,7 +370,11 @@ def _explicit_generation_params(request: CreateSpeechRequest) -> list[str]:
     )
 
 
-def _build_tts_params(request: CreateSpeechRequest) -> dict[str, Any]:
+def _build_tts_params(
+    request: CreateSpeechRequest,
+    *,
+    uploaded_voice: "UploadedVoiceReference | None" = None,
+) -> dict[str, Any]:
     tts_params: dict[str, Any] = {
         "voice": request.voice,
         "response_format": request.response_format,
@@ -332,6 +393,13 @@ def _build_tts_params(request: CreateSpeechRequest) -> dict[str, Any]:
         tts_params["ref_audio"] = request.ref_audio
     if request.ref_text is not None:
         tts_params["ref_text"] = request.ref_text
+    if uploaded_voice is not None:
+        tts_params["task_type"] = "Base"
+        tts_params["ref_audio"] = uploaded_voice.ref_audio
+        if uploaded_voice.voice.ref_text is not None:
+            tts_params["ref_text"] = uploaded_voice.voice.ref_text
+        tts_params["uploaded_voice_name"] = uploaded_voice.voice.normalized_name
+        tts_params["uploaded_voice_created_at"] = uploaded_voice.voice.created_at
     if request.x_vector_only_mode is not None:
         tts_params["x_vector_only_mode"] = request.x_vector_only_mode
     if request.initial_codec_chunk_frames is not None:
@@ -459,6 +527,23 @@ def _normalize_response_format(value: str) -> str:
             param="response_format",
         )
     return fmt
+
+
+def _uploaded_voice_reference_dict(
+    uploaded_voice: "UploadedVoiceReference",
+) -> dict[str, Any]:
+    ref: dict[str, Any] = {
+        "audio_path": uploaded_voice.ref_audio,
+        "uploaded_voice_name": uploaded_voice.voice.normalized_name,
+        "uploaded_voice_created_at": uploaded_voice.voice.created_at,
+    }
+    parsed = urlparse(uploaded_voice.ref_audio)
+    if parsed.scheme == "data" and "," in parsed.path:
+        header, data = parsed.path.split(",", 1)
+        media_type = header.split(";", 1)[0] or "audio/wav"
+        ref["media_type"] = media_type
+        ref["data"] = data
+    return ref
 
 
 def _validate_positive_int(value: int | None, *, param: str) -> None:

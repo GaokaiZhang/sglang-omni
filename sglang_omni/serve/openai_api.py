@@ -4,6 +4,9 @@
 Provides the following endpoints:
 - POST /v1/chat/completions  — Text (+ audio) chat completions
 - POST /v1/audio/speech      — Text-to-speech synthesis
+- GET  /v1/audio/voices      — List preset and uploaded TTS voices
+- POST /v1/audio/voices      — Upload a persistent TTS reference voice
+- DELETE /v1/audio/voices/{name} — Delete an uploaded TTS voice
 - GET  /v1/models            — List available models
 - GET  /v1/fs/list           — Browse filesystem directories
 - GET  /v1/fs/file           — Download a file
@@ -18,6 +21,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any, AsyncIterator
 
 from fastapi import (
@@ -72,20 +76,27 @@ from sglang_omni.serve.protocol import (
     TranscriptionResponse,
     UpdateWeightFromDiskRequest,
     UsageResponse,
+    VoiceListResponse,
     WeightsCheckerRequest,
 )
 from sglang_omni.serve.speech_errors import (
     SpeechAPIError,
     bad_request,
     internal_error,
+    openai_error_payload,
     speech_error_response,
 )
 from sglang_omni.serve.speech_service import SpeechRequestValidator
+from sglang_omni.serve.speech_voices import MAX_VOICE_UPLOAD_BYTES, SpeakerSampleStore
 
 logger = logging.getLogger(__name__)
 STREAM_DONE_SENTINEL = "[DONE]"
 HTTP_DISCONNECT_POLL_INTERVAL_S = 0.05
 HTTP_DISCONNECT_CANCEL_TIMEOUT_S = 0.1
+VOICE_UPLOAD_MULTIPART_OVERHEAD_BYTES = 64 * 1024
+MAX_VOICE_UPLOAD_BODY_BYTES = (
+    MAX_VOICE_UPLOAD_BYTES + VOICE_UPLOAD_MULTIPART_OVERHEAD_BYTES
+)
 
 _BAD_REQUEST_MARKERS = (
     "longer than the model's context length",
@@ -98,10 +109,55 @@ def _is_bad_request_error(exc: Exception) -> bool:
     return any(marker in message for marker in _BAD_REQUEST_MARKERS)
 
 
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+class VoiceUploadBodyLimitMiddleware:
+    """Reject oversized voice uploads before Starlette parses multipart bodies."""
+
+    def __init__(self, app: Callable[..., Awaitable[None]], max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(
+        self,
+        scope: dict[str, Any],
+        receive: Callable[[], Awaitable[dict[str, Any]]],
+        send: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        if not _is_voice_upload_scope(scope):
+            await self.app(scope, receive, send)
+            return
+
+        content_length = _content_length(scope)
+        if content_length is not None and content_length > self.max_bytes:
+            await _send_voice_upload_too_large(send, self.max_bytes)
+            return
+
+        received_bytes = 0
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal received_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > self.max_bytes:
+                    raise _RequestBodyTooLarge
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _RequestBodyTooLarge:
+            await _send_voice_upload_too_large(send, self.max_bytes)
+
+
 def create_app(
     client: Client,
     *,
     model_name: str | None = None,
+    requires_uploaded_voice_for_named_voice: bool = False,
+    supports_uploaded_voice_references: bool = True,
     enable_realtime: bool = False,
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
@@ -112,6 +168,10 @@ def create_app(
     Args:
         client: Client instance connected to the pipeline coordinator.
         model_name: Default model name to report in responses and /v1/models.
+        requires_uploaded_voice_for_named_voice: Whether non-default TTS voice
+            names must resolve to uploaded voices before reaching the model.
+        supports_uploaded_voice_references: Whether uploaded voice names can be
+            lowered into backend reference-audio requests.
         enable_realtime: If True, mount the WebSocket ``/v1/realtime``
             endpoint (OpenAI Realtime API).
         allowed_local_media_path: Directory allowed for ``file://`` TTS
@@ -131,15 +191,25 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(
+        VoiceUploadBodyLimitMiddleware,
+        max_bytes=MAX_VOICE_UPLOAD_BODY_BYTES,
+    )
 
     # Store references in app state for access from route handlers
     app.state.client = client
     app.state.model_name = model_name or "sglang-omni"
     app.state.realtime_enabled = enable_realtime
+    app.state.speaker_sample_store = SpeakerSampleStore()
     app.state.speech_service = SpeechRequestValidator(
         default_model=app.state.model_name,
+        requires_uploaded_voice_for_named_voice=(
+            requires_uploaded_voice_for_named_voice
+        ),
+        supports_uploaded_voice_references=supports_uploaded_voice_references,
         allowed_local_media_path=allowed_local_media_path,
         allowed_media_domains=allowed_media_domains,
+        voice_store=app.state.speaker_sample_store,
     )
 
     resolved_key = resolve_admin_api_key(admin_api_key)
@@ -150,12 +220,117 @@ def create_app(
     _register_models(app)
     _register_admin(app, resolved_key)
     _register_chat_completions(app)
+    _register_voices(app)
     _register_speech(app)
     _register_transcriptions(app)
     if enable_realtime:
         _register_realtime(app)
 
     return app
+
+
+def _register_voices(app: FastAPI) -> None:
+    @app.get("/v1/audio/voices")
+    async def list_voices() -> JSONResponse:
+        voice_store: SpeakerSampleStore = app.state.speaker_sample_store
+        response = VoiceListResponse.model_validate(voice_store.list_response())
+        return JSONResponse(content=response.model_dump(exclude_none=True))
+
+    @app.post("/v1/audio/voices")
+    async def upload_voice(
+        audio_sample: UploadFile = File(...),
+        consent: str = Form(...),
+        name: str = Form(...),
+        ref_text: str | None = Form(default=None),
+        speaker_description: str | None = Form(default=None),
+    ) -> JSONResponse:
+        voice_store: SpeakerSampleStore = app.state.speaker_sample_store
+        try:
+            response = voice_store.upload(
+                name=name,
+                consent=consent,
+                audio_bytes=await _read_voice_upload(audio_sample),
+                filename=audio_sample.filename,
+                content_type=audio_sample.content_type,
+                ref_text=ref_text,
+                speaker_description=speaker_description,
+            )
+        except SpeechAPIError as exc:
+            return speech_error_response(exc)
+        return JSONResponse(content=response)
+
+    @app.delete("/v1/audio/voices/{name}")
+    async def delete_voice(name: str) -> JSONResponse:
+        voice_store: SpeakerSampleStore = app.state.speaker_sample_store
+        try:
+            deleted = voice_store.delete(name)
+        except SpeechAPIError as exc:
+            return speech_error_response(exc)
+        if not deleted:
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "error": f"Voice '{name}' not found"},
+            )
+        return JSONResponse(
+            content={
+                "success": True,
+                "message": f"Voice '{name}' deleted successfully",
+            }
+        )
+
+
+async def _read_voice_upload(audio_sample: UploadFile) -> bytes:
+    audio_bytes = await audio_sample.read(MAX_VOICE_UPLOAD_BYTES + 1)
+    if len(audio_bytes) > MAX_VOICE_UPLOAD_BYTES:
+        raise bad_request(
+            f"audio_sample must be at most {MAX_VOICE_UPLOAD_BYTES} bytes",
+            param="audio_sample",
+        )
+    return audio_bytes
+
+
+def _is_voice_upload_scope(scope: dict[str, Any]) -> bool:
+    return (
+        scope.get("type") == "http"
+        and scope.get("method") == "POST"
+        and scope.get("path") == "/v1/audio/voices"
+    )
+
+
+def _content_length(scope: dict[str, Any]) -> int | None:
+    for name, value in scope.get("headers", ()):
+        if name.lower() != b"content-length":
+            continue
+        try:
+            return int(value.decode("ascii"))
+        except ValueError:
+            return None
+    return None
+
+
+async def _send_voice_upload_too_large(
+    send: Callable[[dict[str, Any]], Awaitable[None]],
+    max_bytes: int,
+) -> None:
+    body = json.dumps(
+        openai_error_payload(
+            f"request body must be at most {max_bytes} bytes",
+            error_type="RequestTooLargeError",
+            param="audio_sample",
+            code=413,
+        )
+    ).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
 
 
 def _register_health(app: FastAPI) -> None:
@@ -740,6 +915,7 @@ def _register_speech(app: FastAPI) -> None:
                 req,
                 validate=False,
                 reference_descriptors=prepared.reference_descriptors,
+                uploaded_voice=prepared.uploaded_voice,
             )
         except json.JSONDecodeError as exc:
             return speech_error_response(
@@ -1025,6 +1201,8 @@ def _register_transcriptions(app: FastAPI) -> None:
         default_model: str = app.state.model_name
         request_id = f"transcription-{uuid.uuid4()}"
 
+        # TODO(Ratish): add the same pre-parser body limit used by voice uploads
+        # once transcription upload limits are defined.
         audio_bytes = await file.read()
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
