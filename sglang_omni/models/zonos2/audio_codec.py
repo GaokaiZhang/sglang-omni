@@ -30,6 +30,15 @@ def _get_dac(device: str):
             .eval()
             .to(device)
         )
+        # note (Yue Yin): the DAC convs use legacy weight_norm (78 modules) that
+        # recomputes g*v/||v|| every forward. For inference the reparam is fixed,
+        # so fold it into the conv weight once at load -> ~2e-4 fp-reassoc on the
+        # output (WER-neutral, verified), fewer ops per (streaming) vocoder call.
+        for _m in _dac_model.modules():
+            try:
+                torch.nn.utils.remove_weight_norm(_m)
+            except (ValueError, RuntimeError):
+                pass
         _dac_device = device
     return _dac_model
 
