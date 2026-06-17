@@ -245,18 +245,23 @@ class Zonos2StreamingVocoderScheduler(StreamingSimpleScheduler):
     ) -> list[OutgoingMessage]:
         state = self._stream_states.setdefault(request_id, _Zonos2StreamState())
         self._latch(state, item.metadata)
-        row = item.data
-        if not isinstance(row, torch.Tensor):
+        rows_t = item.data
+        if not isinstance(rows_t, torch.Tensor):
             raise TypeError(
                 f"ZONOS2 stream chunk for {request_id!r} must carry a torch.Tensor, "
-                f"got {type(row).__name__}"
+                f"got {type(rows_t).__name__}"
             )
-        row = row.to(dtype=torch.long).reshape(-1)[: state.n_codebooks]
+        # Accept either a single [9] row or a coalesced [k, 9] batch (the AR engine
+        # may group several frames per message); add each row in order.
+        rows_t = rows_t.to(dtype=torch.long)
+        if rows_t.ndim == 1:
+            rows_t = rows_t.reshape(1, -1)
+        rows_t = rows_t[:, : state.n_codebooks]
         if state.decoder is None:
             state.decoder = _Zonos2OLADecoder(
                 self._device, self._overlap_frames, DAC_HOP_LENGTH
             )
-        state.decoder.add([row])
+        state.decoder.add([rows_t[i] for i in range(rows_t.shape[0])])
         chunk_frames = (
             state.initial_chunk_frames
             if (not state.emitted_any and state.initial_chunk_frames > 0)

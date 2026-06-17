@@ -29,9 +29,18 @@ class Zonos2ModelRunner(ModelRunner):
         compile_sampler: bool = False,
         frame_graph: bool = False,
         async_decode: bool = False,
+        stream_emit_chunk_frames: int = 1,
     ):
         super().__init__(tp_worker, output_processor)
         self._outbox: Any | None = None
+        # Streaming emission granularity: coalesce this many newly sampled frame
+        # rows into a single [k, 9] outbox message instead of one put() per row.
+        # The per-frame puts (~16/step at c=16) run on the resolve host loop and
+        # serialize against the next launch, defeating the async_decode D2H
+        # overlap; batching cuts that put count by ~k. 1 == legacy per-frame path
+        # (byte-identical default). The OLA vocoder is unaffected (same rows, same
+        # order) -- this only regroups them into fewer cross-stage messages.
+        self._stream_emit_chunk_frames = max(1, int(stream_emit_chunk_frames))
         # Side stream for the lagged resolve D2H: gated by a launch event so the
         # copy waits only for codes(N), not the next forward queued on the main
         # stream -> the host resolve overlaps forward(N+1).
@@ -57,35 +66,64 @@ class Zonos2ModelRunner(ModelRunner):
         # note (Yue Yin): additive stream hook — push each newly sampled delayed
         # [9] row to the vocoder; reads the already-CPU output_codes and never
         # touches the decode/EOS/feedback state.
+        # When stream_emit_chunk_frames > 1, coalesce the newly sampled rows into
+        # one [k, 9] message instead of one put() per row: the per-frame puts run
+        # on the resolve host loop and serialize against the next launch, defeating
+        # the async_decode D2H overlap. Same rows in the same order reach the OLA
+        # decoder, so the audio is unchanged — only the message grouping differs.
         del result, outputs
         if self._outbox is None:
             return
+        chunk = self._stream_emit_chunk_frames
         for sched_req in scheduler_output.requests:
             data = sched_req.data
             stream_metadata = getattr(data, "stream_metadata", None)
             if stream_metadata is None:
                 continue
+            done = False
             req = getattr(data, "req", None)
             if req is not None:
                 finished = getattr(req, "finished", None)
-                if (callable(finished) and finished()) or bool(
+                done = (callable(finished) and finished()) or bool(
                     getattr(req, "is_retracted", False)
-                ):
-                    continue
+                )
             codes = data.output_codes
             start = int(data._stream_emit_idx)
-            if start >= len(codes):
+            n_new = len(codes) - start
+            if n_new <= 0:
                 continue
-            for row in codes[start:]:
-                self._outbox.put(
-                    OutgoingMessage(
-                        request_id=sched_req.request_id,
-                        type="stream",
-                        target="vocoder",
-                        data=row.clone(),
-                        metadata=stream_metadata,
+            if chunk == 1:
+                # Legacy per-frame path (byte-identical default): one put per row;
+                # a finishing step's tail is left to the on_stream_done flush.
+                if done:
+                    continue
+                for row in codes[start:]:
+                    self._outbox.put(
+                        OutgoingMessage(
+                            request_id=sched_req.request_id,
+                            type="stream",
+                            target="vocoder",
+                            data=row.clone(),
+                            metadata=stream_metadata,
+                        )
                     )
+                data._stream_emit_idx = len(codes)
+                continue
+            # Coalesced path: hold rows until >= chunk have accumulated, but always
+            # flush the remainder on finish so the OLA decoder receives every row
+            # (on_stream_done's eos_frame cap trims the tail to the aligned length).
+            if not done and n_new < chunk:
+                continue
+            rows = torch.stack(list(codes[start:]), dim=0)
+            self._outbox.put(
+                OutgoingMessage(
+                    request_id=sched_req.request_id,
+                    type="stream",
+                    target="vocoder",
+                    data=rows.clone(),
+                    metadata=stream_metadata,
                 )
+            )
             data._stream_emit_idx = len(codes)
 
     # ---- input embeddings ----
