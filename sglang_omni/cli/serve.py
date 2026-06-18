@@ -875,8 +875,8 @@ def serve(
             "--allowed_media_domain",
             help=(
                 "Restrict remote media references to this domain. Repeat the "
-                "flag to allow multiple domains. Remote HTTP(S) references "
-                "are disabled when this is omitted."
+                "flag to allow multiple domains. When omitted, remote HTTP(S) "
+                "references from any public host are allowed."
             ),
         ),
     ] = None,

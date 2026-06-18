@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from pydantic import Field
 
@@ -96,6 +96,40 @@ class MossTTSLocalPipelineConfig(PipelineConfig):
     stages: list[StageConfig] = Field(
         default_factory=lambda: _stages(codec_device="cuda:0", colocated=True)
     )
+
+    # Streaming-vocoder CUDA-graph knobs, injected into the vocoder factory by model_post_init.
+    # Default on, fail-safe to eager; cuda_graph_frames=None uses the built-in broad-exact set.
+    cuda_graph: bool = True
+    cuda_graph_frames: list[int] | None = None
+    cuda_graph_min_free_gb: float = 3.0
+
+    def model_post_init(self, __context: Any = None) -> None:
+        super().model_post_init(__context)
+        if self.cuda_graph_min_free_gb < 0:
+            raise ValueError(
+                "cuda_graph_min_free_gb must be >= 0 (0 disables the VRAM headroom "
+                f"guard); got {self.cuda_graph_min_free_gb}"
+            )
+        if self.cuda_graph_frames is not None:
+            if not self.cuda_graph_frames:
+                raise ValueError(
+                    "cuda_graph_frames must be non-empty; set `cuda_graph: false` to "
+                    "disable graphs, or leave it null to use the default capture set"
+                )
+            invalid = [t for t in self.cuda_graph_frames if t < 1]
+            if invalid:
+                raise ValueError(
+                    f"cuda_graph_frames entries must be positive ints (>= 1); got {invalid}"
+                )
+        for stage in self.stages:
+            if stage.factory.endswith("create_vocoder_executor"):
+                stage.factory_args.setdefault("cuda_graph", self.cuda_graph)
+                stage.factory_args.setdefault(
+                    "cuda_graph_frames", self.cuda_graph_frames
+                )
+                stage.factory_args.setdefault(
+                    "cuda_graph_min_free_gb", self.cuda_graph_min_free_gb
+                )
 
     def supports_uploaded_voice_references(self) -> bool:
         return True

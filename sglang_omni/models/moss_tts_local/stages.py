@@ -670,14 +670,24 @@ def create_vocoder_executor(
     stream_slots: int = 8,
     stream_chunk_frames: int = 25,
     initial_chunk_frames: int = 5,
+    cuda_graph: bool = True,
+    cuda_graph_frames: list[int] | None = None,
+    cuda_graph_min_free_gb: float = 3.0,
 ) -> MossTTSLocalStreamingVocoderScheduler:
     device = _resolve_codec_device(device, gpu_id)
     processor = _load_moss_tts_local_processor(model_path, device=device)
-    return MossTTSLocalStreamingVocoderScheduler(
+    scheduler = MossTTSLocalStreamingVocoderScheduler(
         processor,
         stream_slots=stream_slots,
         stream_chunk_frames=stream_chunk_frames,
         initial_chunk_frames=initial_chunk_frames,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
+        cuda_graph=cuda_graph,
+        cuda_graph_frames=cuda_graph_frames,
+        cuda_graph_min_free_gb=cuda_graph_min_free_gb,
     )
+    # Capture graphs in the factory: it runs before the process is marked ready, so serving never
+    # races a half-captured graph. Same-process guarantee (each colocate/split stage warms its own).
+    scheduler.warmup_now()
+    return scheduler

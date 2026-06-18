@@ -79,7 +79,7 @@ class SpeechRequestValidator:
         self.reference_connector = MultiModalResourceConnector(
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
-            allow_remote_media_without_domains=False,
+            allow_remote_media_without_domains=True,
             reject_unsafe_remote_addresses=True,
         )
 
@@ -339,7 +339,7 @@ class SpeechRequestValidator:
                     f"{param} must be an http, https, data, file:// URL, or local path",
                     param=param,
                 )
-            value = Path(value).expanduser().resolve().as_uri()
+            return {"audio_path": str(Path(value).expanduser().resolve())}
         try:
             return self.reference_connector.load_resource(
                 value,
