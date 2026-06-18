@@ -38,7 +38,9 @@ _vocoder_device: str | None = None
 
 # New streaming-chunk constants (not changes to existing values). At 86.1328125
 # fps (44100/512) one frame = DAC_HOP_LENGTH=512 PCM samples.
-_STREAM_STEADY_CHUNK_FRAMES = 40  # ~0.46 s steady chunk (fewer vocoder forwards/chunk -> lower streaming RTF)
+_STREAM_STEADY_CHUNK_FRAMES = (
+    40  # ~0.46 s steady chunk (fewer vocoder forwards/chunk -> lower streaming RTF)
+)
 _STREAM_INITIAL_CHUNK_FRAMES = 5  # ~0.06 s first chunk for low TTFB
 _STREAM_OLA_OVERLAP_FRAMES = 2  # note (Yue Yin): cross-fade width; TODO calibrate
 # shear_up needs the trailing N_CODEBOOKS-1 future rows to de-shear a frame.
