@@ -68,6 +68,12 @@ def _stages(*, codec_device: str, speaker_device: str) -> list[StageConfig]:
             factory=f"{_PKG}.stages.create_vocoder_executor",
             factory_args={
                 "device": codec_device,
+                # note (Yue Yin): keep dac_batch OFF -- verified numerically unsafe.
+                # Batched DAC right-pads shorter items and the padding contaminates
+                # them GLOBALLY (only the longest, unpadded item matches single
+                # decode; shorter items diverge ~0.2-0.3 abs / ~0.3 rel = audible).
+                # The DAC has no variable-length batching, so it is not croppable.
+                # Do not enable without fixing the DAC itself.
                 "dac_batch": False,
                 "vocoder_warmup": False,
             },
