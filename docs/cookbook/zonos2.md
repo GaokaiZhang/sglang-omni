@@ -149,17 +149,32 @@ Use `--lang zh` for the Chinese split. See `benchmarks/README.md` for the full w
 
 ## Benchmark Results
 
-<!-- TODO(calibrate on CI GPU): fill from a real ZONOS2 seed-tts-eval run.
-Mirror the columns below from the calibration JSON
-(speed_results.json['summary'] + wer_results.json['summary']). Do not copy
-another model's numbers. -->
+Seed-TTS-Eval EN (1088/1088 successful), 1× H100, concurrency 16, `--ref-format references`,
+`fp8 + frame_graph + async_decode + compile_sampler`. WER scored with whisper-large-v3 +
+`EnglishTextNormalizer` + jiwer (the CI gate in `tests/test_model/test_zonos2_tts_ci.py` also
+checks the Qwen3-ASR router; both agree ~1.3–1.5%). Means over 2 runs — seed-tts generation is
+unseeded, so per-run corpus WER varies ~±0.15pt.
 
-Seed-TTS-Eval, concurrency 16, `--ref-format references`. WER is scored with the Qwen3-ASR
-router (same scorer as `tests/test_model/test_zonos2_tts_ci.py`).
+| Config | WER (corpus) | RTF mean | Throughput (qps) |
+|---|---|---|---|
+| non-streaming | ~1.3% | 0.68 | 6.3 |
+| streaming, `stream_emit_chunk_frames=1` | ~1.4% | 0.92 | 4.6 |
+| **streaming, `stream_emit_chunk_frames=32` (default)** | ~1.5% | **0.77** | **5.6** |
+| streaming, 2-GPU (`multi_gpu`) + emit=32 | ~1.5% | 0.69 | 6.5 |
 
-| Lang | WER (corpus) | Latency mean (s) | RTF mean | Throughput (qps) |
-|---|---|---|---|---|
-| EN | _TODO_ | _TODO_ | _TODO_ | _TODO_ |
+### Streaming throughput (`stream_emit_chunk_frames`)
+
+In streaming mode the AR engine pushes sampled frames to the vocoder over an in-process queue.
+By default the engine **coalesces `stream_emit_chunk_frames=32` frames into one message** instead
+of one `put()` per frame; the per-frame puts run on the resolve host loop and serialize against
+the next decode launch, so batching them gives **−17% streaming RTF and +22% throughput,
+WER-neutral**, vs the per-frame path. The cost is ~0.09 s higher time-to-first-chunk and coarser
+per-chunk granularity (inter-chunk latency actually improves, 0.37 s → 0.23 s). Set
+`stream_emit_chunk_frames=1` for the lowest-latency per-frame streaming. The 2-GPU `multi_gpu`
+pipeline (codec + speaker encoder on `cuda:1`) stacks on top for the best streaming RTF (~0.69).
+
+> ZH (`--lang zh`, 2020 samples) tracks the same RTF/throughput pattern; CER stays flat across
+> the streaming configs (the coalescing is audio-neutral after the `on_stream_done` tail fix).
 
 ## Known Limitations
 
