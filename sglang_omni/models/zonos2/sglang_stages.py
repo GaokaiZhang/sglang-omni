@@ -114,6 +114,7 @@ def create_sglang_omni_tts_engine_executor(
     compile_sampler: bool = False,
     async_decode: bool = False,
     stream_emit_chunk_frames: int = 1,
+    stream_emit_first_chunk_frames: int = 0,
     **_: Any,
 ) -> Any:
     from sglang_omni.models.zonos2.model_runner import Zonos2ModelRunner
@@ -202,6 +203,7 @@ def create_sglang_omni_tts_engine_executor(
         frame_graph=frame_graph,
         async_decode=async_decode,
         stream_emit_chunk_frames=stream_emit_chunk_frames,
+        stream_emit_first_chunk_frames=stream_emit_first_chunk_frames,
     )
     scheduler = OmniScheduler(
         tp_worker=model_worker,

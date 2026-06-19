@@ -30,6 +30,7 @@ class Zonos2ModelRunner(ModelRunner):
         frame_graph: bool = False,
         async_decode: bool = False,
         stream_emit_chunk_frames: int = 1,
+        stream_emit_first_chunk_frames: int = 0,
     ):
         super().__init__(tp_worker, output_processor)
         self._outbox: Any | None = None
@@ -41,6 +42,12 @@ class Zonos2ModelRunner(ModelRunner):
         # (byte-identical default). The OLA vocoder is unaffected (same rows, same
         # order) -- this only regroups them into fewer cross-stage messages.
         self._stream_emit_chunk_frames = max(1, int(stream_emit_chunk_frames))
+        # Adaptive emit: emit a SMALLER first chunk so the vocoder can produce its
+        # first audio sooner (recovers the TTFC that a large steady chunk costs),
+        # then fall back to the steady stream_emit_chunk_frames for throughput.
+        # 0 disables (first chunk == steady chunk = fixed behavior). Only applies on
+        # the coalesced path (stream_emit_chunk_frames > 1).
+        self._stream_emit_first_chunk_frames = max(0, int(stream_emit_first_chunk_frames))
         # Side stream for the lagged resolve D2H: gated by a launch event so the
         # copy waits only for codes(N), not the next forward queued on the main
         # stream -> the host resolve overlaps forward(N+1).
@@ -109,10 +116,14 @@ class Zonos2ModelRunner(ModelRunner):
                     )
                 data._stream_emit_idx = len(codes)
                 continue
-            # Coalesced path: hold rows until >= chunk have accumulated, but always
-            # flush the remainder on finish so the OLA decoder receives every row
-            # (on_stream_done's eos_frame cap trims the tail to the aligned length).
-            if not done and n_new < chunk:
+            # Coalesced path: hold rows until >= threshold have accumulated, but
+            # always flush the remainder on finish so the OLA decoder receives every
+            # row (on_stream_done's eos_frame cap trims the tail to the aligned
+            # length). Adaptive: the FIRST chunk uses a smaller threshold so the
+            # first audio is produced sooner (lower TTFC); steady chunks use `chunk`.
+            first = self._stream_emit_first_chunk_frames
+            threshold = first if (first > 0 and start == 0) else chunk
+            if not done and n_new < threshold:
                 continue
             rows = torch.stack(list(codes[start:]), dim=0)
             self._outbox.put(

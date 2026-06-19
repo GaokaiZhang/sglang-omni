@@ -56,6 +56,7 @@ def _stages(*, codec_device: str, speaker_device: str) -> list[StageConfig]:
                 "compile_sampler": False,
                 "async_decode": False,
                 "stream_emit_chunk_frames": 32,
+                "stream_emit_first_chunk_frames": 24,
             },
             gpu=0,
             next="vocoder",
