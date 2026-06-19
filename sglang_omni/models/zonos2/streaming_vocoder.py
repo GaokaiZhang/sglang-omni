@@ -287,6 +287,23 @@ class Zonos2StreamingVocoderScheduler(StreamingSimpleScheduler):
         zstate = Zonos2State.from_dict(payload.data)
 
         messages: list[OutgoingMessage] = []
+        # note (Yue Yin): coalescing (stream_emit_chunk_frames>1) or retraction can
+        # leave the streamed OLA decoder SHORT of the full aligned length (a held or
+        # dropped tail), which truncates the audio (observed: emit=32 drops a stochastic
+        # ~1% of tails -> WER spike). The complete code sequence is in zstate.audio_codes,
+        # so top the decoder up to full length before the flush: a no-op when every row
+        # was streamed (audio-neutral), and it recovers the missing tail otherwise. The
+        # flush's eos_frame cap then trims to the aligned length == the non-stream path.
+        if zstate.audio_codes is not None:
+            full = torch.as_tensor(zstate.audio_codes, dtype=torch.long)
+            if full.shape[0] > 0:
+                if state.decoder is None:
+                    state.decoder = _Zonos2OLADecoder(
+                        self._device, self._overlap_frames, DAC_HOP_LENGTH
+                    )
+                have = len(state.decoder.rows)
+                if full.shape[0] > have:
+                    state.decoder.add([full[i] for i in range(have, full.shape[0])])
         if state.decoder is not None and state.decoder.rows:
             for pcm in state.decoder.pull(
                 _get_vocoder(self._device),
