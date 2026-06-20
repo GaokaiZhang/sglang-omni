@@ -129,7 +129,9 @@ def _drive(sch, codes, eos_frame, *, emit, rid="req", stream_first_n=None):
         batch = fed[i : i + emit]
         msgs += sch.on_stream_chunk(
             rid,
-            StreamItem(chunk_id=cid, data=batch.clone(), from_stage="tts_engine", metadata=meta),
+            StreamItem(
+                chunk_id=cid, data=batch.clone(), from_stage="tts_engine", metadata=meta
+            ),
         )
         i += emit
         cid += 1
@@ -171,7 +173,10 @@ def test_adaptive_emit_alignment():
             break
         batch = codes[i : i + sz]
         msgs += sch.on_stream_chunk(
-            rid, StreamItem(chunk_id=cid, data=batch.clone(), from_stage="tts_engine", metadata=meta)
+            rid,
+            StreamItem(
+                chunk_id=cid, data=batch.clone(), from_stage="tts_engine", metadata=meta
+            ),
         )
         i += sz
         cid += 1

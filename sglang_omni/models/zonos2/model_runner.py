@@ -47,7 +47,9 @@ class Zonos2ModelRunner(ModelRunner):
         # then fall back to the steady stream_emit_chunk_frames for throughput.
         # 0 disables (first chunk == steady chunk = fixed behavior). Only applies on
         # the coalesced path (stream_emit_chunk_frames > 1).
-        self._stream_emit_first_chunk_frames = max(0, int(stream_emit_first_chunk_frames))
+        self._stream_emit_first_chunk_frames = max(
+            0, int(stream_emit_first_chunk_frames)
+        )
         # Side stream for the lagged resolve D2H: gated by a launch event so the
         # copy waits only for codes(N), not the next forward queued on the main
         # stream -> the host resolve overlaps forward(N+1).
