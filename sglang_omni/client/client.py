@@ -253,6 +253,7 @@ class Client:
             audio_bytes=audio_bytes,
             mime_type=mime_type,
             format=actual_format,
+            sample_rate=sample_rate,
             usage=last_chunk.usage if last_chunk else None,
         )
 

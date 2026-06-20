@@ -254,6 +254,7 @@ SUPPORTED_TTS_LANGUAGES = frozenset(
 SUPPORTED_TTS_TASK_TYPES = frozenset({"Base", "CustomVoice", "VoiceDesign"})
 TTS_SPEED_MIN = 0.25
 TTS_SPEED_MAX = 4.0
+DEFAULT_TTS_BATCH_MAX_ITEMS = 32
 
 
 class SpeechReference(BaseModel):
@@ -311,6 +312,126 @@ class CreateSpeechRequest(BaseModel):
     seed: int | None = None
 
     # Per-stage overrides (sglang-omni specific)
+    stage_params: dict[str, dict[str, Any]] | None = None
+
+
+class SpeechBatchItem(BaseModel):
+    """One item in a batch text-to-speech request."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    model: Any = None
+    input: Any = None
+    voice: Any = Field(
+        default=None,
+        validation_alias=AliasChoices("voice", "speaker"),
+    )
+    response_format: Any = None
+    speed: Any = None
+    stream: Any = None
+    task_type: Any = None
+    language: Any = None
+    instructions: Any = None
+    ref_audio: Any = None
+    ref_text: Any = None
+    references: Any = None
+    x_vector_only_mode: Any = None
+    token_count: Any = None
+    duration_tokens: Any = None
+    max_new_tokens: Any = None
+    initial_codec_chunk_frames: Any = None
+    temperature: Any = None
+    top_p: Any = None
+    top_k: Any = None
+    repetition_penalty: Any = None
+    seed: Any = None
+    stage_params: Any = None
+
+
+class CreateSpeechBatchRequest(BaseModel):
+    """Batch text-to-speech request with shared defaults and item overrides."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    model: str | None = None
+    items: list[SpeechBatchItem]
+    voice: str = Field(
+        default="default",
+        validation_alias=AliasChoices("voice", "speaker"),
+    )
+    response_format: str = "wav"
+    speed: float = 1.0
+    stream: bool = False
+    task_type: str | None = None
+    language: str | None = None
+    instructions: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    references: list[SpeechReference] | None = None
+    x_vector_only_mode: bool | None = None
+    token_count: int | None = None
+    duration_tokens: int | None = None
+    max_new_tokens: int | None = None
+    initial_codec_chunk_frames: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    seed: int | None = None
+    stage_params: dict[str, dict[str, Any]] | None = None
+
+
+class SpeechBatchResult(BaseModel):
+    """One item result in a batch text-to-speech response."""
+
+    index: int
+    status: str
+    audio_data: str | None = None
+    format: str | None = None
+    media_type: str | None = None
+    error: dict[str, Any] | None = None
+
+
+class SpeechBatchResponse(BaseModel):
+    """Batch text-to-speech response preserving item order."""
+
+    id: str
+    results: list[SpeechBatchResult]
+    total: int
+    succeeded: int
+    failed: int
+
+
+class SpeechStreamSessionConfig(BaseModel):
+    """Configuration for /v1/audio/speech/stream WebSocket sessions."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    model: str | None = None
+    voice: str = Field(
+        default="default",
+        validation_alias=AliasChoices("voice", "speaker"),
+    )
+    response_format: str = "pcm"
+    speed: float = 1.0
+    stream_audio: bool = False
+    split_granularity: str = "sentence"
+    task_type: str | None = None
+    language: str | None = None
+    instructions: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    references: list[SpeechReference] | None = None
+    x_vector_only_mode: bool | None = None
+    token_count: int | None = None
+    duration_tokens: int | None = None
+    max_new_tokens: int | None = None
+    initial_codec_chunk_frames: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    seed: int | None = None
     stage_params: dict[str, dict[str, Any]] | None = None
 
 

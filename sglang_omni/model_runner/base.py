@@ -12,6 +12,11 @@ from typing import Any
 
 import torch
 
+from sglang_omni.sampling.seed import (
+    SAMPLING_SEED_MASK,
+    derive_sampling_seed,
+    resolve_row_seed,
+)
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
     RequestOutput,
@@ -19,6 +24,27 @@ from sglang_omni.scheduling.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _current_sglang_sampling_backend() -> str | None:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_global_server_args().sampling_backend
+    except ValueError:
+        return None
+
+
+def _rank_shared_unseeded_sampling_seed(request: Any, row_idx: int) -> int:
+    request_id = getattr(request, "request_id", None)
+    if request_id is None:
+        request_id = getattr(getattr(request, "data", None), "request_id", None)
+    if request_id is None:
+        req = getattr(getattr(request, "data", None), "req", None)
+        request_id = getattr(req, "rid", None)
+    if request_id is None:
+        request_id = f"row-{row_idx}"
+    return derive_sampling_seed("sglang-omni-unseeded-row", request_id)
 
 
 @dataclass
@@ -545,6 +571,7 @@ class ModelRunner:
     ) -> Any:
         self._apply_repetition_penalty(logits_output, requests)
         self._apply_codec_suppress_tokens(logits_output, requests)
+        self._install_sampling_seeds(forward_batch, requests)
         wants_rollout_logprob = any(sr.data.return_logprob for sr in requests)
         if wants_rollout_logprob:
             self._enable_sampler_logprobs(forward_batch, len(requests))
@@ -570,6 +597,56 @@ class ModelRunner:
                 requests,
             )
         return next_token_ids
+
+    def _install_sampling_seeds(self, forward_batch: Any, requests: list) -> None:
+        """Install per-row ``seed``s onto ``sampling_info`` so SGLang routes to
+        ``multinomial_with_seed``. No-op when no request set a seed, or when a
+        subclass already installed its own (e.g. Qwen3-TTS).
+
+        Runs once per decode step. User-provided seeds are resolved once and
+        cached back onto ``sampling_params.sampling_seed``. In a mixed
+        seeded/unseeded batch the SGLang sampler is batch-wide, so unseeded rows
+        receive a request-id-derived fallback seed instead of a rank-local random
+        seed; this keeps TP ranks in sync without mutating the public request seed.
+        """
+        sampling_info = forward_batch.sampling_info
+        if sampling_info.sampling_seed is not None:
+            self._validate_seeded_sampling_supported(sampling_info)
+            return
+        sampling_params = [sr.data.req.sampling_params for sr in requests]
+        if all(sp.sampling_seed is None for sp in sampling_params):
+            return
+        self._validate_seeded_sampling_supported(sampling_info)
+        row_seeds: list[int] = []
+        for row_idx, (sp, request) in enumerate(zip(sampling_params, requests)):
+            seed = sp.sampling_seed
+            if seed is None:
+                seed = _rank_shared_unseeded_sampling_seed(request, row_idx)
+            elif not (0 <= seed <= SAMPLING_SEED_MASK):
+                seed = resolve_row_seed(seed)  # mask and cache user seed
+                sp.sampling_seed = seed
+            row_seeds.append(seed)
+        sampling_info.sampling_seed = torch.tensor(
+            row_seeds, dtype=torch.long, device=sampling_info.device
+        )
+
+    @staticmethod
+    def _validate_seeded_sampling_supported(sampling_info: Any) -> None:
+        if getattr(sampling_info, "need_min_p_sampling", False):
+            raise ValueError(
+                "SGLang seeded sampling does not support min_p yet; set min_p=0 "
+                "or omit request seed"
+            )
+        need_top_p_sampling = getattr(sampling_info, "need_top_p_sampling", False)
+        need_top_k_sampling = getattr(sampling_info, "need_top_k_sampling", False)
+        if not (need_top_p_sampling or need_top_k_sampling):
+            return
+        if _current_sglang_sampling_backend() == "flashinfer":
+            raise ValueError(
+                "SGLang flashinfer sampling backend does not support request seed "
+                "with top_p/top_k filtering; configure sampling_backend='pytorch' "
+                "or avoid top_p/top_k with seed"
+            )
 
     @staticmethod
     def _enable_sampler_logprobs(forward_batch: Any, batch_size: int) -> None:

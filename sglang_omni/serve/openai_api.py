@@ -4,6 +4,8 @@
 Provides the following endpoints:
 - POST /v1/chat/completions  — Text (+ audio) chat completions
 - POST /v1/audio/speech      — Text-to-speech synthesis
+- POST /v1/audio/speech/batch — Batch text-to-speech synthesis
+- WS   /v1/audio/speech/stream — Stateful TTS WebSocket streaming
 - GET  /v1/audio/voices      — List preset and uploaded TTS voices
 - POST /v1/audio/voices      — Upload a persistent TTS reference voice
 - DELETE /v1/audio/voices/{name} — Delete an uploaded TTS voice
@@ -22,6 +24,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from typing import Any, AsyncIterator
 
 from fastapi import (
@@ -54,7 +57,7 @@ from sglang_omni.client.audio import (
     DEFAULT_SAMPLE_RATE,
     apply_speed,
     encode_pcm,
-    to_numpy,
+    select_audio_delta,
 )
 from sglang_omni.http.admin_auth import (
     make_admin_auth_dependency,
@@ -62,6 +65,7 @@ from sglang_omni.http.admin_auth import (
 )
 from sglang_omni.http.favicon import register_favicon
 from sglang_omni.serve.protocol import (
+    DEFAULT_TTS_BATCH_MAX_ITEMS,
     AdminRequestBase,
     ChatCompletionAudio,
     ChatCompletionChoice,
@@ -71,6 +75,7 @@ from sglang_omni.serve.protocol import (
     ChatCompletionStreamDelta,
     ChatCompletionStreamResponse,
     ContinueGenerationRequest,
+    CreateSpeechBatchRequest,
     DestroyWeightsUpdateGroupRequest,
     GenerateAudio,
     GenerateFinishReason,
@@ -82,6 +87,7 @@ from sglang_omni.serve.protocol import (
     PauseGenerationRequest,
     RolloutGenerateRequest,
     RolloutSamplingParams,
+    SpeechBatchResponse,
     TranscriptionResponse,
     UpdateWeightFromDiskRequest,
     UpdateWeightsFromDistributedRequest,
@@ -98,6 +104,7 @@ from sglang_omni.serve.speech_errors import (
 )
 from sglang_omni.serve.speech_service import SpeechRequestValidator
 from sglang_omni.serve.speech_voices import MAX_VOICE_UPLOAD_BYTES, SpeakerSampleStore
+from sglang_omni.serve.speech_ws import SpeechWebSocketSession
 
 logger = logging.getLogger(__name__)
 STREAM_DONE_SENTINEL = "[DONE]"
@@ -172,6 +179,7 @@ def create_app(
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
     admin_api_key: str | None = None,
+    tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
 ) -> FastAPI:
     """Create a FastAPI application with OpenAI-compatible endpoints.
 
@@ -188,6 +196,8 @@ def create_app(
             reference audio.
         allowed_media_domains: Domains allowed for remote TTS reference audio.
         admin_api_key: Optional API key for admin-control endpoints.
+        tts_batch_max_items: Maximum items accepted by
+            ``/v1/audio/speech/batch``.
 
     Returns:
         Configured FastAPI application.
@@ -220,6 +230,7 @@ def create_app(
         allowed_local_media_path=allowed_local_media_path,
         allowed_media_domains=allowed_media_domains,
         voice_store=app.state.speaker_sample_store,
+        tts_batch_max_items=tts_batch_max_items,
     )
 
     resolved_key = resolve_admin_api_key(admin_api_key)
@@ -233,6 +244,8 @@ def create_app(
     _register_voices(app)
     _register_generate(app)
     _register_speech(app)
+    _register_speech_batch(app)
+    _register_speech_ws(app)
     _register_transcriptions(app)
     if enable_realtime:
         _register_realtime(app)
@@ -1143,6 +1156,7 @@ def _register_speech(app: FastAPI) -> None:
         if req.stream:
             try:
                 return await _speech_audio_response(
+                    request=request,
                     client=client,
                     gen_req=gen_req,
                     request_id=request_id,
@@ -1190,6 +1204,81 @@ def _register_speech(app: FastAPI) -> None:
         )
 
 
+def _register_speech_batch(app: FastAPI) -> None:
+    @app.post("/v1/audio/speech/batch")
+    async def create_speech_batch(request: Request) -> JSONResponse:
+        client: Client = app.state.client
+        speech_service: SpeechRequestValidator = app.state.speech_service
+        request_id = f"speech-batch-{uuid.uuid4()}"
+        try:
+            payload = await request.json()
+            batch = await asyncio.to_thread(speech_service.parse_batch_request, payload)
+            response = await _create_speech_batch_with_disconnect_watch(
+                request,
+                client=client,
+                speech_service=speech_service,
+                batch=batch,
+                request_id=request_id,
+            )
+        except json.JSONDecodeError:
+            return speech_error_response(
+                bad_request("speech batch request body must be valid JSON")
+            )
+        except SpeechAPIError as exc:
+            return speech_error_response(exc)
+        except Exception as exc:
+            logger.exception("Error generating speech batch for request %s", request_id)
+            return speech_error_response(internal_error(str(exc)))
+
+        response = SpeechBatchResponse.model_validate(response)
+        return JSONResponse(content=response.model_dump(exclude_none=True))
+
+
+async def _create_speech_batch_with_disconnect_watch(
+    request: Request,
+    *,
+    client: Client,
+    speech_service: SpeechRequestValidator,
+    batch: CreateSpeechBatchRequest,
+    request_id: str,
+) -> Any:
+    batch_task = asyncio.create_task(
+        speech_service.create_speech_batch(
+            client,
+            batch,
+            request_id=request_id,
+        )
+    )
+    disconnect_task = asyncio.create_task(_wait_for_request_disconnect(request))
+    try:
+        done, _ = await asyncio.wait(
+            {batch_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if batch_task in done:
+            return await batch_task
+
+        batch_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await batch_task
+        raise asyncio.CancelledError
+    finally:
+        if not disconnect_task.done():
+            await _cancel_task_bounded(disconnect_task)
+
+
+def _register_speech_ws(app: FastAPI) -> None:
+    @app.websocket("/v1/audio/speech/stream")
+    async def speech_stream(websocket: WebSocket) -> None:
+        await websocket.accept()
+        session = SpeechWebSocketSession(
+            websocket,
+            client=app.state.client,
+            speech_service=app.state.speech_service,
+        )
+        await session.run()
+
+
 def _speech_pcm_chunk_bytes(
     chunk: Any,
     *,
@@ -1197,7 +1286,7 @@ def _speech_pcm_chunk_bytes(
     speed: float,
 ) -> tuple[bytes | None, int, int]:
     sample_rate = chunk.sample_rate or DEFAULT_SAMPLE_RATE
-    audio_data, emitted_samples = _select_speech_audio_delta(
+    audio_data, emitted_samples = select_audio_delta(
         chunk.audio_data,
         emitted_samples=emitted_samples,
         is_terminal=chunk.finish_reason is not None,
@@ -1214,6 +1303,7 @@ def _speech_pcm_chunk_bytes(
 
 
 async def _speech_audio_response(
+    request: Request,
     client: Client,
     gen_req: GenerateRequest,
     request_id: str,
@@ -1225,9 +1315,29 @@ async def _speech_audio_response(
     first_audio_bytes: bytes | None = None
     stream_sample_rate: int | None = None
     stream_completed = False
+    stream_closed = False
+    disconnect_task = asyncio.create_task(_wait_for_request_disconnect(request))
+    next_chunk_task: asyncio.Task[Any] | None = None
 
     try:
-        async for chunk in chunk_stream:
+        while True:
+            next_chunk_task = asyncio.create_task(anext(chunk_stream))
+            done, _ = await asyncio.wait(
+                {next_chunk_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                if not next_chunk_task.done():
+                    await _cancel_task_bounded(next_chunk_task)
+                await _abort_and_close_speech_stream(client, request_id, chunk_stream)
+                stream_closed = True
+                raise asyncio.CancelledError
+
+            try:
+                chunk = next_chunk_task.result()
+            except StopAsyncIteration:
+                stream_completed = True
+                break
             if chunk.audio_data is None:
                 continue
 
@@ -1240,13 +1350,12 @@ async def _speech_audio_response(
             )
             if first_audio_bytes is not None:
                 break
-        else:
-            stream_completed = True
 
         if first_audio_bytes is None or stream_sample_rate is None:
             raise RuntimeError("No audio output generated from the pipeline.")
     except asyncio.CancelledError:
-        await _abort_and_close_speech_stream(client, request_id, chunk_stream)
+        if not stream_closed:
+            await _abort_and_close_speech_stream(client, request_id, chunk_stream)
         raise
     except Exception:
         if not stream_completed:
@@ -1254,6 +1363,11 @@ async def _speech_audio_response(
         else:
             await _close_async_iterator_if_supported(chunk_stream)
         raise
+    finally:
+        if next_chunk_task is not None and not next_chunk_task.done():
+            await _cancel_task_bounded(next_chunk_task)
+        if not disconnect_task.done():
+            await _cancel_task_bounded(disconnect_task)
 
     async def _body():
         nonlocal emitted_samples
@@ -1379,30 +1493,6 @@ async def _abort_and_close_speech_stream(
         await client.abort(request_id)
     finally:
         await _close_async_iterator_if_supported(stream)
-
-
-def _select_speech_audio_delta(
-    audio_data: Any,
-    *,
-    emitted_samples: int,
-    is_terminal: bool,
-) -> tuple[Any | None, int]:
-    audio = to_numpy(audio_data)
-    if audio.ndim > 1:
-        audio = audio.squeeze()
-    if audio.ndim > 1:
-        # Streaming chunks are mono; downmix multi-channel payloads
-        # (e.g. the 48 kHz stereo MOSS-TTS Local codec) instead of
-        # silently dropping channels.
-        channel_axis = 0 if audio.shape[0] < audio.shape[-1] else -1
-        audio = audio.mean(axis=channel_axis).astype("float32")
-
-    total_samples = int(audio.shape[-1]) if audio.ndim else 0
-    if not is_terminal:
-        return audio, emitted_samples + total_samples
-    if total_samples <= emitted_samples:
-        return None, emitted_samples
-    return audio[emitted_samples:], total_samples
 
 
 def _register_transcriptions(app: FastAPI) -> None:

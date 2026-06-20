@@ -225,6 +225,7 @@ class SpeechResult:
     audio_bytes: bytes
     mime_type: str
     format: str
+    sample_rate: int | None = None
     usage: UsageInfo | None = None
 
 

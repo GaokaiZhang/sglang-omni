@@ -186,6 +186,21 @@ class PrefetchedBlockingStreamingSpeechClient:
         self.aborted.append(request_id)
 
 
+class BlockingFirstAudioStreamingSpeechClient:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.aborted: list[str] = []
+
+    async def generate(self, request: Any, request_id: str | None = None):
+        del request, request_id
+        self.started.set()
+        await asyncio.Future()
+        yield GenerateChunk(request_id="speech-1")
+
+    async def abort(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+
+
 class BlockingNonStreamingSpeechClient:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -620,6 +635,7 @@ def test_raw_pcm_response_close_aborts_inner_speech_stream() -> None:
     async def _drive() -> None:
         client = PrefetchedBlockingStreamingSpeechClient()
         response = await _speech_audio_response(
+            request=ConnectedRequest(),
             client=client,
             gen_req=GenerateRequest(model="s2-pro", prompt="hello", stream=True),
             request_id="req-1",
@@ -628,6 +644,28 @@ def test_raw_pcm_response_close_aborts_inner_speech_stream() -> None:
         body = response.body_iterator
         assert await anext(body) == encode_pcm([0.0, 0.1, -0.1, 0.0], 24000)
         await body.aclose()
+        assert client.aborted == ["req-1"]
+
+    asyncio.run(_drive())
+
+
+def test_raw_pcm_response_disconnect_before_first_chunk_aborts_request() -> None:
+    async def _drive() -> None:
+        client = BlockingFirstAudioStreamingSpeechClient()
+        request = DisconnectingRequest()
+        task = asyncio.create_task(
+            _speech_audio_response(
+                request=request,
+                client=client,
+                gen_req=GenerateRequest(model="s2-pro", prompt="hello", stream=True),
+                request_id="req-1",
+                speed=1.0,
+            )
+        )
+        await client.started.wait()
+        request.disconnected.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
         assert client.aborted == ["req-1"]
 
     asyncio.run(_drive())
