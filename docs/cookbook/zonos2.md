@@ -149,18 +149,20 @@ Use `--lang zh` for the Chinese split. See `benchmarks/README.md` for the full w
 
 ## Benchmark Results
 
-Seed-TTS-Eval EN (1088/1088 successful), 1× H100, concurrency 16, `--ref-format references`,
-`fp8 + frame_graph + async_decode + compile_sampler`. WER scored with whisper-large-v3 +
-`EnglishTextNormalizer` + jiwer (the CI gate in `tests/test_model/test_zonos2_tts_ci.py` also
-checks the Qwen3-ASR router; both agree ~1.3–1.5%). Means over 2 runs — seed-tts generation is
-unseeded, so per-run corpus WER varies ~±0.15pt.
+Seed-TTS-Eval **full sets** (EN 1088 / ZH 2020), 1× H100, concurrency 16, cold full clock,
+`--ref-format references`, `fp8 + frame_graph + async_decode + compile_sampler`. Scored with
+**Qwen3-ASR-1.7B** (the CI scorer; EN word-WER, ZH char-CER). **Median WER/CER is 0% for every
+config** — the corpus numbers below are inflated by a few catastrophic-collapse samples from
+unseeded sampling (EN ≤3/1088, ZH 9–16/2020), so cross-config corpus deltas are run noise, not
+config differences (excluding those, corpus is EN ~1.3% / ZH ~1.4–1.7%). All EN configs clear the
+<2% gate.
 
 | Config | WER (corpus) | RTF mean | Throughput (qps) |
 |---|---|---|---|
-| non-streaming | ~1.3% | 0.68 | 6.3 |
-| streaming, `stream_emit_chunk_frames=1` | ~1.4% | 0.92 | 4.6 |
-| **streaming, adaptive `24→32` (default)** | ~1.5% | **0.75** | **5.7** |
-| streaming, 2-GPU (`multi_gpu`) + emit=32 | ~1.5% | 0.69 | 6.5 |
+| non-streaming | 1.7% | 0.69 | 6.2 |
+| streaming, `stream_emit_chunk_frames=1` | 1.4% | 0.92 | 4.6 |
+| **streaming, adaptive `24→32` (default)** | 1.3% | **0.77** | **5.6** |
+| streaming, 2-GPU (`multi_gpu`) | 1.5% | 0.69 | 6.2 |
 
 ### Streaming throughput (`stream_emit_chunk_frames`)
 
@@ -176,8 +178,10 @@ first-audio latency low, the default also emits a **smaller first chunk**
 `stream_emit_chunk_frames=1` for the lowest-latency per-frame streaming. The 2-GPU `multi_gpu`
 pipeline (codec + speaker encoder on `cuda:1`) stacks on top for the best streaming RTF (~0.69).
 
-> ZH (`--lang zh`, 2020 samples) tracks the same RTF/throughput pattern; CER stays flat across
-> the streaming configs (the coalescing is audio-neutral after the `on_stream_done` tail fix).
+> ZH (`--lang zh`, full 2020) — Qwen3-ASR corpus CER 1.8–3.0% (median 0%; the corpus reflects a
+> 9–16/2020 catastrophic-sample tail, not config differences — excluding those, ~1.4–1.7%).
+> Non-streaming RTF ~0.62–0.64, streaming ~0.65–0.72; coalescing is audio-neutral after the
+> `on_stream_done` tail fix.
 
 ## Known Limitations
 
