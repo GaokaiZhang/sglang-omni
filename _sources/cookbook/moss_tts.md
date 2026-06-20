@@ -1,13 +1,19 @@
 # MOSS-TTS
 
-[MOSS-TTS-v1.5](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-v1.5) is a discrete
-multi-codebook text-to-speech model from the OpenMOSS team. It pairs a Qwen3 language-model
-backbone with 32 residual-vector-quantization (RVQ) audio codebooks scheduled in a **delay
-pattern** (one text channel plus 32 audio channels, advanced one codebook per frame). It clones
-a voice from a short reference clip, can synthesize without a reference, supports inline
-duration control, and the vocoder reconstructs 24 kHz speech. In SGLang-Omni it runs as a
-`preprocessing → tts_engine → vocoder` pipeline and is served through the OpenAI-compatible
-`/v1/audio/speech` endpoint.
+[MOSS-TTS-v1.5](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-v1.5) is a delay-pattern text-to-speech model from MOSI.AI and the OpenMOSS team. It reconstructs **24 kHz** speech and supports zero-shot voice cloning from reference audio, reference-less synthesis, long-form speech generation, streaming, token-level duration control, Pinyin/IPA pronunciation control, multilingual synthesis, and code-switching. The model supports **31 languages**, accepts language tags to guide multilingual generation, and supports inline pause markers such as `[pause 3.2s]` for explicit prosody control.
+
+![MOSS-TTS delay-pattern architecture](../_static/image/moss-tts-arch-delay.png)
+
+Architecturally, MOSS-TTS-v1.5 is the `delay-pattern` counterpart to [MOSS-TTS-Local-Transformer-v1.5](moss_tts_local.md). The Qwen3-8B backbone predicts one text stream plus 32 residual-vector-quantization (RVQ) audio codebooks with delay-pattern scheduling; the generated codes are de-delayed and reconstructed into waveform by the vocoder. In SGLang-Omni it runs as a `preprocessing → tts_engine → vocoder` pipeline served through the OpenAI-compatible `/v1/audio/speech` endpoint.
+
+| Component | Spec |
+|---|---|
+| Architecture | `MossTTSDelayModel` (`moss_tts_delay`) |
+| Backbone | Qwen3-8B autoregressive decoder (36 L, hidden=4096, GQA 32/8) |
+| Audio tokens | 32-codebook RVQ depth with delay-pattern scheduling |
+| Output audio | 24 kHz |
+| Languages | 31 languages with optional language tags |
+| Controls | Voice reference, target duration tokens, Pinyin/IPA, pause markers, style instructions |
 
 ## Prerequisites
 
@@ -96,8 +102,8 @@ URL, or a base64 **data URI** (`data:audio/wav;base64,<...>`, decoded with `soun
 
 ### Streaming
 
-Set `"stream": true` to receive Server-Sent Events (SSE). Audio events carry base64-encoded WAV
-bytes in `audio.data`; the final metadata event has `audio: null`, followed by `data: [DONE]`.
+Set `"stream": true` and `"response_format": "pcm"` to receive raw PCM audio
+chunks in real time.
 
 ```bash
 curl -N -X POST http://localhost:8000/v1/audio/speech \
@@ -106,8 +112,10 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
     "input": "Get the trust fund to the bank early.",
     "ref_audio": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
     "ref_text": "We asked over twenty different people, and they all said it was his.",
-    "stream": true
-  }'
+    "stream": true,
+    "response_format": "pcm"
+  }' \
+  --output output.pcm
 ```
 
 ### Duration Control
@@ -136,7 +144,6 @@ to let the model infer from the text):
   "input": "今天天气不错 [pause 0.5s] 就该出去晒晒太阳。",
   "ref_audio": "...", "ref_text": "...",
   "language": "Chinese",
-  "instructions": "Speak slowly and warmly."
 }
 ```
 
@@ -147,7 +154,7 @@ to let the model infer from the text):
 | `input` | (required) | Text to synthesize; may carry a `${token:N}` duration prefix and inline markup |
 | `references` | `null` | Reference clip for cloning; each item has `audio_path` and `text` |
 | `ref_audio` / `ref_text` | `null` | Shorthand for `references[0].audio_path` / `references[0].text` |
-| `stream` | `false` | Enable SSE streaming |
+| `stream` | `false` | Stream raw PCM audio chunks |
 | `language` | `null` | Optional target-language hint; omit to let the model infer |
 | `instructions` / `instruct` | `null` | Optional free-text style directive |
 | `token_count` / `duration_tokens` / `tokens` | `null` | Target duration in codec frames; must be `> 0` |
