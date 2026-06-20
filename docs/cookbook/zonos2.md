@@ -159,7 +159,7 @@ unseeded, so per-run corpus WER varies ~±0.15pt.
 |---|---|---|---|
 | non-streaming | ~1.3% | 0.68 | 6.3 |
 | streaming, `stream_emit_chunk_frames=1` | ~1.4% | 0.92 | 4.6 |
-| **streaming, `stream_emit_chunk_frames=32` (default)** | ~1.5% | **0.77** | **5.6** |
+| **streaming, adaptive `24→32` (default)** | ~1.5% | **0.75** | **5.7** |
 | streaming, 2-GPU (`multi_gpu`) + emit=32 | ~1.5% | 0.69 | 6.5 |
 
 ### Streaming throughput (`stream_emit_chunk_frames`)
@@ -167,9 +167,12 @@ unseeded, so per-run corpus WER varies ~±0.15pt.
 In streaming mode the AR engine pushes sampled frames to the vocoder over an in-process queue.
 By default the engine **coalesces `stream_emit_chunk_frames=32` frames into one message** instead
 of one `put()` per frame; the per-frame puts run on the resolve host loop and serialize against
-the next decode launch, so batching them gives **−17% streaming RTF and +22% throughput,
-WER-neutral**, vs the per-frame path. The cost is ~0.09 s higher time-to-first-chunk and coarser
-per-chunk granularity (inter-chunk latency actually improves, 0.37 s → 0.23 s). Set
+the next decode launch, so batching them gives **−17% streaming RTF and +21% throughput,
+WER-neutral**, vs the per-frame path (inter-chunk latency also improves, 0.37 s → 0.28 s). To keep
+first-audio latency low, the default also emits a **smaller first chunk**
+(`stream_emit_first_chunk_frames=24`), so time-to-first-chunk stays at the per-frame level
+(~0.30 s) instead of waiting for a full 32-frame batch (which would add ~0.09 s). Set
+`stream_emit_first_chunk_frames=0` to disable the adaptive first chunk, or
 `stream_emit_chunk_frames=1` for the lowest-latency per-frame streaming. The 2-GPU `multi_gpu`
 pipeline (codec + speaker encoder on `cuda:1`) stacks on top for the best streaming RTF (~0.69).
 
