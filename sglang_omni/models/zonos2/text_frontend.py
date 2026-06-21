@@ -13,10 +13,11 @@ import logging
 import os
 import re
 import threading
-from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
+
+from sglang_omni.scheduling.stage_cache import StageOutputCache
 
 logger = logging.getLogger(__name__)
 
@@ -129,11 +130,11 @@ _MOSES_POSTPROCESS_LANGS = {"en", "zh", "ja", "ko"}
 _NORMALIZER = None
 
 # note (Yue Yin): normalize_text is a pure function of (text, language), so an
-# LRU spares the NeMo FST pipeline on repeated prompts (batched evals, retries).
-# Cap mirrors the speaker-encoder cache (256).
-_NORMALIZE_CACHE: "OrderedDict[tuple[str, str], str]" = OrderedDict()
+# LRU on the shared StageOutputCache spares the NeMo FST pipeline on repeated
+# prompts (batched evals, retries). Cap mirrors the speaker-encoder cache (256);
+# StageOutputCache is not internally locked, so keep the module lock.
+_NORMALIZE_CACHE = StageOutputCache(max_size=256, cache_device="cpu")
 _NORMALIZE_CACHE_LOCK = threading.Lock()
-_NORMALIZE_CACHE_MAX = 256
 
 
 # Set once by the preprocessing stage from its ``tts_norm_cache_dir`` factory arg
@@ -275,7 +276,6 @@ def normalize_text(text: str, language: str | None) -> str:
     with _NORMALIZE_CACHE_LOCK:
         cached = _NORMALIZE_CACHE.get(key)
         if cached is not None:
-            _NORMALIZE_CACHE.move_to_end(key)
             return cached
     normalizer = _get_normalizer()
     if normalizer is None:
@@ -287,10 +287,7 @@ def normalize_text(text: str, language: str | None) -> str:
     if not (isinstance(result, str) and result.strip()):
         result = text
     with _NORMALIZE_CACHE_LOCK:
-        _NORMALIZE_CACHE[key] = result
-        _NORMALIZE_CACHE.move_to_end(key)
-        while len(_NORMALIZE_CACHE) > _NORMALIZE_CACHE_MAX:
-            _NORMALIZE_CACHE.popitem(last=False)
+        _NORMALIZE_CACHE.put(key, result)
     return result
 
 

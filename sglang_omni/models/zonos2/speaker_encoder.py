@@ -12,7 +12,6 @@ import io
 import subprocess
 import threading
 import wave
-from collections import OrderedDict
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -22,6 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 from transformers import AutoModel
+
+from sglang_omni.scheduling.stage_cache import StageOutputCache
 
 SPEAKER_EMBEDDING_DIM = 2048
 
@@ -208,16 +209,24 @@ class SpeakerEncoder:
         cache_max_items: int = 256,
         compile_forward: bool = False,
     ):
+        if int(cache_max_items) < 1:
+            raise ValueError(f"cache_max_items must be >= 1, got {cache_max_items}")
         self.device = device
         self.cache_max_items = int(cache_max_items)
         self._embedder: Qwen3SpeakerEmbedding | None = None
-        self._cache: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+        # note (Yue Yin): content-hash LRU of [2048] embeddings on the shared
+        # StageOutputCache. Entries are fixed-size so the count cap is the budget;
+        # batched encode + single-flight dedup are deferred to #809.
+        self._cache = StageOutputCache(
+            max_size=self.cache_max_items, cache_device="cpu"
+        )
         self._last_fingerprint: str | None = None
         # note (Yue Yin): opt-in compile kill-switch (default OFF for bit-for-bit
         # parity); driven by the speaker_encode stage's spk_compile factory arg.
         self._compile = compile_forward
         # note (Yue Yin): max_concurrency=4 dispatches encode() across threads that
-        # share one CUDA model + one LRU; serialize the body to keep it re-entrant.
+        # share one CUDA model + one cache; serialize the body to keep it re-entrant
+        # (StageOutputCache is not internally locked).
         self._lock = threading.Lock()
 
     def _get_embedder(self) -> Qwen3SpeakerEmbedding:
@@ -292,8 +301,8 @@ class SpeakerEncoder:
             self._last_fingerprint = key
             cached = self._cache.get(key)
             if cached is not None:
-                self._cache.move_to_end(key)
-                # clone so callers can't mutate the cached tensor
+                # clone so callers can't mutate the cached tensor (get() already
+                # refreshes LRU recency)
                 return cached.clone()
             embedder = self._get_embedder()
 
@@ -302,10 +311,10 @@ class SpeakerEncoder:
         emb = self._select_embedding(output)
 
         # note (Yue Yin): benign race -- two threads with the same key both
-        # compute and the second _cache_put overwrites; the forward is
-        # deterministic so the emb is identical and the cache stays correct.
+        # compute and the second put() overwrites; the forward is deterministic
+        # so the emb is identical and the cache stays correct.
         with self._lock:
-            self._cache_put(key, emb)
+            self._cache.put(key, emb)
         return emb.clone()
 
     def fingerprint(self) -> str | None:
@@ -332,9 +341,3 @@ class SpeakerEncoder:
             f"{SPEAKER_EMBEDDING_DIM}, but speaker encoder produced "
             f"{', '.join(str(c.numel()) for c in candidates)}."
         )
-
-    def _cache_put(self, key: str, emb: torch.Tensor) -> None:
-        self._cache[key] = emb
-        self._cache.move_to_end(key)
-        while len(self._cache) > self.cache_max_items:
-            self._cache.popitem(last=False)
