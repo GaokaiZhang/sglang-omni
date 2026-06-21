@@ -51,10 +51,10 @@ def _stages(*, codec_device: str, speaker_device: str) -> list[StageConfig]:
             factory_args={
                 "gpu_id": 0,
                 "dtype": "bfloat16",
-                "fp8": False,
-                "frame_graph": False,
-                "compile_sampler": False,
-                "async_decode": False,
+                "fp8": True,
+                "frame_graph": True,
+                "compile_sampler": True,
+                "async_decode": True,
                 "stream_emit_chunk_frames": 32,
                 "stream_emit_first_chunk_frames": 24,
             },
@@ -101,6 +101,12 @@ class Zonos2PipelineConfig(PipelineConfig):
     @classmethod
     def talker_sglang_role_to_stage(cls) -> dict[str, str]:
         return {"talker": "tts_engine"}
+
+    @classmethod
+    def generation_sglang_role_to_stage(cls) -> dict[str, str]:
+        # lets the serve CLI --max-running-requests / --cuda-graph-max-bs flags
+        # target the AR engine for single-card throughput tuning.
+        return {"generation": "tts_engine"}
 
     model_path: str
     stages: list[StageConfig] = Field(
