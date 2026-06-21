@@ -89,11 +89,6 @@ def store_state(payload: StagePayload, state: S2ProState) -> StagePayload:
     return payload
 
 
-# ---------------------------------------------------------------------------
-# Preprocessing — returns callable
-# ---------------------------------------------------------------------------
-
-
 def create_preprocessing_executor(
     model_path: str,
     *,
@@ -201,11 +196,6 @@ def create_preprocessing_executor(
         return store_state(payload, state)
 
     return ThreadedSimpleScheduler(_preprocess, max_concurrency=max_concurrency)
-
-
-# ---------------------------------------------------------------------------
-# TTS Engine — returns OmniScheduler
-# ---------------------------------------------------------------------------
 
 
 def create_sglang_tts_engine_executor(
@@ -327,11 +317,6 @@ def create_sglang_tts_engine_executor(
         max_new_tokens=max_new_tokens,
     )
     return scheduler
-
-
-# ---------------------------------------------------------------------------
-# Vocoder — returns callable
-# ---------------------------------------------------------------------------
 
 
 def create_vocoder_executor(

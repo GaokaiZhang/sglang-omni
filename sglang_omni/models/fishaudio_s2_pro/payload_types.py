@@ -42,8 +42,6 @@ class S2ProState:
     audio_samples: Any | None = None
     sample_rate: int = 44100
 
-    # -- Helpers -----------------------------------------------------------
-
     @staticmethod
     def _tensor_to_list(t: Any) -> Any:
         if isinstance(t, torch.Tensor):
