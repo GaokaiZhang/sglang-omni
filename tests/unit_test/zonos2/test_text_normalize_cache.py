@@ -8,7 +8,7 @@ so no NeMo/FST grammars are loaded.
 """
 
 from sglang_omni.models.zonos2 import text_frontend
-from sglang_omni.models.zonos2.text_frontend import normalize_text
+from sglang_omni.models.zonos2.components.text_frontend import normalize_text
 
 
 class _CountingNormalizer:

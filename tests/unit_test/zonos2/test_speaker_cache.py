@@ -15,7 +15,7 @@ pytest.importorskip("transformers")
 
 import torch  # noqa: E402
 
-from sglang_omni.models.zonos2.speaker_encoder import (  # noqa: E402
+from sglang_omni.models.zonos2.components.speaker_encoder import (  # noqa: E402
     SPEAKER_EMBEDDING_DIM,
     SpeakerEncoder,
 )

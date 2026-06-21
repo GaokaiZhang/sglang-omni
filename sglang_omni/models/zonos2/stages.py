@@ -29,7 +29,7 @@ from sglang_omni.models.zonos2.request_builders import (
     build_zonos2_state,
     ref_audio_to_encoder_input,
 )
-from sglang_omni.models.zonos2.text_frontend import (
+from sglang_omni.models.zonos2.components.text_frontend import (
     build_prompt_rows,
     configure_tts_norm_cache_root,
 )
@@ -100,7 +100,7 @@ def create_speaker_encode_executor(
     spk_compile: bool = False,
     **_: Any,
 ) -> SimpleScheduler:
-    from sglang_omni.models.zonos2.speaker_encoder import SpeakerEncoder
+    from sglang_omni.models.zonos2.components.speaker_encoder import SpeakerEncoder
 
     encoder = SpeakerEncoder(
         device=device,
@@ -130,7 +130,7 @@ def create_vocoder_executor(
     vocoder_warmup: bool = False,
     **_: Any,
 ) -> Any:
-    from sglang_omni.models.zonos2.streaming_vocoder import (
+    from sglang_omni.models.zonos2.components.streaming_vocoder import (
         Zonos2StreamingVocoderScheduler,
         decode_batch,
         decode_to_pcm,
@@ -414,7 +414,7 @@ def create_sglang_omni_tts_engine_executor(
     # (otherwise eager in the runner). Captured per decode bucket with the default
     # sampling params; the runner falls back to eager for other params.
     if frame_graph:
-        from sglang_omni.models.zonos2.text_frontend import TTSSamplingParams
+        from sglang_omni.models.zonos2.components.text_frontend import TTSSamplingParams
 
         model.capture_tail_graphs(cg_bs, TTSSamplingParams())
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import torch
 
-from .payload_types import N_CODEBOOKS, ZONOS2_SAMPLE_RATE
+from ..payload_types import N_CODEBOOKS, ZONOS2_SAMPLE_RATE
 
 DAC_HOP_LENGTH = 512
 # eoa_id=1024, audio_pad_id=1025 are sentinels, not real codes; clamp >=1024 before decode.
