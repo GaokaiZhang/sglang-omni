@@ -103,6 +103,14 @@ def _install_tuned_moe_configs() -> None:
         pass
 
 
+def _cuda_graph_buckets(max_bs: int) -> list[int]:
+    """Power-of-two decode buckets up to max_bs (+ max_bs itself)."""
+    bs = [b for b in (1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256) if b <= max_bs]
+    if not bs or bs[-1] != max_bs:
+        bs.append(max_bs)
+    return bs
+
+
 def create_sglang_omni_tts_engine_executor(
     model_path: str,
     *,
@@ -115,6 +123,9 @@ def create_sglang_omni_tts_engine_executor(
     async_decode: bool = False,
     stream_emit_chunk_frames: int = 1,
     stream_emit_first_chunk_frames: int = 0,
+    max_running_requests: int = 16,
+    cuda_graph_max_bs: int = 16,
+    server_args_overrides: dict | None = None,
     **_: Any,
 ) -> Any:
     from sglang_omni.models.zonos2.model_runner import Zonos2ModelRunner
@@ -134,6 +145,15 @@ def create_sglang_omni_tts_engine_executor(
     shim = _build_config_shim(model_path, cfg)
     gpu = int(gpu_id) if gpu_id is not None else 0
 
+    # note (Yue Yin): concurrency knobs (generic generation-stage override from the
+    # serve CLI arrives as server_args_overrides). Higher max_running_requests +
+    # cuda_graph_max_bs raise single-card throughput at the cost of per-request RTF;
+    # decode buckets scale with cuda_graph_max_bs so large batches stay graph-captured.
+    sao = dict(server_args_overrides or {})
+    mrr = int(sao.pop("max_running_requests", max_running_requests))
+    cg_max = int(sao.pop("cuda_graph_max_bs", cuda_graph_max_bs))
+    cg_bs = _cuda_graph_buckets(cg_max)
+
     # Opt-in dynamic FP8 on the MoE experts (bf16 -> fp8 at load, halving the
     # expert weights); bf16 nn.Linear projections are unaffected. Off by default;
     # needs sm80+ (native fp8 tensor-core speedup on Hopper/Ada).
@@ -144,17 +164,18 @@ def create_sglang_omni_tts_engine_executor(
         context_length=cfg.max_seqlen,
         dtype=dtype,
         disable_cuda_graph=False,
-        cuda_graph_bs=[1, 2, 4, 8, 16],
-        cuda_graph_max_bs=16,
+        cuda_graph_bs=cg_bs,
+        cuda_graph_max_bs=cg_max,
         # async-decode lookahead overlaps the resolve D2H with the next forward;
         # the overlap scheduler must be enabled for it (opt-in via async_decode).
         disable_overlap_schedule=not async_decode,
         enable_torch_compile=True,
-        max_running_requests=16,
+        max_running_requests=mrr,
         mem_fraction_static=mem_fraction_static,
         sampling_backend="pytorch",
         trust_remote_code=True,
         **fp8_kwargs,
+        **sao,
     )
     # Note:(Chenchen Hong) per-frame feedback/EOS state has no rollback, so a
     # non-final chunked-prefill chunk would queue a spurious frame; disable
@@ -189,7 +210,7 @@ def create_sglang_omni_tts_engine_executor(
     if frame_graph:
         from sglang_omni.models.zonos2.text_frontend import TTSSamplingParams
 
-        model.capture_tail_graphs([1, 2, 4, 8, 16], TTSSamplingParams())
+        model.capture_tail_graphs(cg_bs, TTSSamplingParams())
 
     output_proc = SGLangOutputProcessor(
         capture_hidden=False, capture_hidden_layers=None, model=model
