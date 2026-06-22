@@ -365,8 +365,7 @@ def create_sglang_omni_tts_engine_executor(
     # needs sm80+ (native fp8 tensor-core speedup on Hopper/Ada).
     fp8_kwargs = {"quantization": "fp8"} if fp8 else {}
 
-    server_args = build_sglang_server_args(
-        shim,
+    sa_kwargs = dict(
         context_length=cfg.max_seqlen,
         dtype=dtype,
         disable_cuda_graph=False,
@@ -381,8 +380,12 @@ def create_sglang_omni_tts_engine_executor(
         sampling_backend="pytorch",
         trust_remote_code=True,
         **fp8_kwargs,
-        **sao,
     )
+    # note (Yue Yin): remaining server_args_overrides (e.g. mem_fraction_static from
+    # --mem-fraction-static) win over the defaults via update -- avoids a duplicate
+    # keyword when an override collides with an explicit kwarg above.
+    sa_kwargs.update(sao)
+    server_args = build_sglang_server_args(shim, **sa_kwargs)
     # Note:(Chenchen Hong) per-frame feedback/EOS state has no rollback, so a
     # non-final chunked-prefill chunk would queue a spurious frame; disable
     # chunking after construction (mirrors the Qwen3-Omni talker).
