@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-from sglang_omni.models.zonos2 import sglang_stages
+from sglang_omni.models.zonos2 import stages as sglang_stages
 from sglang_omni.models.zonos2.config import Zonos2PipelineConfig
 
 
@@ -85,7 +85,7 @@ def test_zonos2_tts_engine_disables_chunked_prefill(monkeypatch) -> None:
         "sglang_omni.models.zonos2.model_runner.Zonos2ModelRunner", FakeModelRunner
     )
     monkeypatch.setattr(
-        "sglang_omni.models.zonos2.sglang_request_builders."
+        "sglang_omni.models.zonos2.request_builders."
         "make_zonos2_scheduler_adapters",
         lambda model: (None, None),
     )

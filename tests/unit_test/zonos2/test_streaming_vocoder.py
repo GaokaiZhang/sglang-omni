@@ -25,7 +25,7 @@ from sglang_omni.models.zonos2.payload_types import (
     ZONOS2_SAMPLE_RATE,
     Zonos2State,
 )
-from sglang_omni.models.zonos2.streaming_vocoder import (
+from sglang_omni.models.zonos2.components.streaming_vocoder import (
     DAC_HOP_LENGTH,
     Zonos2StreamingVocoderScheduler,
 )

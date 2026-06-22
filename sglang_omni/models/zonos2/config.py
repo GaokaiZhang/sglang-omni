@@ -47,7 +47,7 @@ def _stages(*, codec_device: str, speaker_device: str) -> list[StageConfig]:
         StageConfig(
             name="tts_engine",
             process="pipeline",
-            factory=f"{_PKG}.sglang_stages.create_sglang_omni_tts_engine_executor",
+            factory=f"{_PKG}.stages.create_sglang_omni_tts_engine_executor",
             factory_args={
                 "gpu_id": 0,
                 "dtype": "bfloat16",

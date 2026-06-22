@@ -15,9 +15,9 @@ from typing import Any
 import torch
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.zonos2 import callbacks
 from sglang_omni.models.zonos2.radix_hash import EOS_SENTINEL, poly_row_hash
 from sglang_omni.models.zonos2.sampler import sample_tts
-from sglang_omni.scheduling.messages import OutgoingMessage
 
 
 class Zonos2ModelRunner(ModelRunner):
@@ -71,101 +71,22 @@ class Zonos2ModelRunner(ModelRunner):
     def set_stream_outbox(self, outbox: Any) -> None:
         self._outbox = outbox
 
-    def post_process_outputs(self, result, scheduler_output, outputs) -> None:
-        # note (Yue Yin): additive stream hook — push each newly sampled delayed
-        # [9] row to the vocoder; reads the already-CPU output_codes and never
-        # touches the decode/EOS/feedback state.
-        # When stream_emit_chunk_frames > 1, coalesce the newly sampled rows into
-        # one [k, 9] message instead of one put() per row: the per-frame puts run
-        # on the resolve host loop and serialize against the next launch, defeating
-        # the async_decode D2H overlap. Same rows in the same order reach the OLA
-        # decoder, so the audio is unchanged — only the message grouping differs.
-        del result, outputs
-        if self._outbox is None:
-            return
-        chunk = self._stream_emit_chunk_frames
-        for sched_req in scheduler_output.requests:
-            data = sched_req.data
-            stream_metadata = getattr(data, "stream_metadata", None)
-            if stream_metadata is None:
-                continue
-            done = False
-            req = getattr(data, "req", None)
-            if req is not None:
-                finished = getattr(req, "finished", None)
-                done = (callable(finished) and finished()) or bool(
-                    getattr(req, "is_retracted", False)
-                )
-            codes = data.output_codes
-            start = int(data._stream_emit_idx)
-            n_new = len(codes) - start
-            if n_new <= 0:
-                continue
-            if chunk == 1:
-                # Legacy per-frame path (byte-identical default): one put per row;
-                # a finishing step's tail is left to the on_stream_done flush.
-                if done:
-                    continue
-                for row in codes[start:]:
-                    self._outbox.put(
-                        OutgoingMessage(
-                            request_id=sched_req.request_id,
-                            type="stream",
-                            target="vocoder",
-                            data=row.clone(),
-                            metadata=stream_metadata,
-                        )
-                    )
-                data._stream_emit_idx = len(codes)
-                continue
-            # Coalesced path: hold rows until >= threshold have accumulated, but
-            # always flush the remainder on finish so the OLA decoder receives every
-            # row (on_stream_done's eos_frame cap trims the tail to the aligned
-            # length). Adaptive: the FIRST chunk uses a smaller threshold so the
-            # first audio is produced sooner (lower TTFC); steady chunks use `chunk`.
-            first = self._stream_emit_first_chunk_frames
-            threshold = first if (first > 0 and start == 0) else chunk
-            if not done and n_new < threshold:
-                continue
-            rows = torch.stack(list(codes[start:]), dim=0)
-            self._outbox.put(
-                OutgoingMessage(
-                    request_id=sched_req.request_id,
-                    type="stream",
-                    target="vocoder",
-                    data=rows.clone(),
-                    metadata=stream_metadata,
-                )
-            )
-            data._stream_emit_idx = len(codes)
+    # ---- FeedbackAR hooks: model-specific bodies live in callbacks.py ----
 
-    # ---- input embeddings ----
+    def post_process_outputs(self, result, scheduler_output, outputs) -> None:
+        callbacks.extract_zonos2_output(self, result, scheduler_output, outputs)
 
     def custom_prefill_forward(self, forward_batch, schedule_batch, requests):
-        del schedule_batch
-        forward_batch.input_embeds = self._build_prefill_embeds(forward_batch, requests)
-        return None
+        return callbacks.zonos2_prefill_forward(
+            self, forward_batch, schedule_batch, requests
+        )
 
     def before_decode(
         self, forward_batch, schedule_batch, requests, *, is_lookahead=False
     ):
-        del schedule_batch, is_lookahead
-        bs = len(requests)
-        if bs == 0:
-            return
-        buf = self.model._decode_input_embedding.weight
-        # note (Yue Yin): gather each request's last feedback from its on-device
-        # pool row into the positional decode buffer (buf[i] = request i), instead
-        # of a per-request Python deque. Byte-identical: the deque held exactly the
-        # latest feedback the pool row now holds. Reconcile-release finished rows.
-        pool = self.model._decode_state_pool
-        pool.release_inactive({sr.request_id for sr in requests})
-        row_t = pool.prepare_active_rows(requests)
-        with torch.no_grad():
-            buf[:bs].copy_(pool.feedback_embeds[row_t])
-        # Decode reads the staged buffer by row index -> stable input for graph replay.
-        forward_batch.input_ids = torch.arange(bs, device=buf.device, dtype=torch.long)
-        forward_batch.input_embeds = None
+        return callbacks.write_zonos2_buffers(
+            self, forward_batch, schedule_batch, requests, is_lookahead=is_lookahead
+        )
 
     def _build_prefill_embeds(self, forward_batch, requests) -> torch.Tensor:
         model = self.model
