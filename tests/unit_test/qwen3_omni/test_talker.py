@@ -828,6 +828,7 @@ def _build_state_machine_scheduler(
     scheduler._deferred_request_payloads = {}
     scheduler._dirty_deferred_request_ids = set()
     scheduler._aborted_request_ids = set()
+    scheduler._aborted_request_id_order = deque()
     scheduler.waiting_queue = []
     scheduler._request_builder = request_builder_stub
     scheduler._request_admission_lock = threading.RLock()
@@ -960,6 +961,7 @@ def test_abort_filters_subsequent_stream_messages_via_recv_requests() -> None:
     """
     scheduler = object.__new__(QwenTalkerScheduler)
     scheduler._aborted_request_ids = set()
+    scheduler._aborted_request_id_order = deque()
     scheduler._pending_stream_chunks = {}
     scheduler._pending_stream_done = set()
     scheduler._deferred_request_payloads = {}

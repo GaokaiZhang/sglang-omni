@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 
 _FAILED_BATCH_RESULT = object()
 
+_ABORTED_REQUEST_ID_LIMIT = 10000
+_ABORTED_REQUEST_ID_RETAINED = 5000
+
 
 class _NoOpSender:
     """Stub for send_to_detokenizer — stream_output handles emission."""
@@ -370,6 +373,7 @@ class OmniScheduler:
 
         self._running = False
         self._aborted_request_ids: set[str] = set()
+        self._aborted_request_id_order: deque[str] = deque()
         self._pending_stream_chunks: dict[str, list[Any]] = {}
         self._pending_stream_done: set[str] = set()
         self._deferred_request_payloads: dict[str, Any] = {}
@@ -856,12 +860,13 @@ class OmniScheduler:
         the sync and async (resolve) paths. ``skip_rids`` suppresses emission
         for requests already finished in an earlier step (the lookahead
         overrun) — emitting their extra chunk would corrupt the downstream
-        vocoder's delayed-code stream."""
+        vocoder's delayed-code stream. Aborted requests are suppressed for the
+        same reason: an abort landing mid-step must not ship one more chunk."""
         if self._stream_output_builder is None:
             return
         for sched_req in sched_output.requests:
             rid = sched_req.request_id
-            if rid in skip_rids:
+            if rid in skip_rids or rid in self._aborted_request_ids:
                 continue
             req_output = mr_output.outputs[rid]
             emitted_any = False
@@ -1060,7 +1065,17 @@ class OmniScheduler:
             else False
         )
         with self._request_admission_lock:
-            self._aborted_request_ids.add(request_id)
+            if request_id not in self._aborted_request_ids:
+                if len(self._aborted_request_ids) >= _ABORTED_REQUEST_ID_LIMIT:
+                    # Evict oldest-first: a still-quiescing abort must survive.
+                    while (
+                        len(self._aborted_request_ids) >= _ABORTED_REQUEST_ID_RETAINED
+                    ):
+                        self._aborted_request_ids.discard(
+                            self._aborted_request_id_order.popleft()
+                        )
+                self._aborted_request_ids.add(request_id)
+                self._aborted_request_id_order.append(request_id)
             pending = self._pending_request_builds.pop(request_id, None)
             if pending is not None:
                 pending[2].cancel()

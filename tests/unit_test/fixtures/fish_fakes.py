@@ -46,6 +46,9 @@ def make_s2pro_payload(
 class FakeFishTokenizer:
     vocab_size = 512
 
+    def __len__(self) -> int:
+        return 640
+
     def __init__(self) -> None:
         self.additional_stop_token_ids: list[int] = []
         self.encoded_texts: list[str] = []
@@ -103,17 +106,11 @@ class FakeFishReq:
         is_chunked: int = 0,
         extend_input_len: int = 0,
         prefix_indices: list[int] | None = None,
-        decode_batch_idx: int = 0,
     ) -> None:
         self.rid = rid
         self.is_chunked = is_chunked
         self.extend_input_len = extend_input_len
         self.prefix_indices = prefix_indices or []
-        self.decode_batch_idx = decode_batch_idx
-        self.output_ids: list[int] = []
-
-    def finished(self) -> bool:
-        return False
 
 
 class FakeFishModel:
