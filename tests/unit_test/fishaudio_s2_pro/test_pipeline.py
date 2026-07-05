@@ -414,24 +414,19 @@ def _run_s2pro_engine_with_fake_buffers(
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
 
-    fake_omni_scheduler = ModuleType("sglang_omni.scheduling.omni_scheduler")
+    from sglang_omni.scheduling import omni_scheduler
 
     class _FakeOmniScheduler:
         def __init__(self, **kwargs: object) -> None:
             self.__dict__.update(kwargs)
 
-    fake_omni_scheduler.OmniScheduler = _FakeOmniScheduler
+    monkeypatch.setattr(omni_scheduler, "OmniScheduler", _FakeOmniScheduler)
 
     fake_model_runner = ModuleType("sglang_omni.models.fishaudio_s2_pro.model_runner")
     fake_model_runner.FishS2ProModelRunner = lambda *args, **kwargs: SimpleNamespace(
         args=args, kwargs=kwargs
     )
 
-    monkeypatch.setitem(
-        sys.modules,
-        "sglang_omni.scheduling.omni_scheduler",
-        fake_omni_scheduler,
-    )
     monkeypatch.setitem(
         sys.modules,
         "sglang_omni.models.fishaudio_s2_pro.model_runner",
