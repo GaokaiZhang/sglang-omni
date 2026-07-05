@@ -65,7 +65,7 @@ def _ref_vq_fingerprint(vq_parts: list | None) -> str | None:
         return None
     digest = hashlib.blake2b(digest_size=16)
     for part in vq_parts:
-        codes = part.to(torch.int32).contiguous()
+        codes = part.detach().to(device="cpu", dtype=torch.int32).contiguous()
         digest.update(str(tuple(codes.shape)).encode())
         digest.update(codes.numpy().tobytes())
     return digest.hexdigest()
