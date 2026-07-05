@@ -113,7 +113,7 @@ class StreamingVocoderBase(
     ) -> None:
         self._stream_states: dict[str, StreamStateT] = {}
         self._emitted_stream_ids: set[str] = set()
-        self._completed_stream_request_ids: set[str] = set()
+        self._completed_stream_request_ids: dict[str, None] = {}
         self._sample_rate = int(sample_rate)
         self._stream_source_hint = stream_source_hint or type(self).__name__
         super().__init__(
@@ -158,7 +158,7 @@ class StreamingVocoderBase(
         return bool(params.get("stream", False))
 
     def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
-        self._completed_stream_request_ids.discard(request_id)
+        self._completed_stream_request_ids.pop(request_id, None)
         state = self._get_or_create_stream_state(request_id)
         if state is None:
             return
@@ -268,7 +268,7 @@ class StreamingVocoderBase(
         self._emitted_stream_ids.add(request_id)
 
     def _record_completed_stream_request_id(self, request_id: str) -> None:
-        self._completed_stream_request_ids.add(request_id)
+        self._completed_stream_request_ids[request_id] = None
         if (
             len(self._completed_stream_request_ids)
             <= _COMPLETED_STREAM_REQUEST_ID_LIMIT
@@ -279,7 +279,7 @@ class StreamingVocoderBase(
             - _COMPLETED_STREAM_REQUEST_ID_RETAINED
         )
         for stale_request_id in list(self._completed_stream_request_ids)[:excess]:
-            self._completed_stream_request_ids.discard(stale_request_id)
+            del self._completed_stream_request_ids[stale_request_id]
 
     def _ingest_stream_item(
         self, request_id: str, item: StreamItem

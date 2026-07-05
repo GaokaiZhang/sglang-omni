@@ -21,6 +21,7 @@ import torch
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling import streaming_vocoder
 from sglang_omni.scheduling.streaming_vocoder import (
     INITIAL_CODEC_CHUNK_FRAMES_PARAM,
     StreamingVocoderBase,
@@ -394,6 +395,17 @@ def test_late_chunk_after_completed_stream_never_recreates_state() -> None:
     scheduler._on_streaming_new_request("r", _payload())
     scheduler._on_chunk("r", _item([3]))
     assert "r" in scheduler._stream_states
+
+
+def test_completed_stream_ids_evict_oldest_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(streaming_vocoder, "_COMPLETED_STREAM_REQUEST_ID_LIMIT", 3)
+    monkeypatch.setattr(streaming_vocoder, "_COMPLETED_STREAM_REQUEST_ID_RETAINED", 2)
+    scheduler = _FakeStreamingVocoder(threshold=1)
+    for rid in ("r0", "r1", "r2", "r3"):
+        scheduler._record_completed_stream_request_id(rid)
+    assert list(scheduler._completed_stream_request_ids) == ["r2", "r3"]
 
 
 def test_contract_latch_is_immutable_per_request() -> None:
