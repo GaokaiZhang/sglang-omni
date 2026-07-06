@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU contract tests for StreamingVocoderBase (TTS refactor M6, issue #661).
+"""CPU contract tests for StreamingVocoderBase.
 
 A fake subclass records every hook invocation so the tests can assert the base
 skeleton drives each lifecycle event (one-backbone guarantee): state-registry
@@ -544,8 +544,9 @@ def test_step_failure_aborts_every_participant() -> None:
     assert scheduler._stream_states == {}
     assert scheduler._is_aborted("a") and scheduler._is_aborted("b")
     assert "release:a" in scheduler.calls and "release:b" in scheduler.calls
-    # note (Gaokai Zhang): late chunks after the failed step stay dropped and must
-    # never recreate state (T9's lazy abort relies on this).
+    # Late chunks after the failed step stay dropped and must never recreate
+    # state: upstream AR stages abort lazily and can still deliver in-flight
+    # chunks for an already-aborted request.
     scheduler.calls.clear()
     scheduler.on_stream_chunk_batch([("a", _item([3]))])
     assert scheduler._stream_states == {}
@@ -579,11 +580,30 @@ def test_missing_coalescing_hooks_name_subclass() -> None:
         scheduler.on_stream_chunk("r", _item([1]))
 
 
-def test_stop_clears_registry_and_calls_serving_stop_hook() -> None:
+def test_stop_releases_live_streams_then_calls_serving_stop_hook() -> None:
     scheduler = _FakeStreamingVocoder(threshold=10)
-    scheduler._on_chunk("r", _item([1]))
-    assert "r" in scheduler._stream_states
+    scheduler._on_chunk("a", _item([1]))
+    scheduler._on_chunk("b", _item([2]))
+    states = dict(scheduler._stream_states)
     scheduler.stop()
     assert scheduler._stream_states == {}
     assert scheduler._emitted_stream_ids == set()
-    assert scheduler.calls[-1] == "serving_stop"
+    assert all(state.released for state in states.values())
+    assert scheduler.calls[-3:] == ["release:a", "release:b", "serving_stop"]
+
+
+def test_stop_release_failure_still_tears_down_session() -> None:
+    class _ExplodingVocoder(_FakeStreamingVocoder):
+        def release_stream_resources(
+            self, request_id: str, state: _FakeStreamState
+        ) -> None:
+            super().release_stream_resources(request_id, state)
+            if request_id == "a":
+                raise RuntimeError("release exploded")
+
+    scheduler = _ExplodingVocoder(threshold=10)
+    scheduler._on_chunk("a", _item([1]))
+    scheduler._on_chunk("b", _item([2]))
+    scheduler.stop()
+    assert scheduler._stream_states == {}
+    assert scheduler.calls[-3:] == ["release:a", "release:b", "serving_stop"]

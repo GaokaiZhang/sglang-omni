@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Streaming vocoder scheduler base (TTS refactor M6, issue #661).
+"""Streaming vocoder scheduler base.
 
 ``StreamingVocoderBase`` owns the request-local streaming-vocoder lifecycle
-that was duplicated across model schedulers:
+shared by model schedulers:
 
 - per-request state registry: created on first chunk/payload via
   ``create_stream_state``, popped by ``clear_stream_state``
@@ -11,13 +11,12 @@ that was duplicated across model schedulers:
   tensor type) with per-request contract latching via ``latch_stream_contract``
 - threshold-accumulate -> decode-delta -> emit ordering, wrapping waveforms in
   ``OutgoingMessage(type="stream", metadata={"modality": "audio"})``
-- request-level ``initial_codec_chunk_frames`` resolution (absorbed from the
-  former ``sglang_omni/models/tts_streaming.py``)
+- request-level ``initial_codec_chunk_frames`` resolution
 - ``on_stream_done`` sequencing: flush remainder -> final stream chunk ->
   terminal result -> state cleared
 - whole-utterance ``fallback_full_decode`` when nothing was emitted
-- abort -> ``release_stream_resources`` -> state pop; late chunks for
-  aborted/cleared request ids are dropped and never recreate state
+- abort and scheduler stop -> ``release_stream_resources`` -> state pop; late
+  chunks for aborted/cleared request ids are dropped and never recreate state
 - opt-in cross-request coalescing (``_can_batch_stream_chunks``) through
   ``select_step_participants`` / ``build_step_plan`` / ``run_step`` /
   ``on_step_failure``; a failed step errors and aborts all its participants
@@ -140,10 +139,20 @@ class StreamingVocoderBase(
             self._shutdown_stream_states()
 
     def _shutdown_stream_states(self) -> None:
-        """Clear the registry wholesale (no per-request release) then let the
-        subclass tear down session-level resources."""
+        """Release every live state through ``clear_stream_state`` (the same
+        path as completion/abort, so ``release_stream_resources`` runs), then
+        let the subclass tear down session-level resources. A failing release
+        is logged so the remaining states and ``on_serving_stop`` still run."""
         with self._state_lock:
-            self._stream_states.clear()
+            for request_id in list(self._stream_states):
+                try:
+                    self.clear_stream_state(request_id)
+                except Exception:
+                    logger.exception(
+                        "%s failed to release stream state for %s during shutdown",
+                        self._stream_source_hint,
+                        request_id,
+                    )
             self._emitted_stream_ids.clear()
             self._completed_stream_request_ids.clear()
             self.on_serving_stop()
@@ -427,7 +436,7 @@ class StreamingVocoderBase(
 
     def release_stream_resources(self, request_id: str, state: StreamStateT) -> None:
         """Release per-request resources (e.g. codec session slots); invoked
-        from ``clear_stream_state`` on completion and abort."""
+        from ``clear_stream_state`` on completion, abort, and scheduler stop."""
         del request_id, state
 
     def on_serving_start(self) -> None:
