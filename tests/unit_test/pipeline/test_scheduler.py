@@ -528,6 +528,86 @@ def test_omni_scheduler_emit_stream_output_skips_aborted_requests() -> None:
     assert scheduler.outbox.empty()
 
 
+def test_omni_scheduler_fish_abort_during_step_suppresses_chunk_and_result() -> None:
+    """A Fish abort landing mid-step defers per-request cleanup to the
+    upstream FINISH_ABORT path, leaves the buffered codes unconsumed, and
+    ships neither the pending stream chunk nor the terminal result."""
+    from sglang_omni.models.fishaudio_s2_pro.request_builders import (
+        make_tts_scheduler_adapters,
+    )
+    from tests.unit_test.fixtures.fish_fakes import (
+        FakeFishTokenizer,
+        make_s2pro_payload,
+    )
+
+    _, result_adapter, stream_output_builder = make_tts_scheduler_adapters(
+        tokenizer=FakeFishTokenizer()
+    )
+    adapted: list = []
+    cleaned: list = []
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.outbox = Queue()
+    scheduler.inbox = Queue()
+    scheduler._abort_callback = cleaned.append
+    scheduler._aborted_request_ids = set()
+    scheduler._aborted_request_id_order = deque()
+    scheduler._pending_stream_chunks = {}
+    scheduler._pending_stream_done = set()
+    scheduler._deferred_request_payloads = {}
+    scheduler._dirty_deferred_request_ids = set()
+    scheduler._first_emit_done = set()
+    scheduler._prefill_start_done = set()
+    scheduler._stream_output_builder = stream_output_builder
+    scheduler._result_adapter = (
+        lambda data: adapted.append(data) or result_adapter(data)
+    )
+    scheduler.waiting_queue = []
+    _init_sync_request_build_state(scheduler)
+
+    codes = torch.full((11, 1), 7, dtype=torch.long)
+    data = SimpleNamespace(
+        stage_payload=make_s2pro_payload(
+            request_id="req-fish", params={"stream": True}
+        ),
+        latest_stream_code_chunk=codes,
+        output_codes=[codes],
+    )
+    req = SimpleNamespace(
+        rid="req-fish",
+        to_finish=None,
+        finished=lambda: False,
+        req_pool_idx=1,
+        _omni_data=data,
+    )
+    batch = SimpleNamespace(reqs=[req], batch_is_full=True)
+    scheduler.running_batch = batch
+    scheduler.cur_batch = batch
+    scheduler.last_batch = None
+
+    scheduler.abort("req-fish")
+
+    assert req in batch.reqs
+    assert req.to_finish.to_json()["type"] == "abort"
+    assert cleaned == []
+
+    sched_output = SimpleNamespace(
+        requests=[SimpleNamespace(request_id="req-fish", data=data)]
+    )
+    mr_output = SimpleNamespace(outputs={"req-fish": object()})
+    scheduler._emit_stream_output(sched_output, mr_output)
+
+    assert scheduler.outbox.empty()
+    assert data.latest_stream_code_chunk is codes
+    assert len(data.output_codes) == 1 and data.output_codes[0] is codes
+
+    req.finished = lambda: True
+    scheduler.stream_output([req])
+
+    assert adapted == []
+    assert cleaned == ["req-fish"]
+    assert scheduler.outbox.empty()
+
+
 def test_omni_scheduler_abort_caps_aborted_id_set() -> None:
     """The aborted-id set is trimmed instead of growing without bound."""
     scheduler = object.__new__(OmniScheduler)
@@ -948,6 +1028,7 @@ def test_omni_scheduler_result_adapter_failure_emits_error_without_raise() -> No
     scheduler.outbox = Queue()
     scheduler.is_entry_rank = True
     scheduler.server_args = SimpleNamespace(weight_version=None)
+    scheduler._aborted_request_ids = set()
     scheduler._first_emit_done = {"req-adapter"}
     scheduler._prefill_start_done = {"req-adapter"}
 

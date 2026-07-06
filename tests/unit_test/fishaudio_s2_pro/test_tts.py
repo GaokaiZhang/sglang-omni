@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from queue import Queue
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,7 @@ from sglang_omni.models.fishaudio_s2_pro.request_builders import (
     validate_s2pro_top_k,
 )
 from sglang_omni.models.fishaudio_s2_pro.sglang_model import S2ProSGLangTextModel
+from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.types import SchedulerRequest
 from tests.unit_test.fixtures.fish_fakes import (
     FakeFishModel,
@@ -620,6 +622,42 @@ def test_fish_tts_result_adapter_maps_finish_reason_and_engine_time() -> None:
 
     data.finish_reason = None
     assert result_adapter(data).data["finish_reason"] == "stop"
+
+
+def test_fish_req_hits_max_new_tokens_and_scheduler_reports_length() -> None:
+    """Budget exhaustion runs the upstream length path end-to-end: the Req
+    finishes with FINISH_LENGTH and the scheduler maps it onto the terminal
+    Fish payload."""
+    request_builder, result_adapter, _ = make_tts_scheduler_adapters(
+        tokenizer=FakeFishTokenizer()
+    )
+    data = request_builder(
+        make_s2pro_payload(make_s2pro_state(max_new_tokens=2), request_id="req-length")
+    )
+    req = data.req
+    req._omni_data = data
+
+    for value in (200, 201):
+        assert not req.finished()
+        req.output_ids.append(value)
+        data.output_codes.append(torch.tensor([[value], [5]], dtype=torch.long))
+        req.check_finished()
+    assert req.finished()
+
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.outbox = Queue()
+    scheduler._aborted_request_ids = set()
+    scheduler._first_emit_done = set()
+    scheduler._prefill_start_done = set()
+    scheduler._result_adapter = result_adapter
+    scheduler.server_args = SimpleNamespace(weight_version=None)
+
+    scheduler.stream_output([req])
+
+    message = scheduler.outbox.get_nowait()
+    assert message.type == "result"
+    assert message.data.data["finish_reason"] == "length"
+    assert message.data.data["completion_tokens"] == 2
 
 
 def test_fish_tts_result_adapter_raises_for_empty_codes() -> None:

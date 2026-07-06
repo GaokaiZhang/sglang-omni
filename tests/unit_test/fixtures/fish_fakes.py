@@ -45,6 +45,7 @@ def make_s2pro_payload(
 
 class FakeFishTokenizer:
     vocab_size = 512
+    eos_token_id = 99
 
     def __len__(self) -> int:
         return 640

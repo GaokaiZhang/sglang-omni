@@ -971,6 +971,21 @@ class OmniScheduler:
                 continue
 
             rid = req.rid
+            if rid in self._aborted_request_ids:
+                # An abort landing mid-step finishes here via FINISH_ABORT: run
+                # the per-request cleanup abort() deferred (callbacks are
+                # idempotent) and drop the stale terminal result so it cannot
+                # resurrect the request downstream.
+                if self._abort_callback is not None:
+                    try:
+                        self._abort_callback(rid)
+                    except Exception:
+                        logger.exception(
+                            "OmniScheduler: abort cleanup failed for %s", rid
+                        )
+                self._first_emit_done.discard(rid)
+                self._prefill_start_done.discard(rid)
+                continue
 
             # Build result payload from the Req
             data = req._omni_data

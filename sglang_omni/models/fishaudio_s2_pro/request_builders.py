@@ -23,7 +23,7 @@ class S2ProSGLangRequestData(SGLangARRequestData):
     """S2-Pro per-request state."""
 
     vq_mask_tokens: Any = None
-    vq_parts: list | None = None
+    vq_parts: list[torch.Tensor] | None = None
     num_codebooks: int = 10
     codebook_size: int = 4096
     output_codes: list[torch.Tensor] = field(default_factory=list)
@@ -57,7 +57,7 @@ def validate_s2pro_top_k(top_k: int) -> None:
         )
 
 
-def _ref_vq_fingerprint(vq_parts: list | None) -> str | None:
+def _ref_vq_fingerprint(vq_parts: list[torch.Tensor] | None) -> str | None:
     # note (Gaokai Zhang) only cb0 of the ref VQ codes becomes prompt token ids;
     # cb1..N ride in as embeddings, so extra_key must hash all codebooks to keep
     # same-cb0 prompts from sharing radix KV across different reference audio.

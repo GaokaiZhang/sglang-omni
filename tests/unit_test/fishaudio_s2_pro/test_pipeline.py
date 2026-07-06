@@ -458,6 +458,9 @@ def test_s2pro_engine_disables_generic_compile_after_local_compile(
     scheduler = result.scheduler
     build_kwargs = result.build_kwargs
 
+    # The Fish migration hinges on make_adapters() saving the third adapter
+    # and extra_scheduler_kwargs() passing it into OmniScheduler.
+    assert callable(scheduler.stream_output_builder)
     assert build_kwargs["enable_torch_compile"] is True
     assert build_kwargs["max_running_requests"] == 64
     assert build_kwargs["cuda_graph_max_bs"] == 64
