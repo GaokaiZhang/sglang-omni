@@ -284,18 +284,25 @@ class ProxyHandler:
                     return
                 raise
             finally:
-                await upstream.aclose()
-                worker.decrement_active()
-                status_code = upstream.status_code if outcome == "completed" else None
-                worker.record_routed_request(status_code=status_code)
-                self._log_route_completion(
-                    worker=worker,
-                    path=path,
-                    metadata=metadata,
-                    status_code=upstream.status_code,
-                    outcome=outcome,
-                    start_time=start_time,
-                )
+                # Note (Jiaxin Deng): decrement the in-flight count (and record
+                # completion) even if aclose() raises on a broken mid-stream
+                # connection, otherwise least_request drifts permanently.
+                try:
+                    await upstream.aclose()
+                finally:
+                    worker.decrement_active()
+                    status_code = (
+                        upstream.status_code if outcome == "completed" else None
+                    )
+                    worker.record_routed_request(status_code=status_code)
+                    self._log_route_completion(
+                        worker=worker,
+                        path=path,
+                        metadata=metadata,
+                        status_code=upstream.status_code,
+                        outcome=outcome,
+                        start_time=start_time,
+                    )
 
         try:
             headers = filter_response_headers(upstream.headers, buffered=not stream)

@@ -24,7 +24,7 @@ def _request_netloc(request: httpx.Request) -> str:
 def _router_config(
     policy: str = "round_robin",
     max_payload_size: int = 512 * 1024 * 1024,
-    max_connections: int = 100,
+    max_connections: int | None = None,
     health_failure_threshold: int = 1,
     health_check_timeout_secs: int = 5,
     worker_configs: list[WorkerConfig] | None = None,
@@ -1123,6 +1123,48 @@ def test_streaming_failure_records_single_worker_failure() -> None:
     assert worker.failed_requests == 1
     assert worker.consecutive_failures == 1
     assert worker.state == "healthy"
+
+
+def test_streaming_inflight_count_decrements_even_if_aclose_raises() -> None:
+    class AcloseRaisingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"data: chunk\n\n"
+            raise httpx.ReadError("stream boom")
+
+        async def aclose(self) -> None:
+            raise RuntimeError("aclose boom")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(
+                200,
+                stream=AcloseRaisingStream(),
+                headers={"content-type": "text/event-stream"},
+                request=request,
+            )
+        raise AssertionError(f"unexpected request path: {request.url.path}")
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(_router_config(), client=async_client)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={"model": "qwen3-omni", "stream": True},
+        ) as response:
+            b"".join(response.iter_bytes())
+
+    # Note (Jiaxin Deng): the in-flight count must decrement even though aclose()
+    # raised, otherwise it leaks and least_request drifts permanently.
+    assert all(worker.active_requests == 0 for worker in app.state.workers)
+    # Note (Jiaxin Deng): record_routed_request() runs in the same finally, so the
+    # broken stream is still booked as a routed failure rather than silently
+    # dropped; guards against a future change skipping the completion accounting.
+    assert sum(worker.routed_requests for worker in app.state.workers) == 1
+    assert sum(worker.failed_requests for worker in app.state.workers) == 1
 
 
 # Streaming-relay semantics for the non-streaming path (Phase 0, #920): the relay
@@ -2268,3 +2310,45 @@ def test_router_admin_update_lock_timeout_returns_503(monkeypatch) -> None:
     assert result.status_code == 503
     body = json.loads(result.body)
     assert "lock" in body["error"]["message"].lower()
+
+
+def test_max_connections_auto_sizes_to_worker_count() -> None:
+    config = RouterConfig(
+        workers=[
+            WorkerConfig(url="http://worker-a:8101"),
+            WorkerConfig(url="http://worker-b:8102"),
+            WorkerConfig(url="http://worker-c:8103"),
+        ],
+    )
+    # Note: (Jiaxin Deng) 128 per worker: pool-wide cap must exceed in-flight capacity.
+    assert config.max_connections == 384
+
+
+def test_max_connections_auto_caps_at_4096() -> None:
+    workers = [WorkerConfig(url=f"http://worker-{i}:8101") for i in range(40)]
+    config = RouterConfig(workers=workers)
+    assert config.max_connections == 4096
+
+
+def test_max_connections_explicit_value_is_preserved() -> None:
+    config = _router_config(max_connections=512)
+    assert config.max_connections == 512
+
+
+def test_max_connections_explicit_below_worker_budget_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="sglang_omni_router.config"):
+        config = _router_config(max_connections=100)
+    assert config.max_connections == 100
+    assert any("under-feed" in record.getMessage() for record in caplog.records)
+
+
+def test_max_connections_auto_at_cap_still_warns_when_pool_outgrows_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    workers = [WorkerConfig(url=f"http://worker-{i}:8101") for i in range(70)]
+    with caplog.at_level(logging.WARNING, logger="sglang_omni_router.config"):
+        config = RouterConfig(workers=workers)
+    assert config.max_connections == 4096
+    assert any("under-feed" in record.getMessage() for record in caplog.records)
