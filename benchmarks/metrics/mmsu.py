@@ -6,7 +6,11 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
-from benchmarks.metrics._format import MMSU_CATEGORY_WIDTH, SPEED_LINE_WIDTH
+from benchmarks.metrics._format import (
+    MMSU_CATEGORY_WIDTH,
+    SPEED_LINE_WIDTH,
+    print_benchmark_dataset_line,
+)
 
 if TYPE_CHECKING:
     from benchmarks.tasks.audio_understanding import MmsuResult
@@ -69,10 +73,12 @@ def print_mmsu_summary(
     model_name: str,
     *,
     speed_metrics: dict[str, Any] | None = None,
+    dataset: str | None = None,
 ) -> None:
     print("\n" + "=" * SPEED_LINE_WIDTH)
     print(f"  MMSU Results - {model_name}")
     print("=" * SPEED_LINE_WIDTH)
+    print_benchmark_dataset_line(18, dataset)
     print(f"  Total samples:    {metrics['total_samples']}")
     print(
         f"  Successful:       {metrics.get('successful_samples', metrics['total_samples'])}"

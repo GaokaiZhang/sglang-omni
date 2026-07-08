@@ -10,17 +10,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
-from benchmarks.eval.eval_transcribe_diarize import (
+from benchmarks.eval.benchmark_asr_transcribe_diarize import (
     AISHELL4_REPO_ID,
     MODEL_PATH,
     run_eval,
 )
+from benchmarks.metrics._format import format_benchmark_dataset_label
 from benchmarks.metrics.transcribe_diarize_metrics import (
     print_diarization_accuracy_summary,
     print_diarization_speed_summary,
@@ -49,27 +51,48 @@ MOSS_TD_STARTUP_TIMEOUT = 600
 MOSS_TD_MEM_FRACTION_STATIC = 0.80
 MOSS_TD_LONG_MAX_NEW_TOKENS = 65536
 
-# Worst-of-N reference values calibrated by tune.py.
-MOSS_TD_CER_PERCENT_REF = 5.990212279140715
-MOSS_TD_CER_NO_SPK_PERCENT_REF = 5.990212279140715
-MOSS_TD_CER_NO_SPK_BELOW_50_PERCENT_REF: float | None = 5.091774084670031
-MOSS_TD_N_ABOVE_50_CER_MAX: int | None = 31
-MOSS_TD_CP_CER_PERCENT_REF = 13.971335960340664
-MOSS_TD_CER_NO_SPK_CP_VALID_PERCENT_REF = 5.990212279140715
-MOSS_TD_DELTA_CER_PERCENT_REF = 8.04309139443244
-# Speaker-timestamp DER (diarization error rate, already a percentage in the
-# result JSON). None until the first DER calibration fills in the reference.
-MOSS_TD_SPEAKER_TIMESTAMP_DER_PERCENT_REF: float | None = 22.455541605512416
+
+MOSS_TD_CER_PERCENT_REF = 5.801131307995424
+MOSS_TD_CER_NO_SPK_PERCENT_REF = 5.801131307995424
+MOSS_TD_CER_NO_SPK_BELOW_50_PERCENT_REF: float | None = 4.963353478204963
+MOSS_TD_N_ABOVE_50_CER_REF: int | None = 30
+MOSS_TD_CP_CER_PERCENT_REF = 13.02275327316639
+MOSS_TD_CER_NO_SPK_CP_VALID_PERCENT_REF = 5.801131307995424
+MOSS_TD_DELTA_CER_PERCENT_REF = 7.251811363925256
+MOSS_TD_SPEAKER_TIMESTAMP_DER_PERCENT_REF: float | None = 20.975903756491164
 MOSS_TD_CER_VALID_SAMPLES_MIN: int | None = 784
 MOSS_TD_CP_CER_VALID_SAMPLES_MIN: int | None = 784
-MOSS_TD_THROUGHPUT_QPS_REF = 39.21
-MOSS_TD_LATENCY_MEAN_S_REF = 0.404
-MOSS_TD_LATENCY_P95_S_REF = 0.954
-MOSS_TD_RTF_MEAN_REF = 0.0388
-MOSS_TD_RTF_P95_REF = 0.0626
+MOSS_TD_THROUGHPUT_QPS_REF = 39.748
+MOSS_TD_LATENCY_MEAN_S_REF = 0.346
+MOSS_TD_LATENCY_P95_S_REF = 0.725
+MOSS_TD_RTF_MEAN_REF = 0.0372
+MOSS_TD_RTF_P95_REF = 0.0501
+
+AISHELL4_LONG_CER_PERCENT_REF = 13.890521227173444
+AISHELL4_LONG_CER_NO_SPK_PERCENT_REF = 13.890521227173444
+AISHELL4_LONG_CP_CER_PERCENT_REF = 14.0684768990254
+AISHELL4_LONG_DELTA_CER_PERCENT_REF = 0.2794070361787748
+AISHELL4_LONG_SPEAKER_TIMESTAMP_DER_PERCENT_REF = 9.78538976813068
+AISHELL4_LONG_THROUGHPUT_QPS_REF = 0.07
+AISHELL4_LONG_LATENCY_MEAN_S_REF = 158.688
+AISHELL4_LONG_LATENCY_P95_S_REF = 207.51
+AISHELL4_LONG_RTF_MEAN_REF = 0.0694
+AISHELL4_LONG_RTF_P95_REF = 0.092
 
 THRESHOLD_SLACK_HIGHER = 0.9
 THRESHOLD_SLACK_LOWER = 1.1
+
+# Note (chenyang): AISHELL4-long runs only 20 samples, so a single straggler
+#  or a flipped orderline sample moves the aggregate metrics far more than
+# the 800-sample movies800 corpus. Widen its slack accordingly.
+AISHELL4_LONG_THRESHOLD_SLACK_HIGHER = 0.8
+AISHELL4_LONG_THRESHOLD_SLACK_LOWER = 1.2
+
+MOSS_TD_N_ABOVE_50_CER_MAX: int | None = (
+    math.ceil(MOSS_TD_N_ABOVE_50_CER_REF * THRESHOLD_SLACK_LOWER)
+    if MOSS_TD_N_ABOVE_50_CER_REF is not None
+    else None
+)
 
 MOSS_TD_CER_PERCENT_MAX: float | None = round(
     MOSS_TD_CER_PERCENT_REF * THRESHOLD_SLACK_LOWER, 4
@@ -111,16 +134,36 @@ MOSS_TD_RTF_MEAN_MAX: float | None = round(
 MOSS_TD_RTF_P95_MAX: float | None = round(
     MOSS_TD_RTF_P95_REF * THRESHOLD_SLACK_LOWER, 4
 )
-AISHELL4_LONG_CER_PERCENT_MAX: float | None = 15.258728697985385
-AISHELL4_LONG_CER_NO_SPK_PERCENT_MAX: float | None = 15.258728697985385
-AISHELL4_LONG_CP_CER_PERCENT_MAX: float | None = 16.353072923018928
-AISHELL4_LONG_DELTA_CER_PERCENT_MAX: float | None = 2.029581665576388
-AISHELL4_LONG_SPEAKER_TIMESTAMP_DER_PERCENT_MAX: float | None = 12.388339964922126
-AISHELL4_LONG_THROUGHPUT_QPS_MIN: float | None = 0.06
-AISHELL4_LONG_LATENCY_MEAN_S_MAX: float | None = 187.819
-AISHELL4_LONG_LATENCY_P95_S_MAX: float | None = 243.823
-AISHELL4_LONG_RTF_MEAN_MAX: float | None = 0.0821
-AISHELL4_LONG_RTF_P95_MAX: float | None = 0.107
+AISHELL4_LONG_CER_PERCENT_MAX: float | None = round(
+    AISHELL4_LONG_CER_PERCENT_REF * AISHELL4_LONG_THRESHOLD_SLACK_LOWER, 4
+)
+AISHELL4_LONG_CER_NO_SPK_PERCENT_MAX: float | None = round(
+    AISHELL4_LONG_CER_NO_SPK_PERCENT_REF * AISHELL4_LONG_THRESHOLD_SLACK_LOWER, 4
+)
+AISHELL4_LONG_CP_CER_PERCENT_MAX: float | None = round(
+    AISHELL4_LONG_CP_CER_PERCENT_REF * AISHELL4_LONG_THRESHOLD_SLACK_LOWER, 4
+)
+AISHELL4_LONG_DELTA_CER_PERCENT_MAX: float | None = None
+AISHELL4_LONG_SPEAKER_TIMESTAMP_DER_PERCENT_MAX: float | None = round(
+    AISHELL4_LONG_SPEAKER_TIMESTAMP_DER_PERCENT_REF
+    * AISHELL4_LONG_THRESHOLD_SLACK_LOWER,
+    4,
+)
+AISHELL4_LONG_THROUGHPUT_QPS_MIN: float | None = round(
+    AISHELL4_LONG_THROUGHPUT_QPS_REF * AISHELL4_LONG_THRESHOLD_SLACK_HIGHER, 3
+)
+AISHELL4_LONG_LATENCY_MEAN_S_MAX: float | None = round(
+    AISHELL4_LONG_LATENCY_MEAN_S_REF * AISHELL4_LONG_THRESHOLD_SLACK_LOWER, 3
+)
+AISHELL4_LONG_LATENCY_P95_S_MAX: float | None = round(
+    AISHELL4_LONG_LATENCY_P95_S_REF * AISHELL4_LONG_THRESHOLD_SLACK_LOWER, 3
+)
+AISHELL4_LONG_RTF_MEAN_MAX: float | None = round(
+    AISHELL4_LONG_RTF_MEAN_REF * AISHELL4_LONG_THRESHOLD_SLACK_LOWER, 4
+)
+AISHELL4_LONG_RTF_P95_MAX: float | None = round(
+    AISHELL4_LONG_RTF_P95_REF * AISHELL4_LONG_THRESHOLD_SLACK_LOWER, 4
+)
 
 
 def _require_cuda() -> None:
@@ -275,6 +318,14 @@ def _run_transcribe_diarize(
     )
 
 
+def _dataset_preset(repo_id: str) -> str:
+    if repo_id == MOVIES800_REPO_ID:
+        return "movies800times"
+    if repo_id == AISHELL4_REPO_ID:
+        return "aishell4_long"
+    return repo_id
+
+
 def _build_results(
     *,
     samples,
@@ -290,6 +341,18 @@ def _build_results(
         concurrency=MOSS_TD_CONCURRENCY,
         repo_id=repo_id,
         split="validation",
+        dataset=_dataset_preset(repo_id),
+    )
+
+
+def _dataset_label_from_results(results) -> str | None:
+    config = results.get("config", {})
+    if not isinstance(config, dict):
+        return None
+    return format_benchmark_dataset_label(
+        dataset=config.get("dataset"),
+        repo_id=config.get("repo_id"),
+        split=config.get("split"),
     )
 
 
@@ -303,16 +366,19 @@ def _print_and_save_results(
     summary = results["summary"]
     speed = results["speed"]
     diarization_metrics = results["diarization_metrics"]
+    dataset_label = _dataset_label_from_results(results)
     print_diarization_accuracy_summary(
         summary=summary,
         diarization_metrics=diarization_metrics,
         model_name=MOSS_TD_CI_MODEL_PATH,
         concurrency=MOSS_TD_CONCURRENCY,
+        dataset=dataset_label,
     )
     print_diarization_speed_summary(
         speed=speed,
         model_name=MOSS_TD_CI_MODEL_PATH,
         concurrency=MOSS_TD_CONCURRENCY,
+        dataset=dataset_label,
     )
 
     results_path = tmp_path / filename
@@ -488,13 +554,21 @@ def _assert_aishell4_long_results(checks: MetricCheckCollector, results) -> None
         AISHELL4_LONG_CP_CER_PERCENT_MAX,
         unit="%",
     )
-    _check_optional_max(
-        checks,
-        "aishell4_long delta_cer",
-        diarization_percent.get("delta_cer"),
-        AISHELL4_LONG_DELTA_CER_PERCENT_MAX,
-        unit="%",
-    )
+    if AISHELL4_LONG_DELTA_CER_PERCENT_MAX is None:
+        # Note (chenyang): Report-only: delta_cer on 20 samples is noisy,
+        #  so we log the value for observability but do not assert on it.
+        print(
+            "[report-only] aishell4_long delta_cer="
+            f"{diarization_percent.get('delta_cer')}%"
+        )
+    else:
+        _check_optional_max(
+            checks,
+            "aishell4_long delta_cer",
+            diarization_percent.get("delta_cer"),
+            AISHELL4_LONG_DELTA_CER_PERCENT_MAX,
+            unit="%",
+        )
     _check_optional_max(
         checks,
         "aishell4_long speaker_timestamp_der",

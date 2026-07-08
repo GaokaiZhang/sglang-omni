@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MOSS-Transcribe-Diarize eval.
+"""MOSS-Transcribe-Diarize benchmark.
 
 Evaluate the MOSS-Transcribe-Diarize model on the Movies800Time and AISHELL4
 datasets for multi-speaker dialog transcription. These two datasets are private
@@ -12,12 +12,12 @@ Author:
 
 Usage:
 
-    python -m benchmarks.eval.eval_transcribe_diarize \
+    python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
         --dataset movies800times \
         --max-concurrency 16 \
         --output-dir results/moss_transcribe_diarize_movies800times
 
-    python -m benchmarks.eval.eval_transcribe_diarize \
+    python -m benchmarks.eval.benchmark_asr_transcribe_diarize \
         --dataset aishell4_long \
         --max-concurrency 16 \
         --output-dir results/moss_transcribe_diarize_aishell4_long
@@ -565,6 +565,7 @@ def _run_from_asr_results(args: argparse.Namespace) -> tuple[EvaluationPayload, 
         concurrency=int(config.get("concurrency", args.concurrency)),
         repo_id=str(config.get("repo_id", args.repo_id)),
         split=str(config.get("split", args.split)),
+        dataset=str(config.get("dataset", args.dataset)),
     )
     output_path = _save_payload(args, payload)
     return payload, output_path
@@ -624,6 +625,7 @@ def _build_payload(
         concurrency=args.concurrency,
         repo_id=args.repo_id,
         split=args.split,
+        dataset=args.dataset,
     )
 
 

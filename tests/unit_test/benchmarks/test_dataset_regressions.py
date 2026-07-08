@@ -260,7 +260,11 @@ def test_tune_ci_threshold_asr_config_tracks_current_asr_ci_stages() -> None:
     assert stages["aishell4_long_diarization"]["expected_samples"] == 20
     assert (
         stages["aishell4_long_diarization"]["metrics"]["cer_percent"]["source"]
-        == "AISHELL4_LONG_CER_PERCENT_MAX"
+        == "AISHELL4_LONG_CER_PERCENT_REF"
+    )
+    assert (
+        stages["aishell4_long_speed"]["metrics"]["throughput_qps"]["source"]
+        == "AISHELL4_LONG_THROUGHPUT_QPS_REF"
     )
     assert (
         stages["aishell4_long_speed"]["metrics"]["throughput_qps"]["json_file"]
