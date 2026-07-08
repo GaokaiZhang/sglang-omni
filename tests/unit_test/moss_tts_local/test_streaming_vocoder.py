@@ -1121,10 +1121,9 @@ def test_decode_step_failure_fails_participants_only(monkeypatch) -> None:
 
 
 def test_stream_chunk_requires_metadata_contract(monkeypatch) -> None:
-    # note (Gaokai Zhang): base-owned scaffold errors (missing metadata / stream flag /
-    # modality) are contract-tested in tests/unit_test/scheduling/
-    # test_streaming_vocoder.py; this covers the model-owned row shape and
-    # n_vq immutability checks.
+    # note (Gaokai): base-owned scaffold errors are contract-tested in
+    # tests/unit_test/scheduling/test_streaming_vocoder.py; only the
+    # model-owned row-shape and n_vq checks belong here.
     processor = FakeProcessor()
     scheduler = _make_scheduler(monkeypatch, processor)
     row = _rows(1, seed=80)[0]
@@ -1135,7 +1134,7 @@ def test_stream_chunk_requires_metadata_contract(monkeypatch) -> None:
     scheduler.on_stream_chunk("req2", _stream_item(row, _metadata()))
     with pytest.raises(ValueError, match="n_vq changed"):
         scheduler.on_stream_chunk("req2", _stream_item(row, _metadata(n_vq=N_VQ + 1)))
-    # note (Gaokai Zhang): the latch rejection precedes ingestion, so the
+    # note (Gaokai): the latch rejection precedes ingestion, so the
     # off-contract row must not have been buffered (the first row was already
     # pumped, leaving the buffer empty).
     assert len(scheduler._stream_states["req2"].pending) == 0

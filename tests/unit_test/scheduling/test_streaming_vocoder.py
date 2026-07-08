@@ -269,7 +269,7 @@ def test_registry_lifecycle_and_hook_call_order() -> None:
         "should_decode",
         "decode:r:delta",
     ]
-    # note (Gaokai Zhang): the base emit skeleton wraps every chunk (one-backbone);
+    # note (Gaokai): the base emit skeleton wraps every chunk (one-backbone);
     # payload shape and metadata must come from the base, not the fake.
     assert len(messages) == 1
     assert messages[0].type == "stream"
@@ -309,7 +309,7 @@ def test_threshold_accumulate_then_flush_on_done() -> None:
     scheduler._on_done("r")
     scheduler._on_streaming_new_request("r", _payload())
     messages = _drain(scheduler)
-    # note (Gaokai Zhang): done sequencing is flush remainder -> final stream chunk ->
+    # note (Gaokai): done sequencing is flush remainder -> final stream chunk ->
     # terminal result; the flush must precede the result in the outbox.
     assert [m.type for m in messages] == ["stream", "result"]
     np.testing.assert_array_equal(_waveform(messages[0].data), [1.0, 2.0, 3.0])
@@ -390,7 +390,7 @@ def test_late_chunk_after_completed_stream_never_recreates_state() -> None:
     assert scheduler._stream_states == {}
     assert _drain(scheduler) == []
 
-    # note (Gaokai Zhang): a fresh new_request may reuse the id; only late chunks
+    # note (Gaokai): a fresh new_request may reuse the id; only late chunks
     # without a new_request stay dropped.
     scheduler._on_streaming_new_request("r", _payload())
     scheduler._on_chunk("r", _item([3]))
@@ -414,10 +414,10 @@ def test_contract_latch_is_immutable_per_request() -> None:
     assert scheduler._stream_states["r"].n_vq == 4
     with pytest.raises(ValueError, match="n_vq changed"):
         scheduler.on_stream_chunk("r", _item([2], {"stream": True, "n_vq": 8}))
-    # note (Gaokai Zhang): the latch runs before ingest, so the rejected chunk must
+    # note (Gaokai): the latch runs before ingest, so the rejected chunk must
     # not have been buffered.
     assert len(scheduler._stream_states["r"].frames) == 1
-    # note (Gaokai Zhang): re-latching the identical contract must stay legal.
+    # note (Gaokai): re-latching the identical contract must stay legal.
     scheduler._on_chunk("r", _item([3], {"stream": True, "n_vq": 4}))
     assert scheduler._stream_states["r"].n_vq == 4
     assert len(scheduler._stream_states["r"].frames) == 2
@@ -446,7 +446,7 @@ def test_chunk_scaffold_errors_name_subclass() -> None:
 
 
 def test_scaffold_errors_use_stream_source_hint() -> None:
-    # note (Gaokai Zhang): client-visible scaffold errors carry the display hint
+    # note (Gaokai): client-visible scaffold errors carry the display hint
     # (e.g. moss passes "MOSS-TTS Local"), keeping migrated error text
     # byte-identical to the pre-refactor schedulers.
     scheduler = _FakeStreamingVocoder(stream_source_hint="Fake TTS")
@@ -544,7 +544,7 @@ def test_step_failure_aborts_every_participant() -> None:
     assert scheduler._stream_states == {}
     assert scheduler._is_aborted("a") and scheduler._is_aborted("b")
     assert "release:a" in scheduler.calls and "release:b" in scheduler.calls
-    # Late chunks after the failed step stay dropped and must never recreate
+    # note (Gaokai): late chunks after the failed step must never recreate
     # state: upstream AR stages abort lazily and can still deliver in-flight
     # chunks for an already-aborted request.
     scheduler.calls.clear()
