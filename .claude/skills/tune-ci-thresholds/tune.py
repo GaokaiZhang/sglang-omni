@@ -520,8 +520,9 @@ def _gpu_memory_used_mib():
 def _kill_calibration_gpu_processes(host: dict | None = None):
     """Match CI omni-post-stage cleanup between calibration runs.
 
-    When ``TUNE_GPU_EXCLUDE`` / host ``gpu_exclude`` is set (shared 8× H100 hosts),
-    cleanup is scoped to the calibration GPU pool only — never kill CI on excluded GPUs.
+    Cleanup is scoped to ``calibration_gpu_pool`` (respects ``TUNE_GPU_INCLUDE`` and
+    ``TUNE_GPU_EXCLUDE``). Never run global ``pkill`` when either is set — concurrent
+    calibration sessions on the same host must not kill each other's GPUs.
     """
     pool = calibration_gpu_pool(host)
     if not pool:
@@ -531,7 +532,7 @@ def _kill_calibration_gpu_processes(host: dict | None = None):
     env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, pool))
     if script.exists():
         subprocess.run(["bash", str(script)], capture_output=True, check=False, env=env)
-    if excluded_gpu_indices(host):
+    if excluded_gpu_indices(host) or included_gpu_indices(host):
         return
     for pattern in (
         "sgl-omni serve",
@@ -600,7 +601,7 @@ def _ensure_gpus_free(gpus_needed: int, timeout: int = _GPU_WAIT_TIMEOUT_S,
         waited += _GPU_WAIT_POLL_S
         if waited % 60 == 0:
             _kill_calibration_gpu_processes(host)
-    if not excluded_gpu_indices(host):
+    if not excluded_gpu_indices(host) and not included_gpu_indices(host):
         subprocess.run(["pkill", "-9", "-f", "sgl-omni"], check=False)
     time.sleep(5)
     ready, mem, busy = _ready_gpu_indices(gpus_needed, host)
@@ -943,13 +944,44 @@ def excluded_gpu_indices(host: dict | None = None) -> set[int]:
     return set()
 
 
+def included_gpu_indices(host: dict | None = None) -> set[int] | None:
+    """When set via ``TUNE_GPU_INCLUDE``, pin pick/cleanup to exactly these GPUs.
+
+    Used for concurrent calibration sessions on shared hosts (e.g. 0,1 vs 2,3).
+    """
+    raw = os.environ.get("TUNE_GPU_INCLUDE")
+    if not raw:
+        return None
+    included = _parse_gpu_index_list(raw)
+    excluded = excluded_gpu_indices(host)
+    pinned = included - excluded
+    if not pinned:
+        raise RuntimeError(
+            f"TUNE_GPU_INCLUDE={raw!r} empty after excluding {sorted(excluded)}"
+        )
+    return pinned
+
+
 def calibration_gpu_pool(host: dict | None = None) -> list[int]:
     excluded = excluded_gpu_indices(host)
-    return [i for i in all_gpu_indices() if i not in excluded]
+    pool = [i for i in all_gpu_indices() if i not in excluded]
+    pinned = included_gpu_indices(host)
+    if pinned is not None:
+        pool = [i for i in pool if i in pinned]
+    return pool
 
 
 def pick_free_gpus(n, host: dict | None = None):
     """Pick n GPUs with no compute app and memory <= _GPU_RETRY_MEM_MIB (2 GiB)."""
+    pinned = included_gpu_indices(host)
+    if pinned is not None and len(pinned) == n:
+        picked = sorted(pinned)
+        if _picked_gpus_under_limit(picked):
+            return picked, None
+        snap = _picked_gpus_mem_snapshot(picked)
+        return None, (
+            f"pinned GPU(s) {picked} not each <= {_GPU_RETRY_MEM_MIB} MiB: {snap}"
+        )
     ready, mem, busy = _ready_gpu_indices(n, host)
     all_idx = calibration_gpu_pool(host)
     if len(ready) >= n:
@@ -958,9 +990,10 @@ def pick_free_gpus(n, host: dict | None = None):
             snap = _picked_gpus_mem_snapshot(picked)
             return None, f"internal: picked GPUs exceed {_GPU_RETRY_MEM_MIB} MiB: {snap}"
         return picked, None
+    pin_msg = f" pinned={sorted(pinned)}" if pinned is not None else ""
     return None, (
         f"need {n} GPU(s) each <= {_GPU_RETRY_MEM_MIB} MiB (2 GiB); "
-        f"ready {len(ready)}/{len(all_idx)} mem={mem} busy={sorted(busy)}"
+        f"ready {len(ready)}/{len(all_idx)} mem={mem} busy={sorted(busy)}{pin_msg}"
     )
 
 
@@ -1119,10 +1152,12 @@ def precheck(py, src, out, skip_ver, cfg, datasets_override=None,
         ready, _, _ = _ready_gpu_indices(1, cfg.get("_host"))
         free_count = len(ready)
         summary = gpu_summary(smi)
-        pool_note = f" pool={pool}" if excluded else ""
-        if busy or excluded:
+        pinned = sorted(included_gpu_indices(cfg.get("_host")) or [])
+        pool_note = f" pool={pool}" if (excluded or pinned) else ""
+        pin_note = f" pinned={pinned}" if pinned else ""
+        if busy or excluded or pinned:
             print(f"  GPUs: {summary} — {free_count}/{len(pool)} calibration-ready"
-                  f"{pool_note} (busy: {sorted(busy)}"
+                  f"{pool_note}{pin_note} (busy: {sorted(busy)}"
                   f"{f', excluded: {excluded}' if excluded else ''})")
         else:
             print(f"  GPUs: {summary} — {free_count}/{len(pool)} calibration-ready")

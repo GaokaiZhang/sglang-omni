@@ -141,12 +141,17 @@ def test_request_builder_uses_moss_sampling_defaults() -> None:
     data = request_builder(_payload())
     sampling_params = data.req.sampling_params
 
-    assert sampling_params.temperature == DEFAULT_TEMPERATURE
-    assert sampling_params.top_p == DEFAULT_TOP_P
-    assert sampling_params.top_k == DEFAULT_TOP_K
     assert data.temperature == DEFAULT_TEMPERATURE
     assert data.top_p == DEFAULT_TOP_P
     assert data.top_k == DEFAULT_TOP_K
+    if DEFAULT_TEMPERATURE == 0.0:
+        # SGLang encodes greedy sampling as temperature=1.0 with top_k=1.
+        assert sampling_params.temperature == 1.0
+        assert sampling_params.top_k == 1
+    else:
+        assert sampling_params.temperature == DEFAULT_TEMPERATURE
+        assert sampling_params.top_p == DEFAULT_TOP_P
+        assert sampling_params.top_k == DEFAULT_TOP_K
 
 
 def test_request_builder_preserves_sampling_overrides() -> None:

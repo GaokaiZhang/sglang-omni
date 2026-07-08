@@ -206,7 +206,7 @@ aishell4_long_diarization:
       json_path: "summary.evaluated"
   metrics:
     cer_percent:
-      source: "AISHELL4_LONG_CER_PERCENT_MAX"
+      source: "AISHELL4_LONG_CER_PERCENT_REF"
       json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_aishell4_long_results.json"
       json_path: "diarization_metrics_percent.cer"
       worst: max
@@ -216,7 +216,7 @@ aishell4_long_diarization:
         digits: 2
       status: OK
     cer_no_spk_percent:
-      source: "AISHELL4_LONG_CER_NO_SPK_PERCENT_MAX"
+      source: "AISHELL4_LONG_CER_NO_SPK_PERCENT_REF"
       json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_aishell4_long_results.json"
       json_path: "diarization_metrics_percent.cer_no_spk"
       worst: max
@@ -226,7 +226,7 @@ aishell4_long_diarization:
         digits: 2
       status: OK
     cp_cer_percent:
-      source: "AISHELL4_LONG_CP_CER_PERCENT_MAX"
+      source: "AISHELL4_LONG_CP_CER_PERCENT_REF"
       json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_aishell4_long_results.json"
       json_path: "diarization_metrics_percent.cp_cer"
       worst: max
@@ -236,7 +236,7 @@ aishell4_long_diarization:
         digits: 2
       status: OK
     delta_cer_percent:
-      source: "AISHELL4_LONG_DELTA_CER_PERCENT_MAX"
+      source: "AISHELL4_LONG_DELTA_CER_PERCENT_REF"
       json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_aishell4_long_results.json"
       json_path: "diarization_metrics_percent.delta_cer"
       worst: max
@@ -246,7 +246,7 @@ aishell4_long_diarization:
         digits: 2
       status: OK
     speaker_timestamp_der_percent:
-      source: "AISHELL4_LONG_SPEAKER_TIMESTAMP_DER_PERCENT_MAX"
+      source: "AISHELL4_LONG_SPEAKER_TIMESTAMP_DER_PERCENT_REF"
       json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_aishell4_long_results.json"
       json_path: "diarization_metrics_percent.speaker_timestamp_der"
       worst: max
@@ -274,7 +274,7 @@ aishell4_long_speed:
       json_path: "summary.evaluated"
   metrics:
     throughput_qps:
-      source: "AISHELL4_LONG_THROUGHPUT_QPS_MIN"
+      source: "AISHELL4_LONG_THROUGHPUT_QPS_REF"
       json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_aishell4_long_results.json"
       json_path: "speed.throughput_qps"
       worst: min
@@ -284,7 +284,7 @@ aishell4_long_speed:
         digits: 3
       status: OK
     latency_mean_s:
-      source: "AISHELL4_LONG_LATENCY_MEAN_S_MAX"
+      source: "AISHELL4_LONG_LATENCY_MEAN_S_REF"
       json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_aishell4_long_results.json"
       json_path: "speed.latency_mean_s"
       worst: max
@@ -294,7 +294,7 @@ aishell4_long_speed:
         digits: 3
       status: OK
     latency_p95_s:
-      source: "AISHELL4_LONG_LATENCY_P95_S_MAX"
+      source: "AISHELL4_LONG_LATENCY_P95_S_REF"
       json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_aishell4_long_results.json"
       json_path: "speed.latency_p95_s"
       worst: max
@@ -304,7 +304,7 @@ aishell4_long_speed:
         digits: 3
       status: OK
     rtf_mean:
-      source: "AISHELL4_LONG_RTF_MEAN_MAX"
+      source: "AISHELL4_LONG_RTF_MEAN_REF"
       json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_aishell4_long_results.json"
       json_path: "speed.rtf_mean"
       worst: max
@@ -314,7 +314,7 @@ aishell4_long_speed:
         digits: 4
       status: OK
     rtf_p95:
-      source: "AISHELL4_LONG_RTF_P95_MAX"
+      source: "AISHELL4_LONG_RTF_P95_REF"
       json_file: "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_aishell4_long_results.json"
       json_path: "speed.rtf_p95"
       worst: max
