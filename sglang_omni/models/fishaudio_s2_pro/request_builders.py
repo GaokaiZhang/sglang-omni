@@ -58,7 +58,7 @@ def validate_s2pro_top_k(top_k: int) -> None:
 
 
 def _ref_vq_fingerprint(vq_parts: list[torch.Tensor] | None) -> str | None:
-    # note (Gaokai Zhang) only cb0 of the ref VQ codes becomes prompt token ids;
+    # note (Gaokai): only cb0 of the ref VQ codes becomes prompt token ids;
     # cb1..N ride in as embeddings, so extra_key must hash all codebooks to keep
     # same-cb0 prompts from sharing radix KV across different reference audio.
     if not vq_parts:
@@ -102,7 +102,7 @@ def build_sglang_tts_request(
 
     adapter = S2ProTokenizerAdapter(tokenizer)
     im_end_token_id = int(adapter.eos_token_ids[0])
-    # note (Gaokai Zhang) the semantic tokens live in the added vocab
+    # note (Gaokai): the semantic tokens live in the added vocab
     # (151678..155773 > tokenizer.vocab_size); Req must carry the full width or
     # upstream check_finished's vocab-boundary guard kills every request on its
     # first sampled code.
@@ -177,7 +177,7 @@ def make_tts_scheduler_adapters(
                 int(state.max_new_tokens), int(max_new_tokens_cap)
             )
         if context_length is not None:
-            # note (Gaokai Zhang) clamp instead of letting the scheduler's
+            # note (Gaokai): clamp instead of letting the scheduler's
             # KV-capacity check reject: long-prompt requests kept being served
             # under FishScheduler because generation stops at im_end early.
             state.max_new_tokens = min(

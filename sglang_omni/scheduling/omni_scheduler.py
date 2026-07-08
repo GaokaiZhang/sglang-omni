@@ -972,8 +972,8 @@ class OmniScheduler:
 
             rid = req.rid
             if rid in self._aborted_request_ids:
-                # An abort landing mid-step finishes here via FINISH_ABORT: run
-                # the per-request cleanup abort() deferred (callbacks are
+                # note (Gaokai): an abort landing mid-step finishes here via
+                # FINISH_ABORT; run the cleanup abort() deferred (callbacks are
                 # idempotent) and drop the stale terminal result so it cannot
                 # resurrect the request downstream.
                 if self._abort_callback is not None:
@@ -1082,7 +1082,8 @@ class OmniScheduler:
         with self._request_admission_lock:
             if request_id not in self._aborted_request_ids:
                 if len(self._aborted_request_ids) >= _ABORTED_REQUEST_ID_LIMIT:
-                    # Evict oldest-first: a still-quiescing abort must survive.
+                    # note (Gaokai): evict oldest-first so a still-quiescing
+                    # abort survives.
                     while (
                         len(self._aborted_request_ids) >= _ABORTED_REQUEST_ID_RETAINED
                     ):

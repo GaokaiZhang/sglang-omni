@@ -602,7 +602,8 @@ def test_fish_tts_request_builder_clamps_budget_to_context() -> None:
     data = request_builder(
         make_s2pro_payload(make_s2pro_state(max_new_tokens=6), request_id="req-clamp")
     )
-    assert data.req.sampling_params.max_new_tokens == 4  # 8 - 1 - len([10, 11, 12])
+    # note (Gaokai): 8 (context) - 1 - 3 (prompt ids)
+    assert data.req.sampling_params.max_new_tokens == 4
 
 
 def test_fish_tts_result_adapter_maps_finish_reason_and_engine_time() -> None:
