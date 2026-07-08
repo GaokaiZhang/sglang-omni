@@ -13,6 +13,11 @@ from scipy.optimize import linear_sum_assignment
 
 from benchmarks.metrics._format import SPEED_LABEL_WIDTH, SPEED_LINE_WIDTH
 
+try:
+    from rapidfuzz.distance import Levenshtein as _rapidfuzz_levenshtein
+except ImportError:  # pragma: no cover - optional acceleration
+    _rapidfuzz_levenshtein = None
+
 TIMESTAMP_RE = re.compile(r"\[\d+(?:\.\d+)?\]")
 TIMESTAMP_TOKEN_RE = re.compile(r"^\d+(?:\.\d+)?$")
 SPEAKER_TOKEN_RE = re.compile(r"^S0*(\d+)$", re.IGNORECASE)
@@ -535,6 +540,9 @@ def _as_optional_number(metrics: Mapping[str, object], key: str) -> float | int 
 
 
 def _levenshtein_distance(reference: str, prediction: str) -> int:
+    if _rapidfuzz_levenshtein is not None:
+        return int(_rapidfuzz_levenshtein.distance(reference, prediction))
+
     previous_row = list(range(len(prediction) + 1))
     for reference_index, reference_character in enumerate(reference, start=1):
         current_row = [reference_index]

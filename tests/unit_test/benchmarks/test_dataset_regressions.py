@@ -222,6 +222,7 @@ def test_tune_ci_threshold_asr_config_tracks_current_asr_ci_stages() -> None:
     }
     assert {
         "zhaochenyang20/movies800time",
+        "zhaochenyang20/AISHELL4",
         "zhaochenyang20/seed-tts-eval-arrow",
     }.issubset(config["hf_datasets"])
 
@@ -243,6 +244,8 @@ def test_tune_ci_threshold_asr_config_tracks_current_asr_ci_stages() -> None:
     )
 
     assert set(stages) == {
+        "aishell4_long_diarization",
+        "aishell4_long_speed",
         "multi_speaker_diarization",
         "multi_speaker_speed",
         "seedtts_wer",
@@ -254,6 +257,15 @@ def test_tune_ci_threshold_asr_config_tracks_current_asr_ci_stages() -> None:
     assert stages["multi_speaker_diarization"]["expected_samples"] == 800
     assert "cer_percent" in stages["multi_speaker_diarization"]["metrics"]
     assert "throughput_qps" in stages["multi_speaker_speed"]["metrics"]
+    assert stages["aishell4_long_diarization"]["expected_samples"] == 20
+    assert (
+        stages["aishell4_long_diarization"]["metrics"]["cer_percent"]["source"]
+        == "AISHELL4_LONG_CER_PERCENT_MAX"
+    )
+    assert (
+        stages["aishell4_long_speed"]["metrics"]["throughput_qps"]["json_file"]
+        == "test_moss_transcribe_diarize_m0/moss_transcribe_diarize_aishell4_long_results.json"
+    )
     assert stages["seedtts_wer"]["test"] == "tests/test_model/test_asr_ci_seedtts.py"
     assert stages["seedtts_wer"]["expected_samples"] == 1088
 

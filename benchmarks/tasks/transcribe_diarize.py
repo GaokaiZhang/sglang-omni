@@ -97,6 +97,7 @@ def load_movies800_samples(
     audio_column: str,
     expected_column: str,
     max_samples: int | None = None,
+    expected_sample_count: int | None = EXPECTED_SAMPLE_COUNT,
 ) -> list[Movies800Sample]:
     datasets_module = importlib.import_module("datasets")
     audio_type = getattr(datasets_module, "Audio")
@@ -131,9 +132,13 @@ def load_movies800_samples(
         )
         for index, row in enumerate(dataset)
     ]
-    if max_samples is None and len(samples) != EXPECTED_SAMPLE_COUNT:
+    if (
+        max_samples is None
+        and expected_sample_count is not None
+        and len(samples) != expected_sample_count
+    ):
         raise ValueError(
-            f"Expected {EXPECTED_SAMPLE_COUNT} samples for the full movies800 run, got {len(samples)}"
+            f"Expected {expected_sample_count} samples for the full {repo_id} run, got {len(samples)}"
         )
     return samples
 

@@ -184,7 +184,9 @@ def match_metric(name, nested):
         return "delta_cer_percent"
     if "N_ABOVE_50_CER_MAX" in name:
         return "n_above_50_pct_cer"
-    if "SPEAKER_TIMESTAMP_DER_PERCENT" in name:
+    # DER calibrates the reference constant (test derives the MAX via slack),
+    # so match the *_REF symbol; the computed *_MAX literal is left unmatched.
+    if "SPEAKER_TIMESTAMP_DER_PERCENT_REF" in name:
         return "speaker_timestamp_der_percent"
     if "CP_CER_VALID_SAMPLES_MIN" in name:
         return "cp_cer_valid_samples"
