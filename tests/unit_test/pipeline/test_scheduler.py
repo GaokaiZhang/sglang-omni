@@ -558,9 +558,12 @@ def test_omni_scheduler_fish_abort_during_step_suppresses_chunk_and_result() -> 
     scheduler._first_emit_done = set()
     scheduler._prefill_start_done = set()
     scheduler._stream_output_builder = stream_output_builder
-    scheduler._result_adapter = (
-        lambda data: adapted.append(data) or result_adapter(data)
-    )
+
+    def tracking_result_adapter(data):
+        adapted.append(data)
+        return result_adapter(data)
+
+    scheduler._result_adapter = tracking_result_adapter
     scheduler.waiting_queue = []
     _init_sync_request_build_state(scheduler)
 
