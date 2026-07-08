@@ -811,18 +811,26 @@ uses `--stages ALL`; targeted reruns use `multi_speaker` or `seedtts`.
 
 | Stage key | Group | What gets written | Test constant(s) |
 |-----------|-------|-------------------|------------------|
-| `multi_speaker_diarization` | diarization | CER / cpCER / DER / valid sample refs | `MOSS_TD_CER_*`, `MOSS_TD_CP_CER_*`, `MOSS_TD_DELTA_CER_*`, `MOSS_TD_CER_NO_SPK_BELOW_50_PERCENT_REF`, `MOSS_TD_N_ABOVE_50_CER_MAX`, `MOSS_TD_SPEAKER_TIMESTAMP_DER_PERCENT_REF` |
-| `multi_speaker_speed` | speed | throughput + latency + RTF P95 refs | `MOSS_TD_THROUGHPUT_QPS_MIN`, `MOSS_TD_LATENCY_*`, `MOSS_TD_RTF_*` |
+| `multi_speaker_diarization` | diarization | Movies800Time CER / cpCER / DER / valid sample refs | `MOSS_TD_CER_*`, `MOSS_TD_CP_CER_*`, `MOSS_TD_DELTA_CER_*`, `MOSS_TD_CER_NO_SPK_BELOW_50_PERCENT_REF`, `MOSS_TD_N_ABOVE_50_CER_MAX`, `MOSS_TD_SPEAKER_TIMESTAMP_DER_PERCENT_REF` |
+| `multi_speaker_speed` | speed | Movies800Time throughput + latency + RTF P95 refs | `MOSS_TD_THROUGHPUT_QPS_MIN`, `MOSS_TD_LATENCY_*`, `MOSS_TD_RTF_*` |
+| `aishell4_long_diarization` | diarization | AISHELL4 long-audio CER / cpCER / DER refs | `AISHELL4_LONG_CER_*`, `AISHELL4_LONG_CP_CER_*`, `AISHELL4_LONG_DELTA_CER_*`, `AISHELL4_LONG_SPEAKER_TIMESTAMP_DER_*` |
+| `aishell4_long_speed` | speed | AISHELL4 long-audio throughput + latency + RTF refs | `AISHELL4_LONG_THROUGHPUT_*`, `AISHELL4_LONG_LATENCY_*`, `AISHELL4_LONG_RTF_*` |
 | `seedtts_wer` | wer | corpus + per-sample WER ref | `SEEDTTS_ASR_CORPUS_WER_MAX`, `SEEDTTS_ASR_SAMPLE_WER_MAX` |
 | `seedtts_speed` | speed | throughput + latency + RTF P95 refs | `QWEN3_ASR_THROUGHPUT_MIN`, `QWEN3_ASR_LATENCY_*`, `QWEN3_ASR_RTF_*` |
 
 Notes:
-- Stage 1 uses **`OpenMOSS-Team/MOSS-Transcribe-Diarize`** and dataset
-  **`zhaochenyang20/movies800time`**. Strict audit expects
-  **`MOSS_TD_CI_SAMPLES`** samples; CER/cpCER/DER metrics are already percentages
-  in the JSON, so display scale is **1**, not 100. Calibration writes the
-  pre-slack reference constants (`*_REF`) and raw count caps only; never write
-  derived `*_MAX` literals whose RHS is `*_REF * THRESHOLD_SLACK_*`.
+- Stage 1 uses **`OpenMOSS-Team/MOSS-Transcribe-Diarize`** and datasets
+  **`zhaochenyang20/movies800time`** plus **`zhaochenyang20/AISHELL4`**.
+  Strict audit expects **`MOSS_TD_CI_SAMPLES`** Movies800Time samples and
+  **`MOSS_TD_AISHELL4_LONG_CI_SAMPLES`** AISHELL4 long-audio samples.
+  CER/cpCER/DER metrics are already percentages in the JSON, so display scale
+  is **1**, not 100. Movies800Time calibration writes the pre-slack reference
+  constants (`*_REF`) and raw count caps only; never write derived `*_MAX`
+  literals whose RHS is `*_REF * THRESHOLD_SLACK_*`.
+- AISHELL4 long-audio thresholds start as report-only `None` constants in the
+  CI test. Calibrate them from the DP=2 router CI shape using the
+  `aishell4_long_diarization` and `aishell4_long_speed` stages; do not reuse
+  DP=1 local eval numbers.
 - **DER (speaker-timestamp diarization error rate)** calibrates the reference
   constant `MOSS_TD_SPEAKER_TIMESTAMP_DER_PERCENT_REF` (worst-of-N `max`); the
   test derives `MOSS_TD_SPEAKER_TIMESTAMP_DER_PERCENT_MAX` via the slack helper.
@@ -842,7 +850,8 @@ Notes:
   CI assertion margin, **not** part of threshold selection. Do **not** bake slack
   into calibrated literals, and do not edit constants whose value is derived by
   `THRESHOLD_SLACK_*` or `apply_*_slack()`.
-- Shortcuts: `multi_speaker`, `seedtts`, `@diarization`, `@wer`, `@speed`.
+- Shortcuts: `multi_speaker`, `aishell4_long`, `seedtts`, `@diarization`,
+  `@wer`, `@speed`.
 
 ### TTS random-pick CI vs calibration coverage
 

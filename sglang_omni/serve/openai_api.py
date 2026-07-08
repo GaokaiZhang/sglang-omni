@@ -66,6 +66,7 @@ from sglang_omni.http.admin_auth import (
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
+from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
     AdminRequestBase,
@@ -843,6 +844,29 @@ async def _chat_stream(
     yield f"data: {STREAM_DONE_SENTINEL}\n\n"
 
 
+def _explicit_generation_params(request: Any) -> list[str]:
+    fields_set = getattr(request, "model_fields_set", set())
+    return sorted(
+        field
+        for field in (
+            "max_new_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "repetition_penalty",
+        )
+        if field in fields_set and getattr(request, field, None) is not None
+    )
+
+
+def _record_explicit_generation_params(
+    metadata: dict[str, Any],
+    explicit_fields: list[str],
+) -> None:
+    if explicit_fields:
+        metadata[EXPLICIT_GENERATION_PARAMS_KEY] = explicit_fields
+
+
 def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
     """Convert a ChatCompletionRequest into a client GenerateRequest."""
     # Parse stop sequences
@@ -912,6 +936,10 @@ def _build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
         metadata["video_max_pixels"] = req.video_max_pixels
     if req.video_total_pixels is not None:
         metadata["video_total_pixels"] = req.video_total_pixels
+    _record_explicit_generation_params(
+        metadata,
+        _explicit_generation_params(req),
+    )
 
     extra_params: dict[str, Any] = {}
     for field_name, value in (
@@ -984,20 +1012,19 @@ def _register_generate(app: FastAPI) -> None:
 
 
 def _rollout_sampling_to_client(params: RolloutSamplingParams) -> SamplingParams:
-    kwargs: dict[str, Any] = {
-        key: value
-        for key, value in (
-            ("temperature", params.temperature),
-            ("top_p", params.top_p),
-            ("top_k", params.top_k),
-            ("min_p", params.min_p),
-            ("repetition_penalty", params.repetition_penalty),
-            ("stop_token_ids", params.stop_token_ids),
-            ("seed", params.seed),
-            ("max_new_tokens", params.max_new_tokens),
-        )
-        if value is not None
-    }
+    kwargs: dict[str, Any] = {}
+    for key, value in (
+        ("temperature", params.temperature),
+        ("top_p", params.top_p),
+        ("top_k", params.top_k),
+        ("min_p", params.min_p),
+        ("repetition_penalty", params.repetition_penalty),
+        ("stop_token_ids", params.stop_token_ids),
+        ("seed", params.seed),
+        ("max_new_tokens", params.max_new_tokens),
+    ):
+        if value is not None:
+            kwargs[key] = value
     if params.stop is not None:
         kwargs["stop"] = (
             [params.stop] if isinstance(params.stop, str) else list(params.stop)
@@ -1028,6 +1055,11 @@ def _build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateRequ
         "return_routed_experts": req.return_routed_experts,
         "return_indexer_topk": req.return_indexer_topk,
     }
+    metadata = dict(req.metadata) if req.metadata else {}
+    _record_explicit_generation_params(
+        metadata,
+        _explicit_generation_params(req.sampling_params),
+    )
 
     return GenerateRequest(
         model=req.model,
@@ -1043,7 +1075,7 @@ def _build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateRequ
         output_modalities=(
             req.output_modalities if req.output_modalities is not None else ["text"]
         ),
-        metadata=dict(req.metadata) if req.metadata else {},
+        metadata=metadata,
     )
 
 
@@ -1510,6 +1542,7 @@ def _register_transcriptions(app: FastAPI) -> None:
         prompt: str | None = Form(default=None),
         response_format: str = Form(default="json"),
         temperature: float | None = Form(default=None),
+        max_new_tokens: int | None = Form(default=None, ge=1),
     ) -> Response:
         client: Client = app.state.client
         default_model: str = app.state.model_name
@@ -1529,6 +1562,7 @@ def _register_transcriptions(app: FastAPI) -> None:
             language=language,
             prompt=prompt,
             temperature=temperature,
+            max_new_tokens=max_new_tokens,
         )
 
         try:
@@ -1602,15 +1636,24 @@ def build_transcription_generate_request(
     language: str | None,
     prompt: str | None,
     temperature: float | None,
+    max_new_tokens: int | None = None,
 ) -> GenerateRequest:
     params: dict[str, Any] = {"task": "transcribe"}
+    metadata: dict[str, Any] = {"task": "asr"}
+    explicit_fields: list[str] = []
     if language is not None:
         params["language"] = language
     if prompt is not None:
         params["prompt"] = prompt
-    # note (aaron): the client layer fills in the SamplingParams default of 1.0
-    # when this key is absent. 0.0 (greedy) matches the OpenAI API, see issue #959.
-    params["temperature"] = temperature if temperature is not None else 0.0
+    if temperature is not None:
+        explicit_fields.append("temperature")
+    if max_new_tokens is not None:
+        explicit_fields.append("max_new_tokens")
+    _record_explicit_generation_params(metadata, sorted(explicit_fields))
+    sampling = SamplingParams(
+        temperature=temperature if temperature is not None else 0.0,
+        max_new_tokens=max_new_tokens,
+    )
 
     return GenerateRequest(
         model=model,
@@ -1619,8 +1662,9 @@ def build_transcription_generate_request(
             "filename": filename,
             "content_type": content_type,
         },
+        sampling=sampling,
         extra_params=params,
         stream=False,
         output_modalities=["text"],
-        metadata={"task": "asr"},
+        metadata=metadata,
     )

@@ -1,7 +1,7 @@
 # ASR CI threshold calibration (shared omni venv).
 #
 # CI DAG:
-#   stage-1-multi-speaker (MOSS-Transcribe-Diarize on movies800time)
+#   stage-1-multi-speaker (MOSS-Transcribe-Diarize on movies800time + AISHELL4 long)
 #   -> stage-2-seedtts (Qwen3-ASR on SeedTTS EN)
 #
 # Both stages use the managed router with 2 single-GPU workers (DP=2).
@@ -17,6 +17,7 @@ hf_model_ids_by_test:
     - "Qwen/Qwen3-ASR-1.7B"
 hf_datasets:
   - "zhaochenyang20/movies800time"
+  - "zhaochenyang20/AISHELL4"
   - "zhaochenyang20/seed-tts-eval-arrow"
 omni_ci_home: "/github/home/calibration"
 default_venv_python:

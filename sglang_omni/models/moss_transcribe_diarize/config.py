@@ -36,6 +36,7 @@ class MossTranscribeDiarizePipelineConfig(PipelineConfig):
             factory_args={
                 "device": "cuda:0",
                 "max_running_requests": 16,
+                "encoder_cache_size_bytes": 4 * 1024**3,
                 "request_build_max_workers": 2,
                 "request_build_max_pending": 16,
             },

@@ -1721,6 +1721,28 @@ class OmniScheduler:
         except Exception as exc:
             self._handle_batch_failure(batch, exc)
 
+    def _free_overrun_step_slots(self, out_cache_loc, drop_indices) -> None:
+        """Free the per-step decode KV slot for rows whose request finished or
+        retracted in a prior step (the lookahead overrun): ``prepare_for_decode``
+        allocated it but ``cache_finished_req`` truncates below it, so it leaks.
+
+        Only under RadixCache + page_size=1; ChunkCache/paged already free the slot
+        with the request, so compensating here would double-free — hence the gate.
+        """
+        if not drop_indices:
+            return
+        if self.page_size != 1 or self.server_args.disable_radix_cache:
+            return
+        if out_cache_loc is None:
+            logger.warning("overrun step-slot free skipped: out_cache_loc is None")
+            return
+        assert max(drop_indices) < out_cache_loc.numel(), (
+            f"overrun drop index {max(drop_indices)} out of range "
+            f"({out_cache_loc.numel()} step slots)"
+        )
+        idx = torch.tensor(drop_indices, dtype=torch.long, device=out_cache_loc.device)
+        self.token_to_kv_pool_allocator.free(out_cache_loc[idx])
+
     def _drop_stale_overrun(self, batch):
         """Drop reqs finished OR retracted by the just-completed drain from the
         stale fast-path batch, so run_batch does not forward/finalize them again
@@ -1736,6 +1758,9 @@ class OmniScheduler:
         if not any(drop):
             return batch
         keep = [i for i, d in enumerate(drop) if not d]
+        self._free_overrun_step_slots(
+            batch.out_cache_loc, [i for i, d in enumerate(drop) if d]
+        )
         batch.filter_batch(keep_indices=keep)
         return batch if batch.reqs else None
 

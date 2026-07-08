@@ -355,16 +355,23 @@ def test_omni_scheduler_fast_path_drops_retracted_req() -> None:
     forwarded/finalized again and re-frees its already-freed KV.
     """
     captured: dict = {}
+    freed: list[int] = []
 
     class FakeBatch:
         def __init__(self, reqs):
             self.reqs = reqs
+            self.out_cache_loc = torch.arange(100, 100 + len(reqs))
 
         def filter_batch(self, keep_indices=None):
             captured["keep_indices"] = keep_indices
             self.reqs = [self.reqs[i] for i in keep_indices]
 
     scheduler = object.__new__(OmniScheduler)
+    scheduler.page_size = 1
+    scheduler.server_args = SimpleNamespace(disable_radix_cache=False)
+    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+        free=lambda t: freed.extend(t.tolist())
+    )
     keep = SimpleNamespace(rid="keep", finished=lambda: False, is_retracted=False)
     retr = SimpleNamespace(rid="retr", finished=lambda: False, is_retracted=True)
 
@@ -372,16 +379,21 @@ def test_omni_scheduler_fast_path_drops_retracted_req() -> None:
     out = scheduler._drop_stale_overrun(FakeBatch([keep, retr]))
     assert captured["keep_indices"] == [0]
     assert [r.rid for r in out.reqs] == ["keep"]
+    assert freed == [101]
 
     # all dropped -> None so run_batch is skipped
+    freed.clear()
     fin = SimpleNamespace(rid="fin", finished=lambda: True, is_retracted=False)
     assert scheduler._drop_stale_overrun(FakeBatch([retr, fin])) is None
+    assert freed == [100, 101]
 
     # nothing stale -> batch returned unchanged, filter_batch never called
     captured.clear()
+    freed.clear()
     clean = FakeBatch([keep])
     assert scheduler._drop_stale_overrun(clean) is clean
     assert "keep_indices" not in captured
+    assert freed == []
 
 
 def test_omni_scheduler_abort_propagates_immediate_kv_cleanup_failure(
