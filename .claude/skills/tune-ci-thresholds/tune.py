@@ -1210,11 +1210,16 @@ def _constants(tree):
 
 _SLACK_HELPER_CALLS = frozenset({"apply_wer_slack", "apply_mos_slack"})
 _SLACK_ENV_NAMES = frozenset({"THRESHOLD_SLACK_LOWER", "THRESHOLD_SLACK_HIGHER"})
+# Prefixed variants (e.g. AISHELL4_LONG_THRESHOLD_SLACK_LOWER) are matched by
+# suffix so a stage group can widen its slack without touching this module.
+_SLACK_ENV_SUFFIXES = ("THRESHOLD_SLACK_LOWER", "THRESHOLD_SLACK_HIGHER")
 
 
 def _expr_uses_slack(node: ast.AST) -> bool:
     for child in ast.walk(node):
-        if isinstance(child, ast.Name) and child.id in _SLACK_ENV_NAMES:
+        if isinstance(child, ast.Name) and (
+            child.id in _SLACK_ENV_NAMES or child.id.endswith(_SLACK_ENV_SUFFIXES)
+        ):
             return True
         if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
             if child.func.id in _SLACK_HELPER_CALLS:
