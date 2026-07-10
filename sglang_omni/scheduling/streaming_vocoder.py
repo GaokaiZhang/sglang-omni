@@ -19,7 +19,8 @@ shared by model schedulers:
   chunks for aborted/cleared request ids are dropped and never recreate state
 - opt-in cross-request coalescing (``_can_batch_stream_chunks``) through
   ``select_step_participants`` / ``build_step_plan`` / ``run_step`` /
-  ``on_step_failure``; a failed step errors and aborts all its participants
+  ``on_step_failure``; a failed step errors and aborts all its participants,
+  and chunk delivery is batch-only (direct ``on_stream_chunk`` is rejected)
 
 Models own cursor math, buffers, codec invocation/sessions, CUDA-graph
 handling, and result shapes through the hooks. The base adds no locking of its
@@ -176,12 +177,16 @@ class StreamingVocoderBase(
     def on_stream_chunk(
         self, request_id: str, item: StreamItem
     ) -> list[OutgoingMessage]:
+        if self._can_batch_stream_chunks:
+            # note (Gaokai): the coalesced pump must run under ``_state_lock``
+            # with abort cleanup deferred; only ``on_stream_chunk_batch``
+            # provides that, so reject the unlocked entry point outright.
+            raise RuntimeError(
+                f"{type(self).__name__} coalesces stream chunks; deliver them "
+                "through on_stream_chunk_batch"
+            )
         state = self._ingest_stream_item(request_id, item)
         if state is None:
-            return []
-        if self._can_batch_stream_chunks:
-            for failed_id in self._pump_streams():
-                self._cleanup_aborted_request(failed_id)
             return []
         return self._decode_and_emit(request_id, state)
 

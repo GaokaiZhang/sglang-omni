@@ -577,7 +577,18 @@ def test_missing_coalescing_hooks_name_subclass() -> None:
 
     scheduler = _FlaggedVocoder(threshold=1)
     with pytest.raises(RuntimeError, match="_FlaggedVocoder.*select_step_participants"):
+        scheduler.on_stream_chunk_batch([("r", _item([1]))])
+
+
+def test_direct_chunk_entry_rejected_for_coalescing_schedulers() -> None:
+    scheduler = _CoalescingFakeVocoder(threshold=1)
+    with pytest.raises(
+        RuntimeError, match="_CoalescingFakeVocoder.*on_stream_chunk_batch"
+    ):
         scheduler.on_stream_chunk("r", _item([1]))
+    # note (Gaokai): the rejection must precede ingestion so a wrong entry
+    # point cannot leave half-registered state behind.
+    assert scheduler._stream_states == {}
 
 
 def test_stop_releases_live_streams_then_calls_serving_stop_hook() -> None:

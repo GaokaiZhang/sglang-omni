@@ -1127,17 +1127,19 @@ def test_stream_chunk_requires_metadata_contract(monkeypatch) -> None:
     processor = FakeProcessor()
     scheduler = _make_scheduler(monkeypatch, processor)
     row = _rows(1, seed=80)[0]
-    with pytest.raises(ValueError, match="channels"):
-        scheduler.on_stream_chunk(
-            "req", _stream_item(torch.zeros(2, dtype=torch.long), _metadata())
-        )
-    scheduler.on_stream_chunk("req2", _stream_item(row, _metadata()))
-    with pytest.raises(ValueError, match="n_vq changed"):
-        scheduler.on_stream_chunk("req2", _stream_item(row, _metadata(n_vq=N_VQ + 1)))
-    # note (Gaokai): the latch rejection precedes ingestion, so the
-    # off-contract row must not have been buffered (the first row was already
-    # pumped, leaving the buffer empty).
-    assert len(scheduler._stream_states["req2"].pending) == 0
+    scheduler.on_stream_chunk_batch(
+        [("req", _stream_item(torch.zeros(2, dtype=torch.long), _metadata()))]
+    )
+    scheduler.on_stream_chunk_batch([("req2", _stream_item(row, _metadata()))])
+    scheduler.on_stream_chunk_batch(
+        [("req2", _stream_item(row, _metadata(n_vq=N_VQ + 1)))]
+    )
+    errors = {m.request_id: m.data for m in _drain(scheduler) if m.type == "error"}
+    assert "channels" in str(errors["req"])
+    assert "n_vq changed" in str(errors["req2"])
+    # note (Gaokai): the serving path aborts a request whose chunk breaks the
+    # model contract, so neither request may keep stream state.
+    assert scheduler._stream_states == {}
 
 
 # --- CUDA-graph config + recapture / factory-capture / anti-storm lifecycle (CPU fakes) ---
