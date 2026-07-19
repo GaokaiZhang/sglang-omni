@@ -7,7 +7,7 @@ skipping the NeMo normalizer, and distinct-input misses. The normalizer is stubb
 so no NeMo/FST grammars are loaded.
 """
 
-from sglang_omni.models.zonos2 import text_frontend
+from sglang_omni.models.zonos2.components import text_frontend
 from sglang_omni.models.zonos2.components.text_frontend import normalize_text
 
 

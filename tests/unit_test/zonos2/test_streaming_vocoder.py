@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 import torch
 
-from sglang_omni.models.zonos2 import streaming_vocoder
+from sglang_omni.models.zonos2.components import streaming_vocoder
 from sglang_omni.models.zonos2.payload_types import (
     N_CODEBOOKS,
     ZONOS2_SAMPLE_RATE,
