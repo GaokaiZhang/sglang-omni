@@ -12,6 +12,7 @@ import io
 import subprocess
 import threading
 import wave
+from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,11 @@ import torch.nn.functional as F
 import torchaudio
 from transformers import AutoModel
 
-from sglang_omni.scheduling.stage_cache import StageOutputCache
+from sglang_omni.scheduling.reference_encoder import (
+    ReferenceEncodeHook,
+    ReferenceEncodeKey,
+    ReferenceEncodeService,
+)
 
 SPEAKER_EMBEDDING_DIM = 2048
 
@@ -196,11 +201,42 @@ def _decode_wav_bytes(wav_bytes: bytes) -> tuple[torch.Tensor, int]:
     return audio, sample_rate
 
 
-class SpeakerEncoder:
+# Stable tag for the frozen encoder config; bump if the mel/model params change so
+# stale cached embeddings are not reused.
+_ENCODER_CONFIG_HASH = hashlib.sha256(
+    "|".join(
+        str(v)
+        for v in (
+            Qwen3SpeakerEmbedding.MODEL_NAME,
+            Qwen3SpeakerEmbedding.TARGET_SAMPLE_RATE,
+            Qwen3SpeakerEmbedding.N_FFT,
+            Qwen3SpeakerEmbedding.HOP_LENGTH,
+            Qwen3SpeakerEmbedding.WIN_LENGTH,
+            Qwen3SpeakerEmbedding.N_MELS,
+            Qwen3SpeakerEmbedding.F_MIN,
+            Qwen3SpeakerEmbedding.F_MAX,
+        )
+    ).encode()
+).hexdigest()[:16]
+
+
+@dataclass
+class _Zonos2RefInput:
+    """Normalized reference input: raw file bytes, or an already-decoded waveform."""
+
+    kind: str  # "raw" | "wav"
+    input_key: str
+    raw: bytes | None = None
+    wav: torch.Tensor | None = None
+    sr: int | None = None
+
+
+class SpeakerEncoder(ReferenceEncodeHook[_Zonos2RefInput, torch.Tensor, torch.Tensor]):
     """Turns reference audio into the raw 2048-d ZONOS2 speaker embedding.
 
-    The Qwen3 model is loaded lazily on first :meth:`encode`. A content-hash LRU
-    cache means a repeated reference audio costs at most one forward.
+    The Qwen3 model is loaded lazily on first :meth:`encode`. Caching and
+    single-flight dedup run on the shared :class:`ReferenceEncodeService` keyed by
+    a content hash, so a repeated reference audio costs at most one forward.
     """
 
     def __init__(
@@ -212,29 +248,107 @@ class SpeakerEncoder:
         if int(cache_max_items) < 1:
             raise ValueError(f"cache_max_items must be >= 1, got {cache_max_items}")
         self.device = device
-        self.cache_max_items = int(cache_max_items)
         self._embedder: Qwen3SpeakerEmbedding | None = None
-        # note (Yue Yin): content-hash LRU of [2048] embeddings on the shared
-        # StageOutputCache. Entries are fixed-size so the count cap is the budget;
-        # batched encode + single-flight dedup are deferred to #809.
-        self._cache = StageOutputCache(
-            max_size=self.cache_max_items, cache_device="cpu"
-        )
-        self._last_fingerprint: str | None = None
+        self._embedder_lock = threading.Lock()
         # note (Yue Yin): opt-in compile kill-switch (default OFF for bit-for-bit
         # parity); driven by the speaker_encode stage's spk_compile factory arg.
         self._compile = compile_forward
-        # note (Yue Yin): max_concurrency=4 dispatches encode() across threads that
-        # share one CUDA model + one cache; serialize the body to keep it re-entrant
-        # (StageOutputCache is not internally locked).
-        self._lock = threading.Lock()
+        # note (Yue Yin): [2048] embeddings are fixed-size, so the count cap is the
+        # budget (no byte cap). The service holds the content-hash LRU + single-flight.
+        self._service: ReferenceEncodeService[
+            _Zonos2RefInput, torch.Tensor, torch.Tensor
+        ] = ReferenceEncodeService(
+            self,
+            max_items=int(cache_max_items),
+            max_bytes=None,
+            log_prefix="ZONOS2 speaker cache",
+        )
+        self._last_fingerprint: str | None = None
+        self._fp_lock = threading.Lock()
 
     def _get_embedder(self) -> Qwen3SpeakerEmbedding:
         if self._embedder is None:
-            self._embedder = Qwen3SpeakerEmbedding(
-                device=self.device, compile_forward=self._compile
-            )
+            with self._embedder_lock:
+                if self._embedder is None:
+                    self._embedder = Qwen3SpeakerEmbedding(
+                        device=self.device, compile_forward=self._compile
+                    )
         return self._embedder
+
+    def encode(self, ref_audio: Any, sample_rate: int | None = None) -> torch.Tensor:
+        """Encode reference audio into a raw ``[2048]`` CPU float32 embedding.
+
+        ``ref_audio`` may be a file path, raw audio bytes, or a
+        ``(waveform, sample_rate)`` pair.
+        """
+        item = self.normalize_input((ref_audio, sample_rate))
+        with self._fp_lock:
+            self._last_fingerprint = item.input_key
+        return self._service.get_or_encode(item)
+
+    def fingerprint(self) -> str | None:
+        """Content-hash string of the most recent :meth:`encode` call."""
+        return self._last_fingerprint
+
+    # ---- ReferenceEncodeHook ----
+
+    def normalize_input(self, raw_input: Any) -> _Zonos2RefInput:
+        if isinstance(raw_input, _Zonos2RefInput):
+            return raw_input
+        ref_audio, sample_rate = raw_input
+
+        if isinstance(ref_audio, (tuple, list)) and len(ref_audio) == 2:
+            wav, sr = ref_audio
+            wav = torch.as_tensor(wav, dtype=torch.float32)
+            sr = int(sr)
+            return _Zonos2RefInput(
+                kind="wav", wav=wav, sr=sr, input_key=self._hash_waveform(wav, sr)
+            )
+
+        if isinstance(ref_audio, torch.Tensor) or hasattr(
+            ref_audio, "__array_interface__"
+        ):
+            if sample_rate is None:
+                raise ValueError(
+                    "sample_rate is required when ref_audio is a bare waveform."
+                )
+            wav = torch.as_tensor(ref_audio, dtype=torch.float32)
+            sr = int(sample_rate)
+            return _Zonos2RefInput(
+                kind="wav", wav=wav, sr=sr, input_key=self._hash_waveform(wav, sr)
+            )
+
+        raw = self._to_bytes(ref_audio)
+        return _Zonos2RefInput(
+            kind="raw", raw=raw, input_key="raw:" + hashlib.sha256(raw).hexdigest()
+        )
+
+    def cache_key(self, item: _Zonos2RefInput) -> ReferenceEncodeKey:
+        return ReferenceEncodeKey(
+            model_id="zonos2",
+            model_revision="v1",
+            encoder_id=Qwen3SpeakerEmbedding.MODEL_NAME,
+            encoder_config_hash=_ENCODER_CONFIG_HASH,
+            artifact_kind="zonos2_speaker_embedding",
+            input_key=item.input_key,
+        )
+
+    def encode_one(self, item: _Zonos2RefInput) -> torch.Tensor:
+        if item.kind == "raw":
+            wav, sr = _decode_wav_bytes(_transcode_audio_bytes_to_wav(item.raw))
+        else:
+            wav, sr = item.wav, item.sr
+        embedder = self._get_embedder()
+        with torch.inference_mode():
+            output = embedder(wav, sr)
+        return self._select_embedding(output)
+
+    def store_artifact(self, artifact: torch.Tensor) -> torch.Tensor:
+        return artifact.detach().to("cpu", torch.float32).contiguous()
+
+    def load_artifact(self, stored: torch.Tensor) -> torch.Tensor:
+        # clone so callers can't mutate the cached tensor
+        return stored.clone()
 
     @staticmethod
     def _to_bytes(ref_audio: Any) -> bytes:
@@ -245,38 +359,6 @@ class SpeakerEncoder:
             return Path(ref_audio).read_bytes()
         raise TypeError(f"Unsupported ref_audio type: {type(ref_audio)!r}")
 
-    def _load_waveform(
-        self, ref_audio: Any, sample_rate: int | None
-    ) -> tuple[torch.Tensor, int, bytes]:
-        """Return ``(waveform[ch,T] float32, sample_rate, hash_key)``.
-
-        Accepts a ``(waveform, sr)`` pair, a bare tensor/array (needs
-        ``sample_rate``), or a path/bytes (ffmpeg transcode then decode).
-        """
-        if isinstance(ref_audio, (tuple, list)) and len(ref_audio) == 2:
-            wav, sr = ref_audio
-            wav = torch.as_tensor(wav, dtype=torch.float32)
-            sr = int(sr)
-            key = self._hash_waveform(wav, sr)
-            return wav, sr, key
-
-        if isinstance(ref_audio, torch.Tensor) or (
-            hasattr(ref_audio, "__array_interface__")
-        ):
-            if sample_rate is None:
-                raise ValueError(
-                    "sample_rate is required when ref_audio is a bare waveform."
-                )
-            wav = torch.as_tensor(ref_audio, dtype=torch.float32)
-            sr = int(sample_rate)
-            key = self._hash_waveform(wav, sr)
-            return wav, sr, key
-
-        raw = self._to_bytes(ref_audio)
-        wav, sr = _decode_wav_bytes(_transcode_audio_bytes_to_wav(raw))
-        key = "raw:" + hashlib.sha256(raw).hexdigest()
-        return wav, sr, key
-
     @staticmethod
     def _hash_waveform(wav: torch.Tensor, sr: int) -> str:
         contig = wav.detach().to("cpu", torch.float32).contiguous()
@@ -285,41 +367,6 @@ class SpeakerEncoder:
         h.update(str(int(sr)).encode())
         h.update(contig.numpy().tobytes())
         return "wav:" + h.hexdigest()
-
-    def encode(self, ref_audio: Any, sample_rate: int | None = None) -> torch.Tensor:
-        """Encode reference audio into a raw ``[2048]`` CPU float32 embedding.
-
-        ``ref_audio`` may be a file path, raw audio bytes, or a
-        ``(waveform, sample_rate)`` pair.
-        """
-        wav, sr, key = self._load_waveform(ref_audio, sample_rate)
-
-        # note (Yue Yin): hold the lock only for the cache + lazy embedder init,
-        # NOT the 0.3-0.5s read-only forward -- otherwise the 4 encode threads
-        # (max_concurrency=4) serialize on it and collapse to ~1.
-        with self._lock:
-            self._last_fingerprint = key
-            cached = self._cache.get(key)
-            if cached is not None:
-                # clone so callers can't mutate the cached tensor (get() already
-                # refreshes LRU recency)
-                return cached.clone()
-            embedder = self._get_embedder()
-
-        with torch.inference_mode():
-            output = embedder(wav, sr)
-        emb = self._select_embedding(output)
-
-        # note (Yue Yin): benign race -- two threads with the same key both
-        # compute and the second put() overwrites; the forward is deterministic
-        # so the emb is identical and the cache stays correct.
-        with self._lock:
-            self._cache.put(key, emb)
-        return emb.clone()
-
-    def fingerprint(self) -> str | None:
-        """Content-hash string of the most recent :meth:`encode` call."""
-        return self._last_fingerprint
 
     @staticmethod
     def _select_embedding(output: Any) -> torch.Tensor:
