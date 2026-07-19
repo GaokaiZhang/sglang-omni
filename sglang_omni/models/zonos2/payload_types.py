@@ -44,7 +44,9 @@ class Zonos2State(DeclarativeStateBase):
     speaker_fingerprint: str | None = None  # stable hash for radix extra_key
 
     # tts_engine output
-    audio_codes: Any | None = wire(None, codec="tensor_cpu")  # delayed (T, 9), pre-shear
+    audio_codes: Any | None = wire(
+        None, codec="tensor_cpu"
+    )  # delayed (T, 9), pre-shear
     eos_frame: int | None = wire(None, codec="opt_int")
 
     # bookkeeping
