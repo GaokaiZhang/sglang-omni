@@ -34,6 +34,7 @@ from sglang_omni.models.zonos2.components.text_frontend import (
     configure_tts_norm_cache_root,
 )
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
@@ -151,12 +152,9 @@ def create_vocoder_executor(
         )
         data["sample_rate"] = int(state.sample_rate)
         data["modality"] = "audio"
-        if state.prompt_tokens or state.completion_tokens:
-            data["usage"] = {
-                "prompt_tokens": int(state.prompt_tokens),
-                "completion_tokens": int(state.completion_tokens),
-                "total_tokens": int(state.prompt_tokens + state.completion_tokens),
-            }
+        usage = build_usage(state)
+        if usage is not None:
+            data["usage"] = usage
         return StagePayload(
             request_id=payload.request_id, request=payload.request, data=data
         )

@@ -27,6 +27,7 @@ from sglang_omni.models.zonos2.payload_types import (
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
@@ -328,12 +329,9 @@ class Zonos2StreamingVocoderScheduler(StreamingSimpleScheduler):
             "modality": "audio",
             "sample_rate": int(zstate.sample_rate),
         }
-        if zstate.prompt_tokens or zstate.completion_tokens:
-            final_data["usage"] = {
-                "prompt_tokens": int(zstate.prompt_tokens),
-                "completion_tokens": int(zstate.completion_tokens),
-                "total_tokens": int(zstate.prompt_tokens + zstate.completion_tokens),
-            }
+        usage = build_usage(zstate)
+        if usage is not None:
+            final_data["usage"] = usage
         messages.append(
             OutgoingMessage(
                 request_id=request_id,
