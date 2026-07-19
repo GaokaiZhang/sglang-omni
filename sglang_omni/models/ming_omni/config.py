@@ -99,6 +99,7 @@ def _aggregate_stage(*, process: str) -> StageConfig:
         wait_for=[PREPROCESSING_STAGE, AUDIO_STAGE, IMAGE_STAGE],
         merge_fn=f"{_PKG}.pipeline.merge.merge_for_thinker",
         next=THINKER_STAGE,
+        disable_direct_cuda_ipc_payload=True,
     )
 
 
@@ -222,6 +223,10 @@ class _MingOmniBasePipelineConfig(PipelineConfig):
     @classmethod
     def mem_fraction_role_to_stage(cls) -> dict[str, str]:
         return {"thinker": THINKER_STAGE}
+
+    @classmethod
+    def topology_gated_custom_all_reduce_stages(cls) -> set[str]:
+        return {THINKER_STAGE}
 
 
 class MingOmniPipelineConfig(_MingOmniBasePipelineConfig):

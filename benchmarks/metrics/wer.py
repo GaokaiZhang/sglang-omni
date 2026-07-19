@@ -3,21 +3,38 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
 
 import numpy as np
 
 from benchmarks.metrics._format import (
     SPEED_LABEL_WIDTH,
     SPEED_LINE_WIDTH,
+    print_benchmark_dataset_line,
     print_speed_metric_line,
 )
 
-if TYPE_CHECKING:
-    from benchmarks.tasks.tts import SampleOutput
+
+@dataclass
+class SampleOutput:
+    sample_id: str = ""
+    target_text: str = ""
+    whisper_text: str = ""
+    ref_norm: str = ""
+    hyp_norm: str = ""
+    wer: float = 0.0
+    substitutions: int = 0
+    deletions: int = 0
+    insertions: int = 0
+    hits: int = 0
+    audio_duration_s: float = 0.0
+    latency_s: float = 0.0
+    asr_latency_s: float = 0.0
+    is_success: bool = False
+    error: str = ""
 
 
-def calculate_wer_metrics(outputs: list["SampleOutput"], lang: str) -> dict:
+def calculate_wer_metrics(outputs: list[SampleOutput], lang: str) -> dict:
     """Compute corpus-level WER metrics from per-sample outputs."""
     successes = [o for o in outputs if o.is_success]
     if not successes:
@@ -107,6 +124,7 @@ def _print_wer_summary_table(
     model_label: str,
     generation_mode: str | None = None,
     tts_speed_summary: dict | None = None,
+    dataset: str | None = None,
 ) -> None:
     lw = SPEED_LABEL_WIDTH
     w = SPEED_LINE_WIDTH
@@ -119,6 +137,7 @@ def _print_wer_summary_table(
     print(f"{title:^{w}}")
     print(f"{'=' * w}")
     print(f"  {model_label:<{lw}} {model_name}")
+    print_benchmark_dataset_line(lw, dataset)
     if generation_mode:
         print(f"  {'Generation mode:':<{lw}} {generation_mode}")
     print(f"  {'Language:':<{lw}} {metrics.get('lang', 'N/A')}")
@@ -189,6 +208,7 @@ def print_wer_summary(
     generation_mode: str | None = None,
     *,
     tts_speed_summary: dict | None = None,
+    dataset: str | None = None,
 ) -> None:
     _print_wer_summary_table(
         metrics,
@@ -197,20 +217,24 @@ def print_wer_summary(
         model_label="TTS model:",
         generation_mode=generation_mode,
         tts_speed_summary=tts_speed_summary,
+        dataset=dataset,
     )
 
 
-def print_asr_wer_summary(metrics: dict, model_name: str) -> None:
+def print_asr_wer_summary(
+    metrics: dict, model_name: str, *, dataset: str | None = None
+) -> None:
     _print_wer_summary_table(
         metrics,
         model_name,
         title="ASR WER Benchmark Result",
         model_label="ASR model:",
+        dataset=dataset,
     )
 
 
 def calculate_asr_speed_metrics(
-    outputs: list["SampleOutput"],
+    outputs: list[SampleOutput],
     *,
     wall_time_s: float | None = None,
 ) -> dict:
@@ -271,7 +295,9 @@ def calculate_asr_speed_metrics(
     }
 
 
-def print_asr_speed_summary(metrics: dict, model_name: str) -> None:
+def print_asr_speed_summary(
+    metrics: dict, model_name: str, *, dataset: str | None = None
+) -> None:
     """Print ASR speed metrics summary table."""
     lw = SPEED_LABEL_WIDTH
     w = SPEED_LINE_WIDTH
@@ -279,6 +305,7 @@ def print_asr_speed_summary(metrics: dict, model_name: str) -> None:
     print(f"{'ASR Speed Benchmark Result':^{w}}")
     print(f"{'=' * w}")
     print(f"  {'ASR model:':<{lw}} {model_name}")
+    print_benchmark_dataset_line(lw, dataset)
     print(
         f"  {'Evaluated / Total:':<{lw}} "
         f"{metrics.get('evaluated', 0)}/{metrics.get('total_samples', 0)}"

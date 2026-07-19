@@ -29,9 +29,10 @@ import pytest
 from benchmarks.dataset.mmsu import load_mmsu_samples
 from benchmarks.dataset.prepare import DATASETS
 from benchmarks.eval.benchmark_omni_mmsu import run as run_mmsu
+from benchmarks.metrics._format import format_benchmark_dataset_label
 from benchmarks.metrics.mmsu import print_mmsu_summary
 from benchmarks.metrics.wer import print_wer_summary
-from benchmarks.tasks.tts import compute_text_audio_consistency_from_records
+from benchmarks.tasks.asr import compute_text_audio_consistency_from_records
 from tests.test_model.omni_router_utils import (
     ManagedRouterHandle,
     router_worker_traffic_guard,
@@ -60,8 +61,8 @@ MMSU_TTS_PROMPT = (
     "Do not exceed 120 words in total."
 )
 
-MMSU_AUDIO_MIN_ACCURACY = 0.625
-MMSU_AUDIO_WER_BELOW_50_CORPUS_MAX = 0.0426
+MMSU_AUDIO_MIN_ACCURACY = 0.65
+MMSU_AUDIO_WER_BELOW_50_CORPUS_MAX = 0.0297
 MMSU_AUDIO_WER_BELOW_50_CORPUS_THRESHOLD = apply_wer_slack(
     MMSU_AUDIO_WER_BELOW_50_CORPUS_MAX
 )
@@ -69,13 +70,22 @@ MMSU_AUDIO_N_ABOVE_50_MAX = 0
 
 _MMSU_AUDIO_P95 = {
     16: {
-        "throughput_qps": 1.757,
-        "output_tok_per_req_s": 7.7,
-        "latency_mean_s": 8.249,
-        "rtf_mean": 0.4409,
+        "throughput_qps": 1.187,
+        "output_tok_per_req_s": 4.9,
+        "latency_mean_s": 12.811,
+        "rtf_mean": 0.6805,
     },
 }
 MMSU_AUDIO_THRESHOLDS = apply_slack(_MMSU_AUDIO_P95)
+
+MMSU_TALKER_DATASET_LABEL = format_benchmark_dataset_label(
+    dataset="mmsu-ci-2000",
+    repo_id=DATASETS["mmsu-ci-2000"],
+)
+MMSU_TALKER_WER_DATASET_LABEL = format_benchmark_dataset_label(
+    dataset="mmsu-ci-2000 (talker output WER)",
+    repo_id=DATASETS["mmsu-ci-2000"],
+)
 
 
 def _build_args(port: int, output_dir: str) -> argparse.Namespace:
@@ -116,16 +126,16 @@ class _TalkerEvalArtifacts:
 
 @pytest.fixture(scope="module")
 def talker_eval_artifacts(
-    qwen3_omni_router_server: ManagedRouterHandle,
+    qwen3_omni_fp8_tp2_server: ManagedRouterHandle,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> _TalkerEvalArtifacts:
     output_dir = str(tmp_path_factory.mktemp("mmsu_audio"))
-    args = _build_args(qwen3_omni_router_server.port, output_dir)
+    args = _build_args(qwen3_omni_fp8_tp2_server.port, output_dir)
     samples = load_mmsu_samples(
         max_samples=MAX_SAMPLES, repo_id=DATASETS["mmsu-ci-2000"]
     )
     with router_worker_traffic_guard(
-        qwen3_omni_router_server,
+        qwen3_omni_fp8_tp2_server,
         label="Qwen3-Omni MMSU Talker",
     ) as router_guard:
         results = asyncio.run(run_mmsu(args, samples=samples, compute_wer=False))
@@ -143,11 +153,11 @@ def talker_eval_artifacts(
 
 @pytest.fixture(scope="module")
 def wer_eval_artifacts(
-    qwen3_omni_router_server: ManagedRouterHandle,
+    qwen3_omni_fp8_tp2_server: ManagedRouterHandle,
     talker_eval_artifacts: _TalkerEvalArtifacts,
 ) -> _TalkerEvalArtifacts:
     """Reuse saved benchmark audio for WER after freeing the talker server GPU."""
-    qwen3_omni_router_server.stop()
+    qwen3_omni_fp8_tp2_server.stop()
     wait_for_gpu_memory_release()
     return talker_eval_artifacts
 
@@ -161,6 +171,7 @@ def test_mmsu_talker_accuracy_and_speed(
         talker_eval_artifacts.accuracy,
         "qwen3-omni",
         speed_metrics=talker_eval_artifacts.speed,
+        dataset=MMSU_TALKER_DATASET_LABEL,
     )
 
     failed = talker_eval_artifacts.accuracy.get("failed_samples", 0)
@@ -205,7 +216,9 @@ def test_mmsu_talker_wer(
         asr_router_port=qwen3_asr_wer_router.port,
         asr_concurrency=QWEN3_ASR_WER_CONCURRENCY,
     )
-    print_wer_summary(wer["summary"], "qwen3-omni")
+    print_wer_summary(
+        wer["summary"], "qwen3-omni", dataset=MMSU_TALKER_WER_DATASET_LABEL
+    )
     persist_wer_in_benchmark_results(
         wer_eval_artifacts.audio_dir, wer, "mmsu_results.json"
     )

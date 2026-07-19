@@ -24,7 +24,7 @@ def create_thinker_scheduler(
 ):
     if tp_size < 1:
         raise ValueError(f"tp_size must be >= 1, got {tp_size}")
-    if getattr(server_args, "tp_size", None) != tp_size:
+    if server_args.tp_size != tp_size:
         server_args.tp_size = tp_size
 
     from sglang_omni.model_runner.ming_thinker_model_runner import (
@@ -322,7 +322,7 @@ def make_text_stream_output_builder(*, text_decode_stage: str = "decode"):
             OutgoingMessage(
                 request_id=request_id,
                 type="stream",
-                # Wrap int — relay_io.write_blob is tensor-only.
+                # Wrap int; stream transport only accepts tensors.
                 data=torch.tensor([token_id], dtype=torch.long),
                 target=text_decode_stage,
                 metadata={"token_id": token_id},

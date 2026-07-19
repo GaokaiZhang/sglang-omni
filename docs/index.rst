@@ -76,6 +76,8 @@ Supported Models
    cookbook/moss_tts_local.md
    cookbook/zonos2.md
    cookbook/qwen3_asr.md
+   cookbook/fun_asr.md
+   cookbook/moss_transcribe_diarize.md
    cookbook/whisper_asr.md
    cookbook/qwen3_omni.md
    cookbook/ming_omni.md
@@ -88,6 +90,7 @@ Supported Models
    basic_usage/qwen3_omni.md
    basic_usage/tts.md
    basic_usage/omni_router.md
+   basic_usage/mps_dp.md
 
 
 .. toctree::
@@ -106,5 +109,6 @@ Supported Models
    developer_reference/pipeline.md
    developer_reference/config.md
    developer_reference/communication.md
+   developer_reference/reference_encode_service.md
    developer_reference/profiler.md
    developer_reference/rl_admin_control.md

@@ -14,6 +14,8 @@ def create_thinker_scheduler(
     tp_rank: int = 0,
     nccl_port: int | None = None,
     total_gpu_memory_fraction: float | None = None,
+    enable_async_decode: bool = True,
+    async_decode_min_batch_size: int = 2,
 ):
     """Create the Qwen thinker scheduler."""
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -30,7 +32,7 @@ def create_thinker_scheduler(
 
     capture_hidden_layers = [0, 24] if speech_enabled else None
     capture_hidden = speech_enabled
-    want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
+    want_cuda_graph = not bool(server_args.disable_cuda_graph)
     defer_cuda_graph_capture = want_cuda_graph and capture_hidden
     if defer_cuda_graph_capture:
         server_args.enable_return_hidden_states = True
@@ -99,6 +101,8 @@ def create_thinker_scheduler(
         request_builder=request_builder,
         result_adapter=result_adapter,
         stream_output_builder=stream_output_builder,
+        enable_async_decode=enable_async_decode,
+        async_decode_min_batch_size=async_decode_min_batch_size,
     )
 
 

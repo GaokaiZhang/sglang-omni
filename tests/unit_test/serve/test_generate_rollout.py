@@ -13,6 +13,7 @@ from sglang_omni.client.types import (
     GenerateRequest,
     UsageInfo,
 )
+from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
 from sglang_omni.serve import create_app
 from sglang_omni.serve.openai_api import _build_rollout_generate_request
 from sglang_omni.serve.protocol import RolloutGenerateRequest as RolloutRequest
@@ -80,6 +81,7 @@ def test_generate_returns_miles_meta_info() -> None:
 
 def test_generate_returns_omni_rollout_when_present() -> None:
     result = _text_result()
+    result.output_token_logprobs = None
     result.omni_rollout = {
         "version": 1,
         "model_family": "qwen3_omni",
@@ -191,8 +193,28 @@ def test_generate_rejects_missing_logprobs_when_requested() -> None:
         },
     )
 
-    assert resp.status_code == 500
+    assert resp.status_code == 501
     assert "output_token_logprobs" in resp.text
+
+
+def test_generate_audio_logprob_error_hints_omni_rollout() -> None:
+    result = _text_result()
+    result.output_token_logprobs = None
+    result.audio = CompletionAudio(id="a1", data="QUJD", transcript="hello world")
+    client = _RolloutClient(result)
+    tc = TestClient(create_app(client, model_name="higgs-audio"))
+
+    resp = tc.post(
+        "/generate",
+        json={
+            "prompt": "hi",
+            "sampling_params": {},
+            "output_modalities": ["audio"],
+        },
+    )
+
+    assert resp.status_code == 501
+    assert "return_omni_rollout=true" in resp.text
 
 
 def test_generate_rejects_logprob_length_mismatch() -> None:
@@ -390,6 +412,61 @@ def test_converter_maps_input_ids_to_prompt_token_ids() -> None:
     assert gen.sampling.max_new_tokens == 8
     assert gen.stream is False
     assert gen.extra_params["return_logprob"] is True
+
+
+def test_converter_omits_explicit_params_when_sampling_omitted() -> None:
+    req = RolloutRequest(prompt="hi", sampling_params={})
+
+    gen = _build_rollout_generate_request(req)
+
+    assert gen.sampling.temperature == 1.0
+    assert gen.sampling.top_p == 1.0
+    assert gen.sampling.top_k == -1
+    assert EXPLICIT_GENERATION_PARAMS_KEY not in gen.metadata
+
+
+def test_converter_preserves_explicit_rollout_sampling_default_values() -> None:
+    req = RolloutRequest(
+        prompt="hi",
+        sampling_params={"temperature": 1.0, "top_p": 1.0, "top_k": -1},
+    )
+
+    gen = _build_rollout_generate_request(req)
+
+    assert gen.sampling.temperature == 1.0
+    assert gen.sampling.top_p == 1.0
+    assert gen.sampling.top_k == -1
+    assert gen.metadata[EXPLICIT_GENERATION_PARAMS_KEY] == [
+        "temperature",
+        "top_k",
+        "top_p",
+    ]
+
+
+def test_converter_does_not_mark_null_rollout_sampling_params_explicit() -> None:
+    req = RolloutRequest(
+        prompt="hi",
+        sampling_params={"temperature": None, "top_p": None, "top_k": None},
+    )
+
+    gen = _build_rollout_generate_request(req)
+
+    assert gen.sampling.temperature == 1.0
+    assert gen.sampling.top_p == 1.0
+    assert gen.sampling.top_k == -1
+    assert EXPLICIT_GENERATION_PARAMS_KEY not in gen.metadata
+
+
+def test_converter_preserves_rollout_metadata() -> None:
+    req = RolloutRequest(
+        prompt="hi",
+        sampling_params={},
+        metadata={"rollout_id": 1},
+    )
+
+    gen = _build_rollout_generate_request(req)
+
+    assert gen.metadata == {"rollout_id": 1}
 
 
 def test_converter_preserves_prompt_as_raw_rollout_input() -> None:

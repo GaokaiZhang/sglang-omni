@@ -20,7 +20,7 @@ from sglang_omni.models.moss_tts.request_builders import (
     normalize_moss_tts_inputs,
     resolve_moss_reference,
 )
-from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
+from sglang_omni.scheduling.streaming_vocoder import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.models.zonos2.payload_types import Zonos2State
 from sglang_omni.models.zonos2.radix_hash import RADIX_HASH_SPACE, poly_row_hash
 from sglang_omni.models.zonos2.components.text_frontend import TTSSamplingParams, make_speaker_slot

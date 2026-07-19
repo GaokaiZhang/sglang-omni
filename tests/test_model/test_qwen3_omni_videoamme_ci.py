@@ -19,6 +19,7 @@ import pytest
 from benchmarks.dataset.prepare import DATASETS
 from benchmarks.eval.benchmark_omni_videoamme import run_videoamme_eval
 from benchmarks.eval.benchmark_omni_videomme import VideoEvalConfig
+from benchmarks.metrics._format import format_benchmark_dataset_label
 from benchmarks.metrics.performance import print_speed_summary
 from benchmarks.metrics.video import print_videomme_accuracy_summary
 from tests.test_model.omni_router_utils import (
@@ -30,13 +31,13 @@ from tests.utils import MetricCheckCollector, apply_slack, assert_speed_threshol
 CONCURRENCY = 16
 MAX_SAMPLES = 50
 
-VIDEOAMME_MIN_ACCURACY = 0.62
+VIDEOAMME_MIN_ACCURACY = 0.66
 
 _VIDEOAMME_P95 = {
     16: {
-        "throughput_qps": 1.178,
-        "output_tok_per_req_s": 4.1,
-        "latency_mean_s": 12.159,
+        "throughput_qps": 1.676,
+        "output_tok_per_req_s": 6.0,
+        "latency_mean_s": 8.227,
     },
 }
 VIDEOAMME_THRESHOLDS = apply_slack(_VIDEOAMME_P95)
@@ -44,13 +45,13 @@ VIDEOAMME_THRESHOLDS = apply_slack(_VIDEOAMME_P95)
 
 @pytest.mark.benchmark
 def test_videoamme_accuracy_and_speed(
-    qwen3_omni_thinker_server: ManagedRouterHandle,
+    qwen3_omni_fp8_colocated_server: ManagedRouterHandle,
     tmp_path: Path,
 ) -> None:
     """Run videoamme-ci-50 at concurrency=16 and report accuracy + speed."""
     config = VideoEvalConfig(
         model="qwen3-omni",
-        port=qwen3_omni_thinker_server.port,
+        port=qwen3_omni_fp8_colocated_server.port,
         max_samples=MAX_SAMPLES,
         max_concurrency=CONCURRENCY,
         output_dir=str(tmp_path / "videoamme"),
@@ -62,22 +63,28 @@ def test_videoamme_accuracy_and_speed(
         timeout_s=500,
     )
     with router_worker_traffic_guard(
-        qwen3_omni_thinker_server,
+        qwen3_omni_fp8_colocated_server,
         label="Qwen3-Omni Video-AMME",
     ) as router_guard:
         results = asyncio.run(run_videoamme_eval(config))
 
     summary = results["summary"]
+    dataset_label = format_benchmark_dataset_label(
+        dataset="videoamme-ci-50",
+        repo_id=config.repo_id,
+    )
     print_videomme_accuracy_summary(
         summary,
         config.model,
         title="Video-AMME Accuracy",
+        dataset=dataset_label,
     )
     print_speed_summary(
         results["speed"],
         config.model,
         CONCURRENCY,
         title="Video-AMME Speed",
+        dataset=dataset_label,
     )
     failed = summary.get("failed", 0)
     total = summary.get("total_samples", 0)

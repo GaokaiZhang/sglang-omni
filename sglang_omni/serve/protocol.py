@@ -457,10 +457,53 @@ class VoiceListResponse(BaseModel):
     )
 
 
+class TranscriptionUsage(BaseModel):
+    """Duration-based usage info for a transcription response."""
+
+    type: str = "duration"
+    seconds: int
+
+
 class TranscriptionResponse(BaseModel):
     """OpenAI-compatible transcription response."""
 
     text: str
+    usage: TranscriptionUsage | None = None
+
+
+class TranscriptionSegment(BaseModel):
+    """A transcript segment with timestamps (OpenAI verbose_json)."""
+
+    id: int
+    start: float
+    end: float
+    text: str
+
+
+class TranscriptionVerboseResponse(BaseModel):
+    """OpenAI-compatible ``verbose_json`` transcription response."""
+
+    task: str = "transcribe"
+    language: str | None = None
+    duration: float | None = None
+    text: str
+    segments: list[TranscriptionSegment] = Field(default_factory=list)
+    usage: TranscriptionUsage | None = None
+
+
+class TranscriptionTextDeltaEvent(BaseModel):
+    """OpenAI-compatible streaming transcription delta event (SSE)."""
+
+    type: str = "transcript.text.delta"
+    delta: str
+
+
+class TranscriptionTextDoneEvent(BaseModel):
+    """OpenAI-compatible streaming transcription terminal event (SSE)."""
+
+    type: str = "transcript.text.done"
+    text: str
+    usage: TranscriptionUsage | None = None
 
 
 class ModelPermission(BaseModel):

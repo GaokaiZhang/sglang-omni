@@ -45,28 +45,28 @@ THRESHOLD_SLACK_LOWER = 1.25
 
 
 # Higgs thresholds.
-HIGGS_VC_WER_MAX_CORPUS = 0.0121
+HIGGS_VC_WER_MAX_CORPUS = 0.0103
 HIGGS_VC_WER_CORPUS_THRESHOLD = apply_wer_slack(HIGGS_VC_WER_MAX_CORPUS)
-HIGGS_VC_STREAM_WER_MAX_CORPUS = 0.0119
+HIGGS_VC_STREAM_WER_MAX_CORPUS = 0.0107
 HIGGS_VC_STREAM_WER_CORPUS_THRESHOLD = apply_wer_slack(HIGGS_VC_STREAM_WER_MAX_CORPUS)
-HIGGS_VC_SIMILARITY_MEAN_MIN = 66.8902230072
-HIGGS_VC_UTMOS_MEAN_REFERENCE = 4.1539
+HIGGS_VC_SIMILARITY_MEAN_MIN = 65.79954902648926
+HIGGS_VC_UTMOS_MEAN_REFERENCE = 4.1637
 HIGGS_VC_UTMOS_MEAN_MIN = apply_mos_slack(HIGGS_VC_UTMOS_MEAN_REFERENCE)
 
 _HIGGS_VC_NON_STREAM_P95 = {
     16: {
-        "throughput_qps": 14.717,
-        "output_tok_per_req_s": 141.1,
-        "latency_mean_s": 1.002,
-        "rtf_mean": 0.2339,
+        "throughput_qps": 18.189,
+        "output_tok_per_req_s": 146.4,
+        "latency_mean_s": 0.874,
+        "rtf_mean": 0.2129,
     }
 }
 
 _HIGGS_VC_STREAM_P95 = {
     16: {
-        "throughput_qps": 14.89,
-        "latency_mean_s": 0.97,
-        "rtf_mean": 0.2244,
+        "throughput_qps": 17.312,
+        "latency_mean_s": 0.918,
+        "rtf_mean": 0.2167,
     }
 }
 
@@ -79,28 +79,28 @@ HIGGS_VC_STREAM_THRESHOLDS = apply_slack(
 
 
 # MOSS Local thresholds.
-MOSS_VC_WER_MAX_CORPUS = 0.0288
+MOSS_VC_WER_MAX_CORPUS = 0.0249
 MOSS_VC_WER_CORPUS_THRESHOLD = apply_wer_slack(MOSS_VC_WER_MAX_CORPUS)
-MOSS_VC_STREAM_WER_MAX_CORPUS = 0.0262
+MOSS_VC_STREAM_WER_MAX_CORPUS = 0.0237
 MOSS_VC_STREAM_WER_CORPUS_THRESHOLD = apply_wer_slack(MOSS_VC_STREAM_WER_MAX_CORPUS)
-MOSS_VC_SIMILARITY_MEAN_MIN = 63.618772201538086
+MOSS_VC_SIMILARITY_MEAN_MIN = 64.11675895690918
 MOSS_VC_UTMOS_MEAN_REFERENCE = 3.9534
 MOSS_VC_UTMOS_MEAN_MIN = apply_mos_slack(MOSS_VC_UTMOS_MEAN_REFERENCE)
 
 _MOSS_VC_NON_STREAM_P95 = {
     16: {
-        "throughput_qps": 6.185,
-        "output_tok_per_req_s": 76.3,
-        "latency_mean_s": 2.576,
-        "rtf_mean": 0.6218,
+        "throughput_qps": 11.972,
+        "output_tok_per_req_s": 71.3,
+        "latency_mean_s": 1.331,
+        "rtf_mean": 0.3141,
     }
 }
 
 _MOSS_VC_STREAM_P95 = {
     16: {
-        "throughput_qps": 2.676,
-        "latency_mean_s": 5.951,
-        "rtf_mean": 1.4367,
+        "throughput_qps": 9.792,
+        "latency_mean_s": 1.625,
+        "rtf_mean": 0.3788,
     }
 }
 
@@ -115,7 +115,7 @@ MOSS_VC_STREAM_THRESHOLDS = apply_slack(
 TTS_CI_PRESETS: dict[str, TtsCiPreset] = {
     "higgs": TtsCiPreset(
         model=TtsCiModelPreset(
-            model_path="boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999",
+            model_path="bosonai/higgs-tts-3-4b",
         ),
         thresholds=TtsCiThresholdPreset(
             non_stream_speed=HIGGS_VC_NON_STREAM_THRESHOLDS,

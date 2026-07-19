@@ -156,18 +156,19 @@ class HiggsTTSModel(nn.Module):
                 self.multimodal_embedding.modality_embedding_0.weight
             )
 
-        self._max_batch_size = _resolve_max_running_requests()
-        pool_size = self._max_batch_size + 1
+        self._sampler_pool_max_running_requests = _resolve_max_running_requests()
+        pool_size = self._sampler_pool_max_running_requests + 1
         self._sampler_pool = HiggsBatchedSamplerState(
             max_batch_size=pool_size,
             num_codebooks=num_codebooks,
             device=self.backbone.model.embed_tokens.weight.device,
         )
-        self._padding_row = self._max_batch_size  # last row reserved
+        self._padding_row = self._sampler_pool_max_running_requests
         self._rid_to_row: dict[str, int] = {}
-        self._free_rows: list[int] = list(range(self._max_batch_size))
+        self._free_rows: list[int] = list(
+            range(self._sampler_pool_max_running_requests)
+        )
         self._output_codes: dict[str, list[torch.Tensor]] = {}
-
         cg_device = self.backbone.model.embed_tokens.weight.device
         self._cg_row_indices = torch.zeros(
             pool_size, dtype=torch.long, device=cg_device
@@ -227,15 +228,20 @@ class HiggsTTSModel(nn.Module):
     def codebook_vocab_size(self) -> int:
         return self._codebook_vocab_size
 
+    @property
+    def sampler_pool_max_running_requests(self) -> int:
+        return self._sampler_pool_max_running_requests
+
     def acquire_row(self, req_id: str) -> int:
         """Allocate or look up the sampler-pool row for ``req_id``. Idempotent."""
         row = self._rid_to_row.get(req_id)
         if row is not None:
             return row
         if not self._free_rows:
+            max_running_requests = self._sampler_pool_max_running_requests
             raise RuntimeError(
                 f"HiggsTTSModel sampler pool exhausted "
-                f"(max_running_requests={self._max_batch_size}); raise "
+                f"(max_running_requests={max_running_requests}); raise "
                 f"``max_running_requests`` or limit concurrent requests."
             )
         row = self._free_rows.pop()

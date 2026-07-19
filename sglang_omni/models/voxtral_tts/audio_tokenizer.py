@@ -481,12 +481,6 @@ class MultiVocabEmbeddings(nn.Module):
 # ---- Main Audio Tokenizer ----
 
 
-def prepare_for_attention(x: torch.Tensor, time_last: bool = True) -> torch.Tensor:
-    if time_last:
-        return rearrange(x, "b d t -> (b t) d")
-    return rearrange(x, "b t d -> (b t) d")
-
-
 class VoxtralTTSAudioTokenizer(nn.Module):
     def __init__(self, audio_tokenizer_args: dict, audio_config: dict) -> None:
         super().__init__()
@@ -674,7 +668,7 @@ class VoxtralTTSAudioTokenizer(nn.Module):
                 self.quantizer.semantic_codebook.embedding_sum = loaded_weight
                 return name
             else:
-                logger.warning("Weight %s not found in audio tokenizer", name)
+                logger.warning(f"Weight {name} not found in audio tokenizer")
                 return name
         param = params_dict[name]
         param.data.copy_(loaded_weight)

@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from sglang_omni.models.tts_streaming import resolve_initial_codec_chunk_frames
+from sglang_omni.scheduling.streaming_vocoder import resolve_initial_codec_chunk_frames
 from sglang_omni.models.zonos2.components.audio_codec import DAC_HOP_LENGTH, Zonos2DACVocoder
 from sglang_omni.models.zonos2.payload_types import (
     N_CODEBOOKS,

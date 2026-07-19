@@ -21,6 +21,7 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
     """3-stage Qwen3-TTS Base pipeline: preprocessing -> engine -> vocoder."""
 
     architecture: ClassVar[str] = "Qwen3TTSForConditionalGeneration"
+    requires_model_capabilities: ClassVar[bool] = True
 
     @classmethod
     def generation_sglang_role_to_stage(cls) -> dict[str, str]:
@@ -38,7 +39,7 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
             name="tts_engine",
             process="pipeline",
             factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
-            factory_args={"gpu_id": 0, "dtype": "bfloat16"},
+            factory_args={"dtype": "bfloat16"},
             gpu=0,
             next="vocoder",
         ),
@@ -46,7 +47,7 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
             name="vocoder",
             process="pipeline",
             factory=f"{_PKG}.stages.create_vocoder_executor",
-            factory_args={"gpu_id": 0, "dtype": "bfloat16"},
+            factory_args={"dtype": "bfloat16"},
             gpu=0,
             terminal=True,
         ),

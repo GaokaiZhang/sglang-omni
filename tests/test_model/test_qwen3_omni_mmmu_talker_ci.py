@@ -28,10 +28,11 @@ import pytest
 
 from benchmarks.dataset.prepare import DATASETS
 from benchmarks.eval.benchmark_omni_mmmu import MMMUEvalConfig, run_mmmu_eval
+from benchmarks.metrics._format import format_benchmark_dataset_label
 from benchmarks.metrics.mmmu import print_mmmu_accuracy_summary
 from benchmarks.metrics.performance import print_speed_summary
 from benchmarks.metrics.wer import print_wer_summary
-from benchmarks.tasks.tts import compute_text_audio_consistency_from_records
+from benchmarks.tasks.asr import compute_text_audio_consistency_from_records
 from tests.test_model.omni_router_utils import (
     ManagedRouterHandle,
     router_worker_traffic_guard,
@@ -60,22 +61,31 @@ MMMU_TTS_PROMPT = (
     "Do not exceed 120 words in total."
 )
 
-MMMU_AUDIO_MIN_ACCURACY = 0.7
-MMMU_AUDIO_WER_BELOW_50_CORPUS_MAX = 0.2826
+MMMU_AUDIO_MIN_ACCURACY = 0.70
+MMMU_AUDIO_WER_BELOW_50_CORPUS_MAX = 0.2349
 MMMU_AUDIO_WER_BELOW_50_CORPUS_THRESHOLD = apply_wer_slack(
     MMMU_AUDIO_WER_BELOW_50_CORPUS_MAX
 )
-MMMU_AUDIO_N_ABOVE_50_MAX = 5
+MMMU_AUDIO_N_ABOVE_50_MAX = 6
 
 _MMMU_AUDIO_P95 = {
     16: {
-        "throughput_qps": 0.582,
-        "output_tok_per_req_s": 8,
-        "latency_mean_s": 16.895,
-        "rtf_mean": 0.4291,
+        "throughput_qps": 0.652,
+        "output_tok_per_req_s": 7.2,
+        "latency_mean_s": 19.357,
+        "rtf_mean": 0.4996,
     },
 }
 MMMU_AUDIO_THRESHOLDS = apply_slack(_MMMU_AUDIO_P95)
+
+MMMU_TALKER_DATASET_LABEL = format_benchmark_dataset_label(
+    dataset="mmmu-ci-50",
+    repo_id=DATASETS["mmmu-ci-50"],
+)
+MMMU_TALKER_WER_DATASET_LABEL = format_benchmark_dataset_label(
+    dataset="mmmu-ci-50 (talker output WER)",
+    repo_id=DATASETS["mmmu-ci-50"],
+)
 
 
 @dataclass
@@ -89,13 +99,13 @@ class _TalkerEvalArtifacts:
 
 @pytest.fixture(scope="module")
 def talker_eval_artifacts(
-    qwen3_omni_router_server: ManagedRouterHandle,
+    qwen3_omni_bf16_disagg_server: ManagedRouterHandle,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> _TalkerEvalArtifacts:
     output_dir = str(tmp_path_factory.mktemp("mmmu_audio"))
     config = MMMUEvalConfig(
         model="qwen3-omni",
-        port=qwen3_omni_router_server.port,
+        port=qwen3_omni_bf16_disagg_server.port,
         max_samples=MAX_SAMPLES,
         max_tokens=MAX_TOKENS,
         max_concurrency=CONCURRENCY,
@@ -108,7 +118,7 @@ def talker_eval_artifacts(
         timeout_s=500,
     )
     with router_worker_traffic_guard(
-        qwen3_omni_router_server,
+        qwen3_omni_bf16_disagg_server,
         label="Qwen3-Omni MMMU Talker",
     ) as router_guard:
         results = asyncio.run(run_mmmu_eval(config, compute_wer=False))
@@ -126,11 +136,11 @@ def talker_eval_artifacts(
 
 @pytest.fixture(scope="module")
 def wer_eval_artifacts(
-    qwen3_omni_router_server: ManagedRouterHandle,
+    qwen3_omni_bf16_disagg_server: ManagedRouterHandle,
     talker_eval_artifacts: _TalkerEvalArtifacts,
 ) -> _TalkerEvalArtifacts:
     """Reuse saved benchmark audio for WER after freeing the talker server GPU."""
-    qwen3_omni_router_server.stop()
+    qwen3_omni_bf16_disagg_server.stop()
     wait_for_gpu_memory_release()
     return talker_eval_artifacts
 
@@ -141,12 +151,15 @@ def test_mmmu_talker_accuracy_and_speed(
 ) -> None:
     """Run MMMU eval with audio and assert accuracy and speed meet thresholds."""
     summary = talker_eval_artifacts.summary
-    print_mmmu_accuracy_summary(summary, "qwen3-omni")
+    print_mmmu_accuracy_summary(
+        summary, "qwen3-omni", dataset=MMMU_TALKER_DATASET_LABEL
+    )
     print_speed_summary(
         talker_eval_artifacts.speed,
         "qwen3-omni",
         CONCURRENCY,
         title="MMMU Talker Speed",
+        dataset=MMMU_TALKER_DATASET_LABEL,
     )
 
     failed = summary.get("failed", 0)
@@ -190,7 +203,9 @@ def test_mmmu_talker_wer(
         asr_router_port=qwen3_asr_wer_router.port,
         asr_concurrency=QWEN3_ASR_WER_CONCURRENCY,
     )
-    print_wer_summary(wer["summary"], "qwen3-omni")
+    print_wer_summary(
+        wer["summary"], "qwen3-omni", dataset=MMMU_TALKER_WER_DATASET_LABEL
+    )
     persist_wer_in_benchmark_results(
         wer_eval_artifacts.audio_dir, wer, "mmmu_results.json"
     )

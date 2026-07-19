@@ -14,6 +14,7 @@ class MossTTSPipelineConfig(PipelineConfig):
     """MOSS-TTS Delay pipeline: preprocessing -> AR engine -> vocoder."""
 
     architecture: ClassVar[str] = "MossTTSDelayModel"
+    requires_model_capabilities: ClassVar[bool] = True
     architecture_aliases: ClassVar[tuple[str, ...]] = (
         "MossTTSDelay",
         "MossTTSDelayForConditionalGeneration",
@@ -45,7 +46,7 @@ class MossTTSPipelineConfig(PipelineConfig):
             name="tts_engine",
             process="pipeline",
             factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
-            factory_args={"gpu_id": 0, "dtype": "bfloat16"},
+            factory_args={"dtype": "bfloat16"},
             gpu=0,
             next="vocoder",
         ),
@@ -53,7 +54,7 @@ class MossTTSPipelineConfig(PipelineConfig):
             name="vocoder",
             process="pipeline",
             factory=f"{_PKG}.stages.create_vocoder_executor",
-            factory_args={"gpu_id": 0, "dtype": "float32"},
+            factory_args={"dtype": "float32"},
             gpu=0,
             terminal=True,
         ),

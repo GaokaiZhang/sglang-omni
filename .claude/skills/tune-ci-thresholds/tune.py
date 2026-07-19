@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Observe CI metrics over N runs on the H20 repro host.
+"""Observe CI metrics over N runs on the H100 repro host.
 Emits worst-of-N markdown. Does NOT propose thresholds or edit tests.
 Model-agnostic: pass --model <name>; config comes from
 models/<name>/config.yaml. Metrics come from result JSONs that tests
 already write under pytest's --basetemp (set fresh per run).
 """
 from __future__ import annotations
-import argparse, ast, datetime as dt, hashlib, json, math, os, re, shutil, signal
-import subprocess, sys, time, tomllib
+import argparse, ast, datetime as dt, hashlib, json, math, os, platform, re, shutil, signal
+import statistics, subprocess, sys, time, tomllib
 from pathlib import Path
 
-__version__ = "0.5.0"
+__version__ = "0.7.0"
 
 SKILL_DIR = Path(__file__).resolve().parent
 MODELS_DIR = SKILL_DIR / "models"
 HOSTS_DIR = SKILL_DIR / "hosts"
-DEFAULT_MODEL = "qwen3-omni-v1"
+DEFAULT_MODEL = "omni"
 _SPEAKER_SIM_MIN_BYTES = 100 * 1024 * 1024
 REPO_ROOT = Path("/sgl-workspace/sglang-omni")
 if not REPO_ROOT.exists():
@@ -73,11 +73,14 @@ def _flashinfer_cache_dirs(env: dict[str, str] | None = None) -> list[Path]:
 
 
 def _cleanup_flashinfer_cache(env: dict[str, str] | None = None) -> None:
-    # Wipe the runtime FlashInfer JIT dirs so kernels recompile cleanly on the
-    # next cold start. Matches CI, which wipes the same dir before every pytest
-    # attempt (omni-setup at job start + run_flaky_pytest.sh before each retry).
-    for cache_dir in _flashinfer_cache_dirs(env):
-        shutil.rmtree(cache_dir, ignore_errors=True)
+    # Wipe only this job's FlashInfer JIT dir so kernels recompile cleanly.
+    # Concurrent calibration groups must use distinct XDG_CACHE_HOME / HOME
+    # partitions; never delete every candidate path (that races live workers).
+    env = env or os.environ
+    cache_dirs = _flashinfer_cache_dirs(env)
+    if not cache_dirs:
+        return
+    shutil.rmtree(cache_dirs[0], ignore_errors=True)
 
 
 # Metric registry. Each entry encodes how a named metric should be
@@ -90,6 +93,16 @@ METRIC_SPECS = {
     "per_sample_wer_max":   dict(worst="max", label="Max per-sample WER (%)", digits=2, scale=100, group="wer"),
     "wer_below_50_corpus":  dict(worst="max", label="Corpus WER ≤50% (%)", digits=2, scale=100, group="wer"),
     "n_above_50":           dict(worst="max", label="Samples >50% WER",      digits=0, scale=1,   group="wer"),
+    "cer_percent":          dict(worst="max", label="CER (%)",               digits=2, scale=1,   group="diarization"),
+    "cer_no_spk_percent":   dict(worst="max", label="CER no-spk (%)",        digits=2, scale=1,   group="diarization"),
+    "cp_cer_percent":       dict(worst="max", label="cpCER (%)",             digits=2, scale=1,   group="diarization"),
+    "cer_no_spk_cp_valid_percent": dict(worst="max", label="CER no-spk cp-valid (%)", digits=2, scale=1, group="diarization"),
+    "delta_cer_percent":    dict(worst="max", label="Delta CER (%)",         digits=2, scale=1,   group="diarization"),
+    "cer_no_spk_below_50_corpus": dict(worst="max", label="CER no-spk ≤50% corpus (%)", digits=2, scale=1, group="diarization"),
+    "n_above_50_pct_cer":   dict(worst="max", label="Samples >50% CER",      digits=0, scale=1,   group="diarization"),
+    "speaker_timestamp_der_percent": dict(worst="max", label="Speaker-timestamp DER (%)", digits=2, scale=1, group="diarization"),
+    "cer_valid_samples":    dict(worst="min", label="CER valid samples",     digits=0, scale=1,   group="diarization"),
+    "cp_cer_valid_samples": dict(worst="min", label="cpCER valid samples",   digits=0, scale=1,   group="diarization"),
     "throughput_qps":       dict(worst="min", label="Throughput (req/s)",    digits=3, scale=1,   group="speed"),
     "output_tok_per_req_s": dict(
         worst="min", label="Output tok/req-s", digits=1, scale=1, group="speed"
@@ -98,6 +111,8 @@ METRIC_SPECS = {
     "latency_p95_s":        dict(worst="max", label="Latency p95 (s)",       digits=3, scale=1,   group="speed"),
     "rtf_mean":             dict(worst="max", label="RTF mean",              digits=4, scale=1,   group="speed"),
     "rtf_p95":              dict(worst="max", label="RTF p95",               digits=4, scale=1,   group="speed"),
+    "text_ttft_p95_s":      dict(worst="max", label="Text TTFT p95 (s)",     digits=4, scale=1,   group="speed"),
+    "inter_chunk_p95_s":    dict(worst="max", label="Inter-chunk p95 (s)",   digits=4, scale=1,   group="speed"),
     "failed_requests":      dict(worst="max", label="Failed requests",       digits=0, scale=1,   group="reliability"),
     "similarity_mean":      dict(worst="min", label="Speaker sim mean",      digits=4, scale=1,   group="similarity"),
     "utmos_mean":           dict(worst="min", label="UTMOS mean",            digits=4, scale=1,   group="utmos"),
@@ -148,11 +163,19 @@ _TTS_FIXED_PRESETS = frozenset({
     "STREAMING_BENCHMARK_MAX_SAMPLES",
 })
 
+# Assertion literals that stay hand-pinned. Discover must not emit them as
+# calibration metrics, and apply must never rewrite them from worst-of-N.
+# MOSS streaming n_above_50 is too unstable for worst-of-N; keep the test
+# constant fixed (currently 31) across calibration cycles.
+_FIXED_THRESHOLD_SYMBOLS = frozenset({
+    "MOSS_TD_STREAM_N_ABOVE_50_CER_MAX",
+})
+
 
 def match_metric(name, nested):
     if nested is not None:
         return nested if nested in _NESTED else None
-    if name in _TTS_FIXED_PRESETS:
+    if name in _TTS_FIXED_PRESETS or name in _FIXED_THRESHOLD_SYMBOLS:
         return None
     if re.fullmatch(r".*_ACC(?:URACY)?_MIN", name) or re.fullmatch(r".*_MIN_ACCURACY", name):
         return "accuracy"
@@ -162,6 +185,30 @@ def match_metric(name, nested):
     if "N_ABOVE_50_MAX" in name: return "n_above_50"
     if name == "TTS_MAX_FAILED_REQUESTS" or "MAX_FAILED_REQUESTS" in name:
         return "failed_requests"
+    if "CER_NO_SPK_CP_VALID_PERCENT" in name:
+        return "cer_no_spk_cp_valid_percent"
+    if "CER_NO_SPK_BELOW_50_PERCENT" in name:
+        return "cer_no_spk_below_50_corpus"
+    if "CER_NO_SPK_PERCENT" in name:
+        return "cer_no_spk_percent"
+    if "CP_CER_PERCENT" in name:
+        return "cp_cer_percent"
+    if "DELTA_CER_PERCENT" in name:
+        return "delta_cer_percent"
+    # Non-streaming uses MOSS_TD_N_ABOVE_50_CER_REF (+ slack-derived MAX).
+    # Streaming MAX is in _FIXED_THRESHOLD_SYMBOLS and never matches here.
+    if "N_ABOVE_50_CER_MAX" in name:
+        return "n_above_50_pct_cer"
+    # DER calibrates the reference constant (test derives the MAX via slack),
+    # so match the *_REF symbol; the computed *_MAX literal is left unmatched.
+    if "SPEAKER_TIMESTAMP_DER_PERCENT_REF" in name:
+        return "speaker_timestamp_der_percent"
+    if "CP_CER_VALID_SAMPLES_MIN" in name:
+        return "cp_cer_valid_samples"
+    if "CER_VALID_SAMPLES_MIN" in name:
+        return "cer_valid_samples"
+    if "CER_PERCENT" in name:
+        return "cer_percent"
     if "SIMILARITY" in name and name.endswith("_MIN"):
         return "similarity_mean"
     if "UTMOS" in name and name.endswith("_REFERENCE"):
@@ -170,11 +217,20 @@ def match_metric(name, nested):
     if "WER_MAX_PER_SAMPLE" in name: return "per_sample_wer_max"
     if "CORPUS_WER_MAX" in name: return "corpus_wer"
     if "SAMPLE_WER_MAX" in name: return "per_sample_wer_max"
-    if "THROUGHPUT_MIN" in name: return "throughput_qps"
-    if "LATENCY_MEAN_MAX" in name: return "latency_mean_s"
-    if "LATENCY_P95_MAX" in name: return "latency_p95_s"
-    if "RTF_MEAN_MAX" in name: return "rtf_mean"
-    if "RTF_P95_MAX" in name: return "rtf_p95"
+    if "THROUGHPUT_QPS" in name or "THROUGHPUT_MIN" in name:
+        return "throughput_qps"
+    if "LATENCY_MEAN" in name:
+        return "latency_mean_s"
+    if "LATENCY_P95" in name:
+        return "latency_p95_s"
+    if "RTF_MEAN" in name:
+        return "rtf_mean"
+    if "RTF_P95" in name:
+        return "rtf_p95"
+    if "TEXT_TTFT" in name and "P95" in name:
+        return "text_ttft_p95_s"
+    if "INTER_CHUNK" in name and "P95" in name:
+        return "inter_chunk_p95_s"
     return None
 
 
@@ -328,9 +384,34 @@ def read_pins():
 
 
 def venv_version(py, mod):
-    r = subprocess.run([py, "-c", f"import {mod};print({mod}.__version__)"],
-                       capture_output=True, text=True, timeout=60)
-    if r.returncode: raise RuntimeError(f"{mod} version read failed: {r.stderr.strip()}")
+    # Prefer importlib.metadata so precheck does not import heavy packages
+    # (importing sglang touches CUDA and can be SIGKILL'd by a sibling group's
+    # scoped GPU cleanup during parallel calibration).
+    r = subprocess.run(
+        [
+            py,
+            "-c",
+            (
+                "import importlib.metadata as m\n"
+                f"print(m.version({mod!r}))\n"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    r = subprocess.run(
+        [py, "-c", f"import {mod};print({mod}.__version__)"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+    )
+    if r.returncode:
+        raise RuntimeError(f"{mod} version read failed: {r.stderr.strip()}")
     return r.stdout.strip()
 
 
@@ -340,6 +421,123 @@ def git_info():
     return dict(sha=q(["git", "rev-parse", "HEAD"]),
                 branch=q(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
                 dirty=bool(q(["git", "status", "--porcelain"])))
+
+
+def _command_output(cmd: list[str], timeout: int = 30) -> str:
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=timeout
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def environment_fingerprint(py: str, cfg: dict, versions: dict) -> dict:
+    """Capture enough runtime identity to compare calibration with CI."""
+    freeze = _command_output([py, "-m", "pip", "freeze"], timeout=120)
+    gpu_csv = _command_output([
+        "nvidia-smi", "--query-gpu=index,name,uuid,driver_version,memory.total",
+        "--format=csv,noheader,nounits",
+    ])
+    topology = _command_output(["nvidia-smi", "topo", "-m"])
+    env_keys = (
+        "HOME", "OMNI_CI_HOME", "HF_HOME", "MODELSCOPE_CACHE",
+        "XDG_CACHE_HOME", "HF_ENDPOINT", "TORCHINDUCTOR_CACHE_DIR",
+        "FLASHINFER_DISABLE_VERSION_CHECK", "SEEDTTS_SIM_CACHE_DIR",
+        "TUNE_GPU_INCLUDE", "TUNE_GPU_EXCLUDE", "LD_LIBRARY_PATH",
+    )
+    image_digest = (
+        os.environ.get("OMNI_CI_IMAGE_DIGEST")
+        or os.environ.get("CONTAINER_IMAGE_DIGEST")
+    )
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface"))
+    hub = hf_home if hf_home.name == "hub" else hf_home / "hub"
+
+    def cached_revisions(repo_id: str, repo_type: str = "model") -> list[str]:
+        prefix = "datasets--" if repo_type == "dataset" else "models--"
+        snapshots = hub / f"{prefix}{repo_id.replace('/', '--')}" / "snapshots"
+        return sorted(path.name for path in snapshots.glob("*") if path.is_dir())
+
+    model_ids = _all_model_ids(cfg)
+    dataset_ids = cfg.get("hf_datasets", [])
+    return dict(
+        captured_at=now_iso(), hostname=platform.node(), platform=platform.platform(),
+        container_image=os.environ.get("OMNI_CI_IMAGE"),
+        container_image_digest=image_digest,
+        image_identity_status="verified" if image_digest else "unverified",
+        python=_command_output([py, "--version"]), executable=str(Path(py).resolve()),
+        package_versions=versions,
+        dependency_freeze_sha256=(
+            hashlib.sha256(freeze.encode()).hexdigest() if freeze else None
+        ),
+        dependency_freeze=freeze.splitlines(),
+        gpu_inventory=gpu_csv.splitlines(), topology=topology,
+        gpu_group=calibration_gpu_pool(cfg.get("_host")),
+        environment={key: os.environ.get(key) for key in env_keys},
+        model_ids=model_ids, dataset_ids=dataset_ids,
+        model_revisions={repo: cached_revisions(repo) for repo in model_ids},
+        dataset_revisions={repo: cached_revisions(repo, "dataset") for repo in dataset_ids},
+        cache_state="recorded" if hub.exists() else "unknown",
+        comparability=(
+            "core-pins-match; image-digest-unverified"
+            if not image_digest else "core-pins-and-image-identity-recorded"
+        ),
+    )
+
+
+def _plan_calibration_sha(plan: dict) -> str:
+    """Git commit this calibration session is bound to."""
+    return plan.get("calibration_git_sha") or plan.get("git_sha") or ""
+
+
+def audit_git_provenance(run_dir: Path, plan=None) -> dict:
+    """Every run{k}.json must record the same git_sha as plan calibration_git_sha."""
+    plan = plan or json.loads((run_dir / "plan.json").read_text())
+    cal_sha = _plan_calibration_sha(plan)
+    if not cal_sha:
+        return dict(
+            ok=False,
+            calibration_git_sha="",
+            missing_sha=[],
+            mismatches=[],
+            reason="plan.json has no calibration_git_sha",
+        )
+    missing_sha = []
+    mismatches = []
+    repeats = plan["repeats"]
+    for sk in plan["stages"]:
+        for k in range(1, repeats + 1):
+            p = run_dir / sk / f"run{k}.json"
+            if not p.exists():
+                continue
+            try:
+                data = json.loads(p.read_text())
+            except (json.JSONDecodeError, OSError):
+                mismatches.append(f"{sk}/run{k}: corrupt json")
+                continue
+            run_sha = data.get("git_sha")
+            if not run_sha:
+                missing_sha.append(f"{sk}/run{k}")
+            elif run_sha != cal_sha:
+                mismatches.append(
+                    f"{sk}/run{k}: artifact {run_sha[:8]} != calibration {cal_sha[:8]}"
+                )
+    ok = not missing_sha and not mismatches
+    reason = ""
+    if missing_sha:
+        reason = (
+            f"{len(missing_sha)} run(s) missing git_sha "
+            "(pre-v0.6.0 or stale — purge and re-run on current commit)"
+        )
+    elif mismatches:
+        reason = f"{len(mismatches)} run(s) recorded on a different commit"
+    return dict(
+        ok=ok,
+        calibration_git_sha=cal_sha,
+        missing_sha=missing_sha,
+        mismatches=mismatches,
+        reason=reason,
+    )
 
 
 def _unique_ordered(items):
@@ -425,18 +623,26 @@ def _gpu_memory_used_mib():
     return list(_gpu_memory_by_index().values())
 
 
-def _kill_calibration_gpu_processes():
-    """Match CI omni-post-stage cleanup between calibration runs."""
+def _kill_calibration_gpu_processes(gpu_indices: list[int] | tuple[int, ...]) -> None:
+    """Kill processes only on GPUs owned by the current pytest invocation.
+
+    Calibration groups may run concurrently under the same Unix user. A caller
+    must therefore provide the exact physical GPU indices it owns; global
+    process-pattern kills are never safe here.
+    """
+    targets = sorted(set(int(i) for i in gpu_indices))
+    if not targets:
+        return
     script = REPO_ROOT / ".github/scripts/delete_gpu_process.sh"
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, targets))
     if script.exists():
-        subprocess.run(["bash", str(script)], capture_output=True, check=False)
-    for pattern in (
-        "sgl-omni serve",
-        "sglang_omni_router.serve",
-        "stage_process",
-        "pytest tests/test_model",
-    ):
-        subprocess.run(["pkill", "-9", "-f", pattern], check=False)
+        # Keep stdout/stderr visible so cross-group mis-kills are auditable.
+        subprocess.run(
+            ["bash", str(script), "--kill-orphans"],
+            check=False,
+            env=env,
+        )
 
 
 def _picked_gpus_mem_snapshot(picked: list[int]) -> dict[int, int]:
@@ -456,44 +662,53 @@ def _picked_gpus_under_limit(picked: list[int]) -> bool:
     )
 
 
-def _ready_gpu_indices(gpus_needed: int):
+def _ready_gpu_indices(gpus_needed: int, host: dict | None = None):
     """GPU indices with no compute app and memory <= _GPU_RETRY_MEM_MIB."""
     mem = _gpu_memory_by_index()
     busy = busy_gpu_indices()
+    excluded = excluded_gpu_indices(host)
+    pool = set(calibration_gpu_pool(host))
     ready = [
         idx for idx in sorted(mem)
-        if idx not in busy and mem[idx] <= _GPU_RETRY_MEM_MIB
+        if idx in pool
+        and idx not in excluded
+        and idx not in busy
+        and mem[idx] <= _GPU_RETRY_MEM_MIB
     ]
     return ready, mem, busy
 
 
-def _ensure_gpus_free(gpus_needed: int, timeout: int = _GPU_WAIT_TIMEOUT_S) -> bool:
-    """Kill stale processes and wait until >= gpus_needed GPUs are each < 2 GiB."""
-    _kill_calibration_gpu_processes()
+def _ensure_gpus_free(gpus_needed: int, timeout: int = _GPU_WAIT_TIMEOUT_S,
+                      host: dict | None = None,
+                      target_gpus: list[int] | None = None) -> bool:
+    """Wait for free GPUs, cleaning only an explicitly owned GPU group."""
+    if target_gpus:
+        _kill_calibration_gpu_processes(target_gpus)
     time.sleep(3)
     waited = 0
     last_log = -30
     while waited < timeout:
-        ready, mem, busy = _ready_gpu_indices(gpus_needed)
+        ready, mem, busy = _ready_gpu_indices(gpus_needed, host)
         if len(ready) >= gpus_needed:
             picked_mem = {i: mem[i] for i in ready[:gpus_needed]}
             print(f"  GPU ready for launch {picked_mem} MiB (each <= "
                   f"{_GPU_RETRY_MEM_MIB}) after {waited}s")
             return True
         if waited - last_log >= 30:
+            excluded = sorted(excluded_gpu_indices(host))
             print(f"  waiting: need {gpus_needed} GPU(s) each <= "
                   f"{_GPU_RETRY_MEM_MIB} MiB ({waited}s/{timeout}s): "
-                  f"mem={mem} busy={sorted(busy)} ready={len(ready)}")
+                  f"mem={mem} busy={sorted(busy)} ready={len(ready)} "
+                  f"pool={calibration_gpu_pool(host)} excluded={excluded}")
             last_log = waited
         time.sleep(_GPU_WAIT_POLL_S)
         waited += _GPU_WAIT_POLL_S
-        if waited % 60 == 0:
-            _kill_calibration_gpu_processes()
-    subprocess.run(["pkill", "-9", "-f", "sgl-omni"], check=False)
+        if target_gpus and waited % 60 == 0:
+            _kill_calibration_gpu_processes(target_gpus)
     time.sleep(5)
-    ready, mem, busy = _ready_gpu_indices(gpus_needed)
+    ready, mem, busy = _ready_gpu_indices(gpus_needed, host)
     if len(ready) >= gpus_needed:
-        print(f"  GPU ready after forced pkill: "
+        print(f"  GPU ready after final scoped cleanup: "
               f"{ {i: mem[i] for i in ready[:gpus_needed]} } MiB")
         return True
     print(f"  error: cannot launch — need {gpus_needed} GPU(s) each <= "
@@ -502,15 +717,18 @@ def _ensure_gpus_free(gpus_needed: int, timeout: int = _GPU_WAIT_TIMEOUT_S) -> b
     return False
 
 
-def _pick_gpus_for_launch(gpus_needed: int, label: str) -> tuple[list[int] | None, str]:
+def _pick_gpus_for_launch(gpus_needed: int, label: str,
+                          host: dict | None = None) -> tuple[list[int] | None, str]:
     """Select GPUs only after _ensure_gpus_free; abort if any picked GPU >= 2 GiB."""
-    if not _ensure_gpus_free(gpus_needed):
+    pinned = included_gpu_indices(host)
+    owned = sorted(pinned) if pinned is not None else None
+    if not _ensure_gpus_free(gpus_needed, host=host, target_gpus=owned):
         return None, "GPU memory not released after cleanup"
-    picked, err = pick_free_gpus(gpus_needed)
+    picked, err = pick_free_gpus(gpus_needed, host)
     if picked is None:
-        if not _ensure_gpus_free(gpus_needed):
+        if not _ensure_gpus_free(gpus_needed, host=host, target_gpus=owned):
             return None, err or "GPU memory not released after cleanup"
-        picked, err = pick_free_gpus(gpus_needed)
+        picked, err = pick_free_gpus(gpus_needed, host)
     if picked is None:
         return None, err or "no GPU under 2 GiB memory limit"
     if not _picked_gpus_under_limit(picked):
@@ -519,7 +737,8 @@ def _pick_gpus_for_launch(gpus_needed: int, label: str) -> tuple[list[int] | Non
     return picked, ""
 
 
-def _launch_gpu_gate(picked: list[int], gpus_needed: int, label: str) -> tuple[list[int] | None, str]:
+def _launch_gpu_gate(picked: list[int], gpus_needed: int, label: str,
+                     host: dict | None = None) -> tuple[list[int] | None, str]:
     """Hard gate immediately before pytest Popen — recheck memory after brief pause."""
     time.sleep(_GPU_LAUNCH_RECHECK_S)
     if _picked_gpus_under_limit(picked):
@@ -530,7 +749,7 @@ def _launch_gpu_gate(picked: list[int], gpus_needed: int, label: str) -> tuple[l
     snap = _picked_gpus_mem_snapshot(picked)
     print(f"{label} launch gate BLOCKED: GPU mem={snap} MiB — "
           f"releasing before restart")
-    return _pick_gpus_for_launch(gpus_needed, label)
+    return _pick_gpus_for_launch(gpus_needed, label, host)
 
 
 def _stage_metrics_complete(stage, metrics):
@@ -560,7 +779,12 @@ def _stage_counts_complete(stage, sample_counts):
         return True
     total = (sample_counts or {}).get("total")
     ok = (sample_counts or {}).get("ok")
-    return total is not None and ok is not None and ok == total
+    if total is None or ok is None or ok != total:
+        return False
+    expected = stage.get("expected_samples")
+    if expected is not None and total != expected:
+        return False
+    return True
 
 
 def _observation_status(stage, metrics, pytest_status, pytest_reason):
@@ -639,7 +863,19 @@ def audit_completeness(run_dir: Path, all_stages=None, plan=None):
                 if p.exists():
                     try:
                         d = json.loads(p.read_text())
-                        reason = d.get("reason") or d.get("status") or "incomplete metrics"
+                        sc = d.get("sample_counts") or {}
+                        expected = stage.get("expected_samples")
+                        if (
+                            expected is not None
+                            and sc.get("total") is not None
+                            and sc.get("total") != expected
+                        ):
+                            reason = (
+                                f"sample scope mismatch "
+                                f"(total {sc.get('total')} != expected {expected})"
+                            )
+                        else:
+                            reason = d.get("reason") or d.get("status") or "incomplete metrics"
                     except (json.JSONDecodeError, OSError):
                         reason = "corrupt json"
                 missing.append({"stage_key": sk, "run": k, "reason": reason})
@@ -652,6 +888,113 @@ def audit_completeness(run_dir: Path, all_stages=None, plan=None):
         repeats=repeats,
         model=plan.get("model"),
     )
+
+
+def strict_classify_cell(path: Path, stage: dict) -> str:
+    """Classify one stage-run for strict worst-of-N (✓ / △ / ✗ / —)."""
+    if not path.exists():
+        return "—"
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return "✗"
+    sample_counts = data.get("sample_counts") or {}
+    total = sample_counts.get("total")
+    ok = sample_counts.get("ok")
+    metrics = data.get("metrics") or {}
+    has_all = bool(metrics) and all(v is not None for v in metrics.values())
+    if not has_all:
+        return "✗"
+    if total is None or ok is None:
+        return "✗"
+    if ok != total:
+        return "△"
+    expected = stage.get("expected_samples")
+    if expected is not None and total != expected:
+        return "✗"
+    return "✓"
+
+
+def strict_audit(run_dir: Path, all_stages=None, plan=None) -> dict:
+    """Strict worst-of-N readiness — every stage must have N full-scope ✓ repeats."""
+    plan = plan or json.loads((run_dir / "plan.json").read_text())
+    if all_stages is None:
+        sy = Path(plan.get("stages_yaml")
+                  or stages_path(plan.get("model", DEFAULT_MODEL)))
+        all_stages = _load_yaml(sy)
+    repeats = plan["repeats"]
+    stage_rows = []
+    ready = 0
+    for sk in plan["stages"]:
+        stage = all_stages[sk]
+        cells = [
+            strict_classify_cell(run_dir / sk / f"run{k}.json", stage)
+            for k in range(1, repeats + 1)
+        ]
+        strict_ok = cells.count("✓")
+        if strict_ok == repeats:
+            ready += 1
+        stage_rows.append(dict(
+            stage_key=sk,
+            cells=cells,
+            strict_ok=strict_ok,
+            expected_samples=stage.get("expected_samples"),
+        ))
+    return dict(
+        strict_ready=ready,
+        total_stages=len(plan["stages"]),
+        repeats=repeats,
+        stages=stage_rows,
+        strict_complete=(ready == len(plan["stages"])),
+        git_provenance=audit_git_provenance(run_dir, plan),
+    )
+
+
+def strict_audit_cmd(run_dir: Path) -> int:
+    plan_path = run_dir / "plan.json"
+    if not plan_path.exists():
+        print(f"error: no plan.json in {run_dir}")
+        return 1
+    plan = json.loads(plan_path.read_text())
+    sy = Path(plan.get("stages_yaml")
+              or stages_path(plan.get("model", DEFAULT_MODEL)))
+    all_stages = _load_yaml(sy)
+    audit = strict_audit(run_dir, all_stages, plan)
+    git = audit["git_provenance"]
+    cal_sha = git["calibration_git_sha"]
+    if cal_sha:
+        print(f"calibration_git_sha: {cal_sha}")
+    if not git["ok"]:
+        print(f"GIT PROVENANCE: FAIL — {git['reason']}")
+        for item in git["mismatches"][:10]:
+            print(f"  {item}")
+        for item in git["missing_sha"][:10]:
+            print(f"  {item}")
+        if len(git["mismatches"]) > 10 or len(git["missing_sha"]) > 10:
+            extra = len(git["mismatches"]) + len(git["missing_sha"]) - 10
+            print(f"  … and {extra} more")
+    else:
+        print("GIT PROVENANCE: ok (all artifacts match calibration commit)")
+    for row in audit["stages"]:
+        cells = row["cells"]
+        exp = row["expected_samples"]
+        exp_note = f", expected={exp}" if exp is not None else ""
+        print(
+            f"{row['stage_key']}: {''.join(cells)} "
+            f"({row['strict_ok']}/{audit['repeats']} strict{exp_note})"
+        )
+    print(
+        f"STRICT READY: {audit['strict_ready']}/{audit['total_stages']} stages "
+        f"({audit['repeats']} repeats each)"
+    )
+    metrics_ok = audit["strict_complete"]
+    git_ok = git["ok"]
+    if metrics_ok and git_ok:
+        print("STRICT + GIT: READY")
+    elif metrics_ok and not git_ok:
+        print("STRICT metrics ok but GIT PROVENANCE failed — purge stale runs or "
+              "start a fresh --output-dir on the current commit")
+    return 0 if metrics_ok and git_ok else 1
 
 
 def busy_gpu_indices():
@@ -682,19 +1025,79 @@ def all_gpu_indices():
     return out
 
 
-def pick_free_gpus(n):
+def _parse_gpu_index_list(raw: str | list | tuple | None) -> set[int]:
+    if raw is None:
+        return set()
+    if isinstance(raw, (list, tuple)):
+        return {int(x) for x in raw}
+    out: set[int] = set()
+    for part in str(raw).split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.add(int(part))
+    return out
+
+
+def excluded_gpu_indices(host: dict | None = None) -> set[int]:
+    """GPUs calibration must never pick or kill (e.g. CI-reserved 6,7 on 8× hosts)."""
+    raw = os.environ.get("TUNE_GPU_EXCLUDE")
+    if raw:
+        return _parse_gpu_index_list(raw)
+    if host:
+        return _parse_gpu_index_list(host.get("gpu_exclude"))
+    return set()
+
+
+def included_gpu_indices(host: dict | None = None) -> set[int] | None:
+    """When set via ``TUNE_GPU_INCLUDE``, pin pick/cleanup to exactly these GPUs.
+
+    Used for concurrent calibration sessions on shared hosts (e.g. 0,1 vs 2,3).
+    """
+    raw = os.environ.get("TUNE_GPU_INCLUDE")
+    if not raw:
+        return None
+    included = _parse_gpu_index_list(raw)
+    excluded = excluded_gpu_indices(host)
+    pinned = included - excluded
+    if not pinned:
+        raise RuntimeError(
+            f"TUNE_GPU_INCLUDE={raw!r} empty after excluding {sorted(excluded)}"
+        )
+    return pinned
+
+
+def calibration_gpu_pool(host: dict | None = None) -> list[int]:
+    excluded = excluded_gpu_indices(host)
+    pool = [i for i in all_gpu_indices() if i not in excluded]
+    pinned = included_gpu_indices(host)
+    if pinned is not None:
+        pool = [i for i in pool if i in pinned]
+    return pool
+
+
+def pick_free_gpus(n, host: dict | None = None):
     """Pick n GPUs with no compute app and memory <= _GPU_RETRY_MEM_MIB (2 GiB)."""
-    ready, mem, busy = _ready_gpu_indices(n)
-    all_idx = all_gpu_indices()
+    pinned = included_gpu_indices(host)
+    if pinned is not None and len(pinned) == n:
+        picked = sorted(pinned)
+        if _picked_gpus_under_limit(picked):
+            return picked, None
+        snap = _picked_gpus_mem_snapshot(picked)
+        return None, (
+            f"pinned GPU(s) {picked} not each <= {_GPU_RETRY_MEM_MIB} MiB: {snap}"
+        )
+    ready, mem, busy = _ready_gpu_indices(n, host)
+    all_idx = calibration_gpu_pool(host)
     if len(ready) >= n:
         picked = ready[:n]
         if not _picked_gpus_under_limit(picked):
             snap = _picked_gpus_mem_snapshot(picked)
             return None, f"internal: picked GPUs exceed {_GPU_RETRY_MEM_MIB} MiB: {snap}"
         return picked, None
+    pin_msg = f" pinned={sorted(pinned)}" if pinned is not None else ""
     return None, (
         f"need {n} GPU(s) each <= {_GPU_RETRY_MEM_MIB} MiB (2 GiB); "
-        f"ready {len(ready)}/{len(all_idx)} mem={mem} busy={sorted(busy)}"
+        f"ready {len(ready)}/{len(all_idx)} mem={mem} busy={sorted(busy)}{pin_msg}"
     )
 
 
@@ -815,17 +1218,18 @@ def precheck(py, src, out, skip_ver, cfg, datasets_override=None,
             print(f"    {mark} dataset: {ds}")
     if missing:
         lines = [f"{len(missing)} asset(s) not cached locally. "
-                 "Run these to download via the HF mirror:"]
+                 "Run these to download from Hugging Face:"]
         for repo_id, kind in missing:
             flag = " --repo-type dataset" if kind == "dataset" else ""
             lines.append(
-                "  HF_ENDPOINT=https://hf-mirror.com "
+                "  HF_ENDPOINT=https://huggingface.co "
                 f"huggingface-cli download {repo_id}{flag}"
             )
         errs.append("\n".join(lines))
     sim_dir = cfg["auto_env"].get("SEEDTTS_SIM_CACHE_DIR")
-    needs_speaker_sim = bool(cfg.get("_host")) or cfg["name"] in (
-        "tts", "qwen3-omni-v1")
+    needs_speaker_sim = bool(
+        cfg.get("requires_speaker_sim", cfg["name"] in ("tts", "omni"))
+    )
     if sim_dir and needs_speaker_sim:
         sim_ok, sim_detail = _speaker_sim_assets_ok(Path(sim_dir))
         mark = "✓" if sim_ok else "✗"
@@ -846,15 +1250,21 @@ def precheck(py, src, out, skip_ver, cfg, datasets_override=None,
     if not smi:
         errs.append("nvidia-smi -L returned no GPUs")
     else:
-        all_idx = all_gpu_indices()
+        pool = calibration_gpu_pool(cfg.get("_host"))
+        excluded = sorted(excluded_gpu_indices(cfg.get("_host")))
         busy = busy_gpu_indices()
-        free_count = len(all_idx) - len(busy)
+        ready, _, _ = _ready_gpu_indices(1, cfg.get("_host"))
+        free_count = len(ready)
         summary = gpu_summary(smi)
-        if busy:
-            print(f"  GPUs: {summary} — {free_count}/{len(all_idx)} free "
-                  f"(busy: {sorted(busy)})")
+        pinned = sorted(included_gpu_indices(cfg.get("_host")) or [])
+        pool_note = f" pool={pool}" if (excluded or pinned) else ""
+        pin_note = f" pinned={pinned}" if pinned else ""
+        if busy or excluded or pinned:
+            print(f"  GPUs: {summary} — {free_count}/{len(pool)} calibration-ready"
+                  f"{pool_note}{pin_note} (busy: {sorted(busy)}"
+                  f"{f', excluded: {excluded}' if excluded else ''})")
         else:
-            print(f"  GPUs: {summary} — {free_count}/{len(all_idx)} free")
+            print(f"  GPUs: {summary} — {free_count}/{len(pool)} calibration-ready")
         gpu_required = gpu_required_override
         if gpu_required is None:
             gpu_required = max((cfg.get("gpus_per_test") or {}).values(), default=1)
@@ -865,11 +1275,17 @@ def precheck(py, src, out, skip_ver, cfg, datasets_override=None,
                         "precheck does not kill GPU processes")
     if out is not None:
         out.mkdir(parents=True, exist_ok=True)
+        fingerprint = environment_fingerprint(py, cfg, versions)
+        (out / "environment-fingerprint.json").write_text(
+            json.dumps(fingerprint, indent=2)
+        )
         (out / "precheck.json").write_text(json.dumps(dict(
             timestamp=now_iso(), model=cfg["name"],
             venv_python=py, venv_source=src, versions=versions,
             pins={"sglang": pins.get("sglang"), "torch": pins.get("torch")},
-            git=gi, nvidia_smi_L=smi, gpu_summary=gpu_summary(smi)), indent=2))
+            git=gi, nvidia_smi_L=smi, gpu_summary=gpu_summary(smi),
+            environment_fingerprint="environment-fingerprint.json",
+            comparability=fingerprint["comparability"]), indent=2))
     return _summary(errs, warns)
 
 
@@ -883,18 +1299,73 @@ def _summary(errs, warns):
 
 def _constants(tree):
     for n in tree.body:
-        if not isinstance(n, ast.Assign): continue
-        for t in n.targets:
+        if isinstance(n, ast.Assign):
+            targets, value = n.targets, n.value
+        elif isinstance(n, ast.AnnAssign) and n.value is not None:
+            targets, value = [n.target], n.value
+        else:
+            continue
+        for t in targets:
             if not (isinstance(t, ast.Name)
                     and re.fullmatch(r"_?[A-Z][A-Z0-9_]*", t.id)):
                 continue
             yield (t.id, None)
-            if isinstance(n.value, ast.Dict):
-                for vv in n.value.values:
+            if isinstance(value, ast.Dict):
+                for vv in value.values:
                     if isinstance(vv, ast.Dict):
                         for kk in vv.keys:
                             if isinstance(kk, ast.Constant) and isinstance(kk.value, str):
                                 yield (t.id, kk.value)
+
+
+_SLACK_HELPER_CALLS = frozenset({"apply_wer_slack", "apply_mos_slack"})
+_SLACK_ENV_NAMES = frozenset({"THRESHOLD_SLACK_LOWER", "THRESHOLD_SLACK_HIGHER"})
+# Prefixed variants (e.g. AISHELL4_LONG_THRESHOLD_SLACK_LOWER) are matched by
+# suffix so a stage group can widen its slack without touching this module.
+_SLACK_ENV_SUFFIXES = ("THRESHOLD_SLACK_LOWER", "THRESHOLD_SLACK_HIGHER")
+
+
+def _expr_uses_slack(node: ast.AST) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and (
+            child.id in _SLACK_ENV_NAMES or child.id.endswith(_SLACK_ENV_SUFFIXES)
+        ):
+            return True
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
+            if child.func.id in _SLACK_HELPER_CALLS:
+                return True
+    return False
+
+
+def _slack_derived_threshold_names(tree: ast.AST) -> set[str]:
+    """Names assigned from a reference via THRESHOLD_SLACK_* or apply_*_slack().
+
+    Calibration must write the reference literal only; CI derives assertion
+    thresholds (MAX/MIN/THRESHOLD) from slack — never apply worst-of-N to these.
+    """
+    derived: set[str] = set()
+    for n in tree.body:
+        if isinstance(n, ast.Assign):
+            targets, value = n.targets, n.value
+        elif isinstance(n, ast.AnnAssign) and n.value is not None:
+            targets, value = [n.target], n.value
+        else:
+            continue
+        if not _expr_uses_slack(value):
+            continue
+        for t in targets:
+            if isinstance(t, ast.Name):
+                derived.add(t.id)
+    return derived
+
+
+def _pick_calibration_constant(candidates: list[tuple[str, str | None]]) -> tuple[str, str | None]:
+    """Prefer *_REF / *_REFERENCE over bare *_MAX / *_MIN calibration targets."""
+    for suffix in ("_REF", "_REFERENCE"):
+        for name, nested in candidates:
+            if name.endswith(suffix):
+                return name, nested
+    return candidates[0]
 
 
 def _ctx_vars(tree):
@@ -908,6 +1379,67 @@ def _ctx_vars(tree):
                 and n.value.id not in _TTS_FIXED_PRESETS:
             seen.append(n.value.id)
     return seen
+
+
+def _int_constant(tree, name: str) -> int | None:
+    """Return int literal for ``NAME = <int>``; None if missing, non-int, or ``None``."""
+    for n in tree.body:
+        if isinstance(n, ast.Assign):
+            targets, value = n.targets, n.value
+        elif isinstance(n, ast.AnnAssign) and n.value is not None:
+            targets, value = [n.target], n.value
+        else:
+            continue
+        for t in targets:
+            if isinstance(t, ast.Name) and t.id == name:
+                if isinstance(value, ast.Constant):
+                    if isinstance(value.value, int):
+                        return value.value
+                    return None
+    return None
+
+
+def _expected_samples(
+    tree,
+    group: str,
+    variant: str | None,
+    context_vars: list[str] | None,
+) -> int | None:
+    """Resolve CI sample scope from test-file constants (written to stages.yaml)."""
+    for const_name in context_vars or []:
+        if const_name == "CONCURRENCY":
+            continue
+        value = _int_constant(tree, const_name)
+        if isinstance(value, int):
+            return value
+    if group == "similarity":
+        value = _int_constant(tree, "TTS_SIMILARITY_MAX_SAMPLES")
+        if isinstance(value, int):
+            return value
+    if variant == "stream":
+        stream_cap = _int_constant(tree, "STREAMING_BENCHMARK_MAX_SAMPLES")
+        if isinstance(stream_cap, int):
+            return stream_cap
+        fullset = _int_constant(tree, "SEEDTTS_EN_FULLSET_SAMPLES")
+        if isinstance(fullset, int):
+            return fullset
+    if group in ("wer", "speed", "utmos"):
+        value = _int_constant(tree, "SEEDTTS_EN_FULLSET_SAMPLES")
+        if isinstance(value, int):
+            return value
+    value = _int_constant(tree, "SEEDTTS_ASR_CORRECTNESS_SAMPLES")
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _configured_expected_samples(source: dict, group: str) -> int | None:
+    configured = source.get("expected_samples")
+    if isinstance(configured, int):
+        return configured
+    if isinstance(configured, dict) and isinstance(configured.get(group), int):
+        return configured[group]
+    return None
 
 
 def _stage_base(path, cfg):
@@ -998,6 +1530,7 @@ def _stage_entry(
     hf_model_ids=None,
     threshold_file=None,
     threshold_file_sha256=None,
+    expected_samples=None,
 ):
     entry = dict(
         test=rel,
@@ -1010,6 +1543,8 @@ def _stage_entry(
         metrics=metrics,
         sample_counts=sample_counts,
     )
+    if expected_samples is not None:
+        entry["expected_samples"] = int(expected_samples)
     if variant:
         entry["variant"] = variant
     if calibration_preset:
@@ -1024,23 +1559,41 @@ def _stage_entry(
     return entry
 
 
-def _emit_groups(constants, cfg_paths, default_file, counters):
+def _emit_groups(constants, cfg_paths, default_file, counters,
+                 slack_derived: set[str] | None = None):
     """Build {group: {metric_kind: metric_dict}} from a constant list."""
-    groups = {}
+    slack_derived = slack_derived or set()
+    by_metric: dict[str, list[tuple[str, str | None]]] = {}
     for name, nested in constants:
+        if name in slack_derived or name.endswith("_THRESHOLD"):
+            continue
         mk = match_metric(name, nested)
         if mk is None:
             continue
+        by_metric.setdefault(mk, []).append((name, nested))
+    groups: dict[str, dict] = {}
+    for mk, candidates in by_metric.items():
+        name, nested = _pick_calibration_constant(candidates)
         spec = METRIC_SPECS[mk]
         jf, jp = _split_source(cfg_paths.get(mk), default_file)
         status = "OK" if (jf and jp) else "NEEDS_CONFIG"
-        if status == "OK": counters[0] += 1
-        else: counters[1] += 1
+        if status == "OK":
+            counters[0] += 1
+        else:
+            counters[1] += 1
         src = f"{name}[{nested!r}]" if nested else name
-        groups.setdefault(spec["group"], {})[mk] = dict(source=src,
-            json_file=jf, json_path=jp, worst=spec["worst"],
-            display=dict(label=spec["label"], scale=spec["scale"],
-                         digits=spec["digits"]), status=status)
+        groups.setdefault(spec["group"], {})[mk] = dict(
+            source=src,
+            json_file=jf,
+            json_path=jp,
+            worst=spec["worst"],
+            display=dict(
+                label=spec["label"],
+                scale=spec["scale"],
+                digits=spec["digits"],
+            ),
+            status=status,
+        )
     return groups
 
 
@@ -1180,6 +1733,7 @@ def discover(out, only, cfg):
         threshold_sha = sha256(threshold_tp)
         threshold_file_sha = threshold_sha if threshold_rel else None
         ignored_constants = set(ms.get("ignored_constants") or [])
+        slack_derived = _slack_derived_threshold_names(threshold_tree)
         all_constants = [
             (n, k) for (n, k) in _constants(threshold_tree)
             if n not in ignored_constants
@@ -1218,8 +1772,14 @@ def discover(out, only, cfg):
                     else:
                         preset_claimed = claimed
                     v_groups = _emit_groups(
-                        preset_claimed, v_paths, v_default, counters
+                        preset_claimed, v_paths, v_default, counters,
+                        slack_derived=slack_derived,
                     )
+                    effective_base = vcfg.get("stage_base_override") or base
+                    effective_variant = (
+                        None if vcfg.get("omit_variant_suffix") else vname
+                    )
+                    variant_ctx = vcfg.get("context_vars") or ctx
                     for g, metrics in v_groups.items():
                         if g in sc_by_group:
                             group_sc = _build_sample_counts(
@@ -1228,31 +1788,37 @@ def discover(out, only, cfg):
                         else:
                             group_sc = v_sc_default
                         key = _stage_key(
-                            base,
+                            effective_base,
                             g,
-                            variant=vname,
+                            variant=effective_variant,
                             calibration_preset=preset_name,
                         )
                         stages[key] = _stage_entry(
                             rel,
                             _stage_title(
-                                base,
+                                effective_base,
                                 g,
-                                variant=vname,
+                                variant=effective_variant,
                                 calibration_preset=preset_name,
                             ),
                             g,
                             preset_env,
-                            ctx,
+                            variant_ctx,
                             sha,
                             metrics,
                             group_sc,
-                            variant=vname,
+                            variant=effective_variant,
                             calibration_preset=preset_name,
                             gpus=preset_gpus,
                             hf_model_ids=preset_model_ids,
                             threshold_file=threshold_rel,
                             threshold_file_sha256=threshold_file_sha,
+                            expected_samples=(
+                                _configured_expected_samples(vcfg, g)
+                                or _configured_expected_samples(ms, g)
+                                or _expected_samples(
+                                    tree, g, effective_variant, variant_ctx)
+                            ),
                         )
         else:
             # Single-source flow (one result-JSON tree per test file).
@@ -1261,7 +1827,10 @@ def discover(out, only, cfg):
             default_sample_counts = _build_sample_counts(
                 ms.get("sample_counts") or {}, default_file)
             sc_by_group = ms.get("sample_counts_by_group") or {}
-            groups = _emit_groups(all_constants, cfg_paths, default_file, counters)
+            groups = _emit_groups(
+                all_constants, cfg_paths, default_file, counters,
+                slack_derived=slack_derived,
+            )
             for g, metrics in groups.items():
                 if g in sc_by_group:
                     sample_counts = _build_sample_counts(sc_by_group[g], default_file)
@@ -1296,6 +1865,10 @@ def discover(out, only, cfg):
                         hf_model_ids=preset_model_ids,
                         threshold_file=threshold_rel,
                         threshold_file_sha256=threshold_file_sha,
+                        expected_samples=(
+                            _configured_expected_samples(ms, g)
+                            or _expected_samples(tree, g, None, ctx)
+                        ),
                     )
     if only: stages = {k: v for k, v in stages.items() if k == only}
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1334,6 +1907,8 @@ def _write_yaml(stages, path):
             L += [f"    - {_yq(v)}" for v in e["hf_model_ids"]]
         L += [f"  test_file_sha256: {e['test_file_sha256']}",
               f"  last_discovered_at: {e['last_discovered_at']}"]
+        if e.get("expected_samples") is not None:
+            L.append(f"  expected_samples: {int(e['expected_samples'])}")
         if e.get("threshold_file"):
             L += [f"  threshold_file: {_yq(e['threshold_file'])}",
                   f"  threshold_file_sha256: {e['threshold_file_sha256']}"]
@@ -1578,8 +2153,9 @@ def _run_cmd_inner(args, cfg, py, src, out):
         if not tf.exists():
             print(f"error: test file missing for {s}: {tf}"); return 2
         if sha256(tf) != all_stages[s].get("test_file_sha256"):
-            print(f"warning: {s} test sha mismatch — "
+            print(f"error: {s} test sha mismatch — "
                   f"run `tune.py discover --model {cfg['name']}`")
+            return 2
         threshold_file = all_stages[s].get("threshold_file")
         if threshold_file:
             th = REPO_ROOT / threshold_file
@@ -1587,8 +2163,9 @@ def _run_cmd_inner(args, cfg, py, src, out):
                 print(f"error: threshold file missing for {s}: {th}")
                 return 2
             if sha256(th) != all_stages[s].get("threshold_file_sha256"):
-                print(f"warning: {s} threshold sha mismatch — "
+                print(f"error: {s} threshold sha mismatch — "
                       f"run `tune.py discover --model {cfg['name']}`")
+                return 2
     # Which datasets do the selected tests actually reference?
     # Each test uses DATASETS["key"]; resolve key → repo_id via the
     # canonical benchmarks/dataset/prepare.py:DATASETS dict so we don't
@@ -1629,11 +2206,77 @@ def _run_cmd_inner(args, cfg, py, src, out):
             versions={}, pins={}, git=git_info(),
             nvidia_smi_L=smi, gpu_summary=gpu_summary(smi)), indent=2))
     gi = git_info()
-    (out / "plan.json").write_text(json.dumps(dict(
-        model=cfg["name"], stages=sel, repeats=args.repeats,
-        timestamp=now_iso(), git_sha=gi["sha"], git_branch=gi["branch"],
-        dirty=gi["dirty"], venv_python=py, venv_source=src,
-        tune_version=__version__, stages_yaml=str(sy)), indent=2))
+    plan_path = out / "plan.json"
+    if not args.resume and plan_path.exists():
+        print(
+            "error: output-dir already contains plan.json.\n"
+            "  A new calibration request requires a **fresh** --output-dir named "
+            "with the current UTC timestamp (e.g. "
+            ".tune-runs/$(date -u +%Y%m%dT%H%M%SZ)_<label>/).\n"
+            "  Pass --resume only when the user explicitly asked to continue "
+            "the **same** interrupted session on the **same** commit.\n"
+            "  Never reuse an old run dir or report for a new calibration request."
+        )
+        return 2
+    if args.resume and plan_path.exists():
+        existing = json.loads(plan_path.read_text())
+        plan_stages = existing.get("stages") or sel
+        plan_repeats = existing.get("repeats", args.repeats)
+        cal_sha = _plan_calibration_sha(existing)
+        if cal_sha and gi["sha"] != cal_sha:
+            print(
+                "error: HEAD moved since this run dir was started.\n"
+                f"  calibration_git_sha: {cal_sha}\n"
+                f"  current HEAD:        {gi['sha']}\n"
+                "  Start a **new** --output-dir on the current commit; "
+                "do not --resume across commits."
+            )
+            return 2
+        if set(sel) - set(plan_stages):
+            print(
+                "error: --resume --stages must be a subset of the existing "
+                f"plan stages: {plan_stages}"
+            )
+            return 2
+        if args.repeats != plan_repeats:
+            print(
+                f"warning: --resume ignores --repeats {args.repeats}; "
+                f"using plan repeats={plan_repeats}"
+            )
+        if set(sel) != set(plan_stages):
+            print(
+                f"resume: executing subset {sel} within plan "
+                f"({len(plan_stages)} stages, repeats={plan_repeats})"
+            )
+        (out / "plan.json").write_text(json.dumps(dict(
+            model=existing.get("model", cfg["name"]),
+            stages=plan_stages,
+            repeats=plan_repeats,
+            timestamp=existing.get("timestamp", now_iso()),
+            calibration_started_at=existing.get(
+                "calibration_started_at", existing.get("timestamp", now_iso())),
+            calibration_git_sha=cal_sha or gi["sha"],
+            git_sha=cal_sha or gi["sha"],
+            git_branch=existing.get("git_branch", gi["branch"]),
+            dirty=gi["dirty"],
+            venv_python=existing.get("venv_python", py),
+            venv_source=existing.get("venv_source", src),
+            tune_version=existing.get("tune_version", __version__),
+            stages_yaml=existing.get("stages_yaml", str(sy)),
+            last_resume_at=now_iso(),
+            last_resume_git_sha=gi["sha"],
+        ), indent=2))
+        args.repeats = plan_repeats
+    else:
+        started = now_iso()
+        (out / "plan.json").write_text(json.dumps(dict(
+            model=cfg["name"], stages=sel, repeats=args.repeats,
+            timestamp=started,
+            calibration_started_at=started,
+            calibration_git_sha=gi["sha"],
+            git_sha=gi["sha"], git_branch=gi["branch"],
+            dirty=gi["dirty"], venv_python=py, venv_source=src,
+            tune_version=__version__, stages_yaml=str(sy)), indent=2))
     if gi["dirty"]:
         d = subprocess.run(["git", "diff", "HEAD"], cwd=REPO_ROOT,
                            capture_output=True, text=True, check=False).stdout
@@ -1654,6 +2297,7 @@ def _run_cmd_inner(args, cfg, py, src, out):
         (_stage_gpus(all_stages[s], gpus_per_test) for s in sel),
         default=2,
     )
+    host = cfg.get("_host")
     for pass_num in range(1, max_passes + 1):
         ran_any = False
         for k in range(1, args.repeats + 1):
@@ -1675,7 +2319,7 @@ def _run_cmd_inner(args, cfg, py, src, out):
                     print(f"=== calibration pass {pass_num}/{max_passes}: "
                           f"retry {Path(test_path).stem} run {k} ===")
                 if _run_shared(test_path, stage_keys, all_stages, out, k, py,
-                               args.repeats, needed, extra_args):
+                               args.repeats, needed, extra_args, host=host):
                     audit = audit_completeness(out, all_stages)
                     print(f"completeness at HALT: "
                           f"{audit['ok']}/{audit['total']} stage-runs complete")
@@ -1690,7 +2334,12 @@ def _run_cmd_inner(args, cfg, py, src, out):
             break
         if pass_num < max_passes:
             print(f"{audit['missing_count']} incomplete — GPU cleanup before next pass")
-            if not _ensure_gpus_free(max_gpus):
+            pinned = included_gpu_indices(host)
+            if not _ensure_gpus_free(
+                max_gpus,
+                host=host,
+                target_gpus=sorted(pinned) if pinned is not None else None,
+            ):
                 print("error: GPU memory not cleared; stopping calibration passes")
                 break
     audit = audit_completeness(out, all_stages)
@@ -1824,7 +2473,8 @@ def _print_run_banner(label, test_path, stage_keys, all_stages):
         print("  (docs smoke — no benchmark params, pass/fail only)")
 
 
-def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_needed, extra_args=None):
+def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_needed,
+                extra_args=None, host=None):
     """Run pytest once on test_path; write per-stage run{k}.json from
     the result JSONs written under the fresh pytest basetemp.
     """
@@ -1884,19 +2534,27 @@ def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_neede
     )
     _print_run_banner(label, test_path, stage_keys, all_stages)
     attempts, status, reason, dur, text, pytest_rc = 0, "ok", "", 0.0, "", 0
+    attempt_history = []
+    picked = []
     while attempts < _MAX_RUN_ATTEMPTS:
         attempts += 1
-        picked, pick_err = _pick_gpus_for_launch(gpus_needed, label)
+        picked, pick_err = _pick_gpus_for_launch(gpus_needed, label, host)
         if picked is None:
             status, reason, dur = "failed", pick_err, 0.0
+            attempt_history.append(dict(
+                attempt=attempts, status=status, reason=reason,
+                duration_s=0.0, pytest_rc=None, gpu_indices=[]))
             print(f"{label} {pick_err}")
             break
         _cleanup_flashinfer_cache(env)
         shutil.rmtree(basetemp, ignore_errors=True)
         basetemp.mkdir(parents=True)
-        picked, gate_err = _launch_gpu_gate(picked, gpus_needed, label)
+        picked, gate_err = _launch_gpu_gate(picked, gpus_needed, label, host)
         if picked is None:
             status, reason, dur = "failed", gate_err or "launch GPU gate failed", 0.0
+            attempt_history.append(dict(
+                attempt=attempts, status=status, reason=reason,
+                duration_s=0.0, pytest_rc=None, gpu_indices=[]))
             print(f"{label} {reason}")
             break
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, picked))
@@ -1921,16 +2579,29 @@ def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_neede
             )
             pytest_rc = _wait_pytest_with_watchdog(pytest_proc, log, label)
         _cleanup_after_pytest(test_path, pytest_proc.pid, basetemp)
-        if not _ensure_gpus_free(gpus_needed):
+        if not _ensure_gpus_free(
+            gpus_needed, host=host, target_gpus=list(picked)
+        ):
             status, reason, dur = "failed", "GPU memory not released after run", 0.0
+            attempt_history.append(dict(
+                attempt=attempts, status=status, reason=reason,
+                duration_s=0.0, pytest_rc=pytest_rc, gpu_indices=list(picked)))
             break
         dur = time.monotonic() - t0
         text = log.read_text(errors="replace")
         if pytest_rc == 0:
             status, reason = "ok", ""
+            attempt_history.append(dict(
+                attempt=attempts, status=status, reason=reason,
+                duration_s=round(dur, 2), pytest_rc=pytest_rc,
+                gpu_indices=list(picked)))
             break
         reason = _classify(text, pytest_rc)
         status = "failed"
+        attempt_history.append(dict(
+            attempt=attempts, status=status, reason=reason,
+            duration_s=round(dur, 2), pytest_rc=pytest_rc,
+            gpu_indices=list(picked)))
         retryable = (
             any(s in reason for s in RETRY_SIGS)
             or reason.startswith("crashed")
@@ -1939,7 +2610,9 @@ def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_neede
         if attempts < _MAX_RUN_ATTEMPTS and retryable:
             print(f"{label} {reason} — must clear GPU to <2 GiB before retry "
                   f"({attempts}/{_MAX_RUN_ATTEMPTS})")
-            if not _ensure_gpus_free(gpus_needed):
+            if not _ensure_gpus_free(
+                gpus_needed, host=host, target_gpus=list(picked)
+            ):
                 status, reason = "failed", "GPU memory not released before retry"
                 break
             continue
@@ -1958,10 +2631,20 @@ def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_neede
         sample_counts = _extract_counts(stage, basetemp)
         obs_status, obs_reason = _observation_status(
             stage, metrics, status, reason)
+        rec_gi = git_info()
         run_payload = dict(
             status=obs_status, reason=obs_reason, metrics=metrics,
             sample_counts=sample_counts,
             duration_s=round(dur, 2), attempts=attempts,
+            attempt_history=attempt_history, gpu_indices=list(picked or []),
+            seed=dict(
+                calibration=os.environ.get("CALIBRATION_SEED"),
+                python_hash=os.environ.get("PYTHONHASHSEED"),
+                policy=("explicit" if os.environ.get("CALIBRATION_SEED")
+                        else "test-default/unset"),
+            ),
+            git_sha=rec_gi["sha"],
+            recorded_at=now_iso(),
             pytest_log=str(log.resolve()),
             basetemp=str(basetemp.resolve()))
         if stage.get("metrics"):
@@ -1973,6 +2656,17 @@ def _run_shared(test_path, stage_keys, all_stages, out, k, py, total, gpus_neede
         brief_parts = []
         if sample_counts.get("total") is not None or sample_counts.get("ok") is not None:
             brief_parts.append(f"samples={sample_counts.get('ok')}/{sample_counts.get('total')}")
+        expected = stage.get("expected_samples")
+        if (
+            expected is not None
+            and sample_counts.get("total") is not None
+            and sample_counts.get("total") != expected
+        ):
+            print(
+                f"  ⚠ {sk}: sample scope mismatch "
+                f"got {sample_counts.get('total')} expected {expected} "
+                f"(strict ✗ — purge and re-run on current branch)"
+            )
         brief_parts += [f"{k2}={_fmt(v, stage['metrics'][k2]['display'])}"
                         for k2, v in metrics.items() if v is not None]
         brief = " ".join(brief_parts)
@@ -2173,6 +2867,7 @@ def status_cmd(run_dir: Path):
               or stages_path(plan.get("model", DEFAULT_MODEL)))
     all_stages = _load_yaml(sy)
     audit = audit_completeness(run_dir, all_stages, plan)
+    strict = strict_audit(run_dir, all_stages, plan)
     mem = _gpu_memory_by_index()
     busy = sorted(busy_gpu_indices())
     ready, _, _ = _ready_gpu_indices(max(len(mem), 1))
@@ -2208,27 +2903,161 @@ def status_cmd(run_dir: Path):
         pytest_active=pytest_active,
         run_log_tail=log_tail,
         agent_poll_interval_s=_AGENT_POLL_INTERVAL_S,
+        strict_ready=f"{strict['strict_ready']}/{strict['total_stages']}",
+        strict_complete=strict["strict_complete"],
         timestamp=now_iso(),
     )
     print(json.dumps(out, indent=2))
-    return 0 if audit["complete"] else 1
+    return 0 if audit["complete"] and strict["strict_complete"] else 1
+
+
+def validate_run_ready(run_dir: Path) -> tuple[dict | None, list[str]]:
+    """Shared hard gate for every command that consumes final observations."""
+    errors = []
+    plan_path = run_dir / "plan.json"
+    if not plan_path.exists():
+        return None, [f"no plan.json in {run_dir}"]
+    plan = json.loads(plan_path.read_text())
+    sy = Path(plan.get("stages_yaml") or stages_path(plan.get("model", DEFAULT_MODEL)))
+    if not sy.exists():
+        return None, [f"stages schema missing: {sy}"]
+    all_stages = _load_yaml(sy)
+    git = audit_git_provenance(run_dir, plan)
+    if not git["ok"]:
+        errors.append(f"git provenance failed: {git['reason']}")
+    strict = strict_audit(run_dir, all_stages, plan)
+    if not strict["strict_complete"]:
+        errors.append(
+            f"strict audit incomplete: {strict['strict_ready']}/"
+            f"{strict['total_stages']} stages"
+        )
+    complete = audit_completeness(run_dir, all_stages, plan)
+    if not complete["complete"]:
+        errors.append(
+            f"calibration incomplete: {complete['ok']}/{complete['total']} stage-runs"
+        )
+    return dict(
+        plan=plan, stages_yaml=sy, all_stages=all_stages,
+        git=git, strict=strict, completeness=complete,
+    ), errors
+
+
+def merge_runs(run_dirs: list[Path], output_dir: Path) -> int:
+    """Merge strict-ready, disjoint stage partitions into one reportable run."""
+    if len(run_dirs) < 2:
+        print("error: merge-runs requires at least two --run-dir inputs")
+        return 2
+    if output_dir.exists() and any(output_dir.iterdir()):
+        print(f"error: merge output directory is not empty: {output_dir}")
+        return 2
+    validated = []
+    for run_dir in run_dirs:
+        ready, errors = validate_run_ready(run_dir)
+        if errors:
+            print(f"error: input run is not ready: {run_dir}: {'; '.join(errors)}")
+            return 1
+        validated.append((run_dir, ready))
+    first_plan = validated[0][1]["plan"]
+    schema_hash = sha256(validated[0][1]["stages_yaml"])
+    seen = set()
+    fingerprints = []
+    for run_dir, ready in validated:
+        plan = ready["plan"]
+        for key in ("model", "repeats", "calibration_git_sha"):
+            if plan.get(key) != first_plan.get(key):
+                print(f"error: incompatible {key} in {run_dir}")
+                return 2
+        if sha256(ready["stages_yaml"]) != schema_hash:
+            print(f"error: stage schema differs in {run_dir}")
+            return 2
+        overlap = seen.intersection(plan["stages"])
+        if overlap:
+            print(f"error: overlapping stage ownership in {run_dir}: {sorted(overlap)}")
+            return 2
+        seen.update(plan["stages"])
+        fp_path = run_dir / "environment-fingerprint.json"
+        fingerprints.append(json.loads(fp_path.read_text()) if fp_path.exists() else {})
+    identity_keys = ("dependency_freeze_sha256", "container_image_digest")
+    for key in identity_keys:
+        known = {fp.get(key) for fp in fingerprints if fp.get(key)}
+        if len(known) > 1:
+            print(f"error: incompatible environment fingerprint {key}: {sorted(known)}")
+            return 2
+    output_dir.mkdir(parents=True, exist_ok=True)
+    merged_stages = []
+    for run_dir, ready in validated:
+        for stage in ready["plan"]["stages"]:
+            shutil.copytree(run_dir / stage, output_dir / stage)
+            merged_stages.append(stage)
+    merged_plan = dict(first_plan)
+    merged_plan.update(
+        stages=merged_stages,
+        merged_at=now_iso(),
+        source_runs=[str(path.resolve()) for path, _ready in validated],
+    )
+    (output_dir / "plan.json").write_text(json.dumps(merged_plan, indent=2))
+    first_run = validated[0][0]
+    for name in ("precheck.json", "environment-fingerprint.json"):
+        if (first_run / name).exists():
+            shutil.copy2(first_run / name, output_dir / name)
+    (output_dir / "environment-fingerprints.json").write_text(
+        json.dumps(fingerprints, indent=2)
+    )
+    print(f"merged {len(merged_stages)} stages into {output_dir}")
+    return report(output_dir)
+
+
+def _metric_statistics(values: list[float], worst_op: str) -> dict:
+    ordered = sorted(values)
+    mean = statistics.fmean(values)
+    std = statistics.stdev(values) if len(values) > 1 else 0.0
+    q1, q3 = (ordered[1], ordered[-2]) if len(ordered) >= 4 else (ordered[0], ordered[-1])
+    iqr = q3 - q1
+    low, high = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    return dict(
+        worst=(min(values) if worst_op == "min" else max(values)),
+        median=statistics.median(values), min=min(values), max=max(values),
+        range=max(values) - min(values), mean=mean, std=std,
+        cv=(std / abs(mean) if mean else None),
+        outlier_runs=[i + 1 for i, value in enumerate(values)
+                      if value < low or value > high],
+    )
+
+
+def _wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float, float]:
+    if total <= 0:
+        return (0.0, 0.0)
+    p = successes / total
+    denom = 1 + z * z / total
+    center = (p + z * z / (2 * total)) / denom
+    margin = z * math.sqrt((p * (1 - p) + z * z / (4 * total)) / total) / denom
+    return max(0.0, center - margin), min(1.0, center + margin)
 
 
 def report(run_dir):
-    audit = audit_completeness(run_dir)
-    if not audit["complete"]:
-        print(f"error: refusing report — incomplete calibration "
-              f"({audit['ok']}/{audit['total']})")
-        for m in audit["missing"][:15]:
-            print(f"  {m['stage_key']}/run{m['run']}: {m['reason']}")
+    ready, errors = validate_run_ready(run_dir)
+    if errors:
+        print("error: refusing report — " + "; ".join(errors))
         return 1
-    plan = json.loads((run_dir / "plan.json").read_text())
+    plan = ready["plan"]
+    all_stages = ready["all_stages"]
     pre = json.loads((run_dir / "precheck.json").read_text()) \
         if (run_dir / "precheck.json").exists() else {}
     sy = Path(plan.get("stages_yaml") or stages_path(plan.get("model", DEFAULT_MODEL)))
     all_stages = _load_yaml(sy)
     N = plan["repeats"]
-    L = ["# CI Threshold Observation Report", ""]
+    cal_sha = _plan_calibration_sha(plan)
+    started = plan.get("calibration_started_at") or plan.get("timestamp", "?")
+    L = [
+        "# CI Threshold Observation Report",
+        "",
+        f"**Calibration commit:** `{cal_sha}`",
+        f"**Branch:** {plan.get('git_branch', '?')}",
+        f"**Run directory:** `{run_dir}`",
+        f"**Calibration started:** {started}",
+        f"**Report generated:** {now_iso()}",
+        "",
+    ]
     for idx, sk in enumerate(plan["stages"], start=1):
         s = all_stages[sk]
         L += [f"## {idx}. {s['title']}", "", f"{{{{CONTEXT:{sk}}}}}", ""]
@@ -2281,11 +3110,41 @@ def report(run_dir):
             # already surface any coverage drop. Leave these cells blank.
             wc.append("—")
             wc.append("—")
+        stage_stats = {}
         for k in keys:
             if k in nulls or not vals[k]: wc.append("**N/A**"); continue
-            v = min(vals[k]) if worst[k] == "min" else max(vals[k])
+            stage_stats[k] = _metric_statistics(vals[k], worst[k])
+            v = stage_stats[k]["worst"]
             wc.append(f"**{_fmt(v, disp[k])}**")
         L += [f"| **Worst-of-{N}** | " + " | ".join(wc) + " |", ""]
+        if stage_stats:
+            L += ["### Metric calibration", "",
+                  "| Metric | Worst | Median | Min | Max | Range | Std | CV | Outliers |",
+                  "|---|---:|---:|---:|---:|---:|---:|---:|---|"]
+            for k in keys:
+                if k not in stage_stats:
+                    continue
+                st = stage_stats[k]
+                d = disp[k]
+                scaled = lambda v: v * d["scale"]
+                cv = "N/A" if st["cv"] is None else f"{st['cv']:.3f}"
+                outliers = ", ".join(f"run{i}" for i in st["outlier_runs"]) or "none"
+                L.append(
+                    f"| {d['label']} | {scaled(st['worst']):.{d['digits']}f} | "
+                    f"{scaled(st['median']):.{d['digits']}f} | "
+                    f"{scaled(st['min']):.{d['digits']}f} | "
+                    f"{scaled(st['max']):.{d['digits']}f} | "
+                    f"{scaled(st['range']):.{d['digits']}f} | "
+                    f"{scaled(st['std']):.{d['digits']}f} | {cv} | {outliers} |"
+                )
+            if "accuracy" in stage_stats and cvals["total"]:
+                total = sum(cvals["total"])
+                successes = round(sum(vals["accuracy"][i] * cvals["total"][i]
+                                      for i in range(min(len(vals["accuracy"]), len(cvals["total"])))))
+                lo, hi = _wilson_interval(successes, total)
+                L += ["", f"Accuracy aggregate: {successes}/{total}; "
+                      f"95% Wilson CI {lo * 100:.2f}%–{hi * 100:.2f}%."]
+            L.append("")
         # What actually got written into the test files (if anything) is
         # recorded in the "Applied changes" table appended after
         # mode-smart/mode-full apply (see SKILL.md step 9).
@@ -2293,19 +3152,56 @@ def report(run_dir):
             L.append(f"> ⚠ {disp[k]['label']}: no `json_path` in stages.yaml "
                      "(config.yaml `metric_sources` missing this metric)")
         if nulls: L.append("")
+    L += ["## Operational reliability", "",
+          "| Stage | Runs | Attempts | Retry successes | Failed attempts | Startup | OOM | Timeout | Partial |",
+          "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for sk in plan["stages"]:
+        runs = [json.loads((run_dir / sk / f"run{k}.json").read_text())
+                for k in range(1, N + 1)]
+        histories = [r.get("attempt_history") or [] for r in runs]
+        attempts = sum(len(h) or int(r.get("attempts", 1))
+                       for h, r in zip(histories, runs))
+        failed_attempts = [a for h in histories for a in h if a.get("status") != "ok"]
+        failed = len(failed_attempts)
+        retry_successes = sum(
+            1 for r in runs
+            if int(r.get("attempts", 1)) > 1 and r.get("status") == "ok"
+        )
+        reasons = [str(a.get("reason", "")).lower() for a in failed_attempts]
+        startup = sum(1 for reason in reasons if any(
+            token in reason for token in ("start", "connection refused", "address already")
+        ))
+        oom = sum(1 for reason in reasons if "oom" in reason or "out of memory" in reason)
+        timeout = sum(1 for reason in reasons if "timeout" in reason)
+        partial = sum(1 for r in runs if (r.get("sample_counts") or {}).get("ok") !=
+                      (r.get("sample_counts") or {}).get("total"))
+        L.append(
+            f"| {sk} | {N} | {attempts} | {retry_successes} | {failed} | "
+            f"{startup} | {oom} | {timeout} | {partial} |"
+        )
+    L.append("")
     dirty = " (dirty)" if plan.get("dirty") else ""
     diff = " — see `workspace.diff`" if plan.get("dirty") else ""
     v = pre.get("versions", {}) or {}
+    fingerprint = {}
+    fingerprint_path = run_dir / "environment-fingerprint.json"
+    if fingerprint_path.exists():
+        fingerprint = json.loads(fingerprint_path.read_text())
     L += ["## Provenance", "",
           f"- Model: {plan.get('model', '?')}",
-          f"- Branch: {plan.get('git_branch', '?')} "
-          f"@ {plan.get('git_sha', '?')[:8]}{dirty}{diff}",
+          f"- Calibration commit: `{cal_sha}`",
+          f"- Branch: {plan.get('git_branch', '?')}{dirty}{diff}",
+          f"- Calibration started: {started}",
           f"- Venv Python: {plan.get('venv_python', '?')} "
           f"({plan.get('venv_source', '?')})",
           f"- sglang {v.get('sglang', '?')} · torch {v.get('torch', '?')}",
           f"- GPU: {pre.get('gpu_summary', '?')}",
+          f"- GPU group: {fingerprint.get('gpu_group', '?')}",
+          f"- Environment comparability: {fingerprint.get('comparability', 'unverified')}",
+          f"- Container image digest: {fingerprint.get('container_image_digest') or 'unverified'}",
+          f"- Dependency freeze SHA256: {fingerprint.get('dependency_freeze_sha256', '?')}",
           f"- tune-ci-thresholds v{__version__}",
-          f"- Ran {plan.get('timestamp', '?')} – {now_iso()}"]
+          f"- Report generated: {now_iso()}"]
     (run_dir / "report.md").write_text("\n".join(L) + "\n")
     print(f"report written to {run_dir / 'report.md'}")
     return 0
@@ -2338,9 +3234,15 @@ def _read_concurrency(text):
 
 
 def _read_bare_value(text, symbol):
-    m = re.search(rf"^{re.escape(symbol)}\s*=\s*([+-]?\d+(?:\.\d+)?)\s*$",
-                  text, re.M)
-    return float(m.group(1)) if m else None
+    m = re.search(
+        rf"^{re.escape(symbol)}(?:\s*:\s*[^=]+)?\s*=\s*"
+        r"(None|[+-]?\d+(?:\.\d+)?)\s*$",
+        text,
+        re.M,
+    )
+    if not m or m.group(1) == "None":
+        return None
+    return float(m.group(1))
 
 
 def _read_nested_value(text, symbol, conc, subkey):
@@ -2405,7 +3307,7 @@ def _apply_write_value(worst_op: str, worst_raw: float | None,
         return _ceil_wer_reference(worst_raw)
     if stage_group == "reliability":
         return math.ceil(worst_raw)
-    if stage_group in ("accuracy", "similarity", "utmos"):
+    if stage_group in ("accuracy", "diarization", "similarity", "utmos"):
         return worst_raw
     if worst_rounded is None:
         return worst_raw
@@ -2417,10 +3319,15 @@ def _apply_write_value(worst_op: str, worst_raw: float | None,
 
 
 def apply_plan(run_dir):
-    plan = json.loads((run_dir / "plan.json").read_text())
-    sy = Path(plan.get("stages_yaml")
-              or stages_path(plan.get("model", DEFAULT_MODEL)))
-    all_stages = _load_yaml(sy)
+    ready, errors = validate_run_ready(run_dir)
+    if errors:
+        print(json.dumps(dict(
+            error="run_not_ready",
+            reasons=errors,
+        ), indent=2))
+        return 1
+    plan = ready["plan"]
+    all_stages = ready["all_stages"]
     N = plan["repeats"]
     out = {"model": plan["model"], "run_dir": str(run_dir),
            "repeats": N, "stages": []}
@@ -2464,15 +3371,21 @@ def apply_plan(run_dir):
                 worst_rounded = round(worst, digits)
             else:
                 worst, worst_rounded = None, None
-            write_value = _apply_write_value(
-                worst_op, worst, worst_rounded, s.get("group"))
             if kind == "bare":
                 cur = _read_bare_value(threshold_text, sym)
             elif kind == "nested":
                 cur = _read_nested_value(threshold_text, sym, conc, sub)
             else:
                 cur = None
-            direction = _classify_direction(worst_op, cur, write_value)
+            # Defense in depth: fixed symbols stay out of discover, but if an
+            # old stages.yaml still lists one, never propose rewriting it.
+            if sym in _FIXED_THRESHOLD_SYMBOLS:
+                write_value = None
+                direction = "fixed"
+            else:
+                write_value = _apply_write_value(
+                    worst_op, worst, worst_rounded, s.get("group"))
+                direction = _classify_direction(worst_op, cur, write_value)
             sg["metrics"].append({
                 "metric_key": mk,
                 "source": m["source"],
@@ -2504,6 +3417,11 @@ def _bootstrap_from_host(host: dict | None) -> None:
     venv = host.get("venv_python")
     if venv and not os.environ.get("TUNE_VENV_PYTHON"):
         os.environ.setdefault("TUNE_VENV_PYTHON", str(venv))
+    if host.get("gpu_exclude") and not os.environ.get("TUNE_GPU_EXCLUDE"):
+        os.environ.setdefault(
+            "TUNE_GPU_EXCLUDE",
+            ",".join(str(i) for i in host["gpu_exclude"]),
+        )
 
 
 def main(argv=None):
@@ -2536,6 +3454,10 @@ def main(argv=None):
     sd = sub.add_parser("report"); sd.add_argument("--run-dir", required=True)
     se = sub.add_parser("apply-plan"); se.add_argument("--run-dir", required=True)
     sf = sub.add_parser("status"); sf.add_argument("--run-dir", required=True)
+    sg = sub.add_parser("strict-audit"); sg.add_argument("--run-dir", required=True)
+    sm = sub.add_parser("merge-runs")
+    sm.add_argument("--run-dir", action="append", required=True, dest="run_dirs")
+    sm.add_argument("--output-dir", required=True)
     args = p.parse_args(argv)
     if args.cmd == "models-list":
         for m in available_models(): print(m)
@@ -2556,6 +3478,10 @@ def main(argv=None):
         return apply_plan(Path(args.run_dir))
     if args.cmd == "status":
         return status_cmd(Path(args.run_dir))
+    if args.cmd == "strict-audit":
+        return strict_audit_cmd(Path(args.run_dir))
+    if args.cmd == "merge-runs":
+        return merge_runs([Path(path) for path in args.run_dirs], Path(args.output_dir))
     cfg = load_model_config(args.model, host=host)
     if args.cmd == "stages-list":
         return stages_list(cfg)

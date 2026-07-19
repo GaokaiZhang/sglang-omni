@@ -131,7 +131,11 @@ def test_qwen_pipeline_config_and_state_contracts() -> None:
     assert _stage(speech_config, "code2wav").can_accept_stream_before_payload
     assert text_config.env_defaults == {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}
     assert speech_config.env_defaults == {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}
-    assert colocated_config.env_defaults == {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}
+    assert colocated_config.env_defaults == {
+        "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
+        "OMP_NUM_THREADS": "8",
+        "TOKENIZERS_PARALLELISM": "false",
+    }
 
     # Early-submit wiring (issue #473): the talker stage receives its
     # new_request from mm_aggregate so it can enter its deferred state
@@ -250,7 +254,7 @@ def test_qwen_apply_thinker_result_omits_missing_optional_fields() -> None:
     assert state.engine_outputs["thinker"] is thinker_out
 
 
-def test_qwen_preprocess_pretokenized_builds_thinker_state_from_ids() -> None:
+def test_qwen_preprocess_pretokenized_builds_state_and_releases_inputs() -> None:
     # Miles RL rollout sends pre-tokenized input_ids; they must reach the thinker
     # directly (no chat template / re-tokenize), with encoders skipped.
     from sglang_omni.models.qwen3_omni.components.preprocessor import (
@@ -266,7 +270,17 @@ def test_qwen_preprocess_pretokenized_builds_thinker_state_from_ids() -> None:
     pre = object.__new__(Qwen3OmniPreprocessor)
     pre.max_seq_len = None
     payload = SimpleNamespace(
-        request=SimpleNamespace(params={"max_new_tokens": 16}),
+        request=OmniRequest(
+            inputs=[5, 6, 7],
+            params={"max_new_tokens": 16},
+            metadata={
+                "audios": ["raw-audio"],
+                "images": ["raw-image"],
+                "videos": ["raw-video"],
+                "output_modalities": ["text"],
+                "trace": "keep",
+            },
+        ),
         request_id="r1",
         data=None,
     )
@@ -278,6 +292,49 @@ def test_qwen_preprocess_pretokenized_builds_thinker_state_from_ids() -> None:
     assert state.prompt["attention_mask"].tolist() == [1, 1, 1]
     assert state.encoder_inputs["image_encoder"]["_skip"] is True
     assert state.encoder_inputs["audio_encoder"]["_skip"] is True
+    assert out.request.inputs is None
+    assert out.request.params == {"max_new_tokens": 16}
+    assert out.request.metadata == {
+        "output_modalities": ["text"],
+        "trace": "keep",
+    }
+
+
+def test_qwen_preprocessor_retries_without_special_token_compat(
+    tmp_path, monkeypatch
+) -> None:
+    from sglang_omni.models.qwen3_omni.components import (
+        preprocessor as preprocessor_mod,
+    )
+
+    (tmp_path / "tokenizer_config.json").write_text(
+        '{"image_token": "<|image_pad|>", "audio_token": "<|audio_pad|>"}'
+    )
+    calls = []
+
+    def fake_from_pretrained(model_dir, **kwargs):
+        calls.append(kwargs)
+        if "extra_special_tokens" in kwargs:
+            raise TypeError("old transformers does not accept extra_special_tokens")
+        return SimpleNamespace(
+            tokenizer=SimpleNamespace(chat_template=None),
+            chat_template=None,
+        )
+
+    monkeypatch.setattr(
+        preprocessor_mod.Qwen3OmniMoeProcessor,
+        "from_pretrained",
+        fake_from_pretrained,
+    )
+    monkeypatch.setattr(preprocessor_mod, "ensure_chat_template", lambda *_, **__: None)
+
+    preprocessor_mod.Qwen3OmniPreprocessor(str(tmp_path))
+
+    assert calls[0]["extra_special_tokens"] == {
+        "image_token": "<|image_pad|>",
+        "audio_token": "<|audio_pad|>",
+    }
+    assert "extra_special_tokens" not in calls[1]
 
 
 def test_qwen_talker_to_code2wav_projection_keeps_only_request_latch() -> None:
@@ -637,7 +694,9 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
     from sglang_omni.scheduling import omni_scheduler, sglang_backend
 
-    server_args = SimpleNamespace(disable_cuda_graph=False)
+    server_args = SimpleNamespace(
+        disable_cuda_graph=False, enable_return_hidden_states=False
+    )
     infrastructure_saw_graph_disabled: list[bool] = []
     capture_hidden_layers_seen: list[list[int] | None] = []
     init_graph_calls = 0
@@ -711,7 +770,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     assert infrastructure_saw_graph_disabled == [expected_infrastructure_graph_disabled]
     assert capture_hidden_layers_seen == [expected_capture_hidden_layers]
     assert init_graph_calls == expected_init_graph_calls
-    assert getattr(server_args, "enable_return_hidden_states", False) is speech_enabled
+    assert server_args.enable_return_hidden_states is speech_enabled
     assert server_args.disable_cuda_graph is False
     assert scheduler.server_args is server_args
 
@@ -989,11 +1048,15 @@ def test_thinker_tp_disable_custom_all_reduce_uses_shared_config_hook() -> None:
         ) == {"disable_custom_all_reduce": True}
 
 
-def test_qwen_cli_serve_applies_thinker_tp_override_to_server_args() -> None:
+def test_qwen_cli_serve_applies_thinker_tp_override_to_server_args(monkeypatch) -> None:
     """End-to-end: the CLI TP pass writes disable_custom_all_reduce into the
     thinker stage server args when TP>1 is configured (issue #760)."""
     from sglang_omni.cli.serve import _apply_tensor_parallel_server_args_overrides
 
+    monkeypatch.setattr(
+        "sglang_omni.cli.serve.should_disable_custom_all_reduce_for_gpus",
+        lambda *args, **kwargs: True,
+    )
     config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
     apply_parallelism_cli_overrides(
         config,
@@ -1009,6 +1072,28 @@ def test_qwen_cli_serve_applies_thinker_tp_override_to_server_args() -> None:
     )
     assert "disable_custom_all_reduce" not in _server_args_overrides(
         config, "audio_encoder"
+    )
+
+
+def test_qwen_cli_serve_enables_custom_all_reduce_on_p2p_mesh(monkeypatch) -> None:
+    from sglang_omni.cli.serve import _apply_tensor_parallel_server_args_overrides
+
+    monkeypatch.setattr(
+        "sglang_omni.cli.serve.should_disable_custom_all_reduce_for_gpus",
+        lambda *args, **kwargs: False,
+    )
+    config = Qwen3OmniSpeechPipelineConfig(model_path="dummy")
+    apply_parallelism_cli_overrides(
+        config,
+        thinker_tp_size=2,
+        thinker_gpus="0,1",
+        talker_gpu=None,
+        code2wav_gpu=None,
+    )
+    _apply_tensor_parallel_server_args_overrides(config)
+
+    assert (
+        _server_args_overrides(config, "thinker")["disable_custom_all_reduce"] is False
     )
 
 

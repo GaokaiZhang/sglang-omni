@@ -654,6 +654,7 @@ def _bare_stage(*, is_terminal: bool, owns_io: bool = True) -> Stage:
     s._first_stream_chunk_seen = set()
     s._local_stream_targets = {}
     s._nonlocal_stream_targets = {}
+    s.relay = SimpleNamespace()
     s.input_handler = SimpleNamespace(cancel=lambda request_id: None)
     s.scheduler = SimpleNamespace(abort=lambda request_id: None)
     s.control_plane = SimpleNamespace(completions=[])

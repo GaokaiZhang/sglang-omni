@@ -26,8 +26,10 @@ def _cast_tensor(
     return value.to(dtype=dtype) if dtype is not None else value
 
 
-def _non_empty(tensor: torch.Tensor | None) -> bool:
-    return tensor is not None and tensor.numel() > 0
+def _non_empty(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return value.numel() > 0
+    return False
 
 
 def merge_for_thinker(payloads: dict[str, StagePayload]) -> StagePayload:

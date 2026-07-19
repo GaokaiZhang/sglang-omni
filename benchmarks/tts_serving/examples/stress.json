@@ -1,6 +1,6 @@
 {
   "base_url": "http://127.0.0.1:8000",
-  "model_name": "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999",
+  "model_name": "bosonai/higgs-tts-3-4b",
   "test_type": "engine",
   "seed": 0,
   "params": {
@@ -13,6 +13,8 @@
       "websocket"
     ],
     "speaker_max_uploaded": 1000,
+    "file_ref_audio": "file:docs/_static/audio/male-voice.wav",
+    "file_ref_text": "Hey, Adam here. Let's create something that feels real, sounds human, and connects every time.",
     "load_stages": [
       {
         "id": "closed-1",

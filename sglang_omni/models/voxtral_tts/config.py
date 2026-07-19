@@ -17,6 +17,7 @@ _PKG = "sglang_omni.models.voxtral_tts.pipeline"
 
 class VoxtralTTSPipelineConfig(PipelineConfig):
     architecture: ClassVar[str] = "VoxtralTTSForConditionalGeneration"
+    requires_model_capabilities: ClassVar[bool] = True
 
     @classmethod
     def generation_sglang_role_to_stage(cls) -> dict[str, str]:
@@ -35,7 +36,7 @@ class VoxtralTTSPipelineConfig(PipelineConfig):
             name=GENERATION_STAGE,
             process="pipeline",
             factory=f"{_PKG}.stages.create_generation_executor",
-            factory_args={"gpu_id": 0, "max_new_tokens": 4096},
+            factory_args={"max_new_tokens": 4096},
             gpu=0,
             next=VOCODER_STAGE,
         ),
@@ -43,7 +44,6 @@ class VoxtralTTSPipelineConfig(PipelineConfig):
             name=VOCODER_STAGE,
             process="pipeline",
             factory=f"{_PKG}.stages.create_vocoder_executor",
-            factory_args={"gpu_id": 0},
             gpu=0,
             terminal=True,
         ),

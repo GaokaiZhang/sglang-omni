@@ -7,6 +7,12 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+from sglang_omni.quantization import (
+    needs_quant_config_normalization,
+    normalize_quant_config,
+    resolve_quant_config,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.server_args import ServerArgs
@@ -27,9 +33,11 @@ _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "Qwen3OmniTalker": ("talker_config", "text_config"),
     "Qwen3OmniThinkerForCausalLM": ("thinker_config", "text_config"),
     "Qwen3ASRForConditionalGeneration": ("thinker_config", "text_config"),
+    "FunAsrNanoForConditionalGeneration": ("text_config", None),
     "Qwen3TTSTalker": ("talker_config", None),
     "MossTTSDelaySGLangModel": ("language_config", None),
     "MossTTSLocalSGLangModel": ("language_config", None),
+    "MossTranscribeDiarizeForConditionalGeneration": ("text_config", None),
 }
 
 
@@ -116,6 +124,11 @@ class ModelWorker:
         model_config.num_hidden_layers = text_cfg.num_hidden_layers
 
     def _configure_backend_policy(self) -> None:
+        # Apply Omni-specific quantization adapters (stage-local checkpoint name
+        # normalization) before SGLang builds its quant config, then run the
+        # model_worker backend policy.
+        _apply_omni_quantization_adapters(self.model_config)
+
         effective_quantization = _apply_model_worker_backend_policy(
             self.server_args,
             self.model_config,
@@ -222,11 +235,11 @@ class ModelWorker:
 
     def model_info(self) -> dict[str, Any]:
         return {
-            "model_path": getattr(self.server_args, "model_path", None),
-            "load_format": getattr(self.server_args, "load_format", None),
-            "weight_version": getattr(self.server_args, "weight_version", None),
+            "model_path": self.server_args.model_path,
+            "load_format": self.server_args.load_format,
+            "weight_version": self.server_args.weight_version,
             "tp_rank": self.tp_rank,
-            "tp_size": getattr(self.server_args, "tp_size", 1),
+            "tp_size": self.server_args.tp_size,
             "model_arch_override": self.model_arch_override,
             "supports_weight_update": hasattr(
                 self.model_runner, "update_weights_from_disk"
@@ -241,9 +254,7 @@ class ModelWorker:
         update = getattr(self.model_runner, "update_weights_from_disk", None)
         if update is None:
             return False, "model runner does not support update_weights_from_disk"
-        load_format = payload.get("load_format") or getattr(
-            self.server_args, "load_format", None
-        )
+        load_format = payload.get("load_format") or self.server_args.load_format
         success, message = update(
             model_path,
             load_format,
@@ -400,18 +411,16 @@ def _apply_model_worker_backend_policy(
     effective_quantization = _normalize_quantization(
         getattr(model_config, "quantization", None)
     )
-    server_quantization = _normalize_quantization(
-        getattr(server_args, "quantization", None)
-    )
+    server_quantization = _normalize_quantization(server_args.quantization)
     if server_quantization is not None:
         effective_quantization = server_quantization
 
-    moe_runner_backend = getattr(server_args, "moe_runner_backend", "auto")
+    moe_runner_backend = server_args.moe_runner_backend
     is_qwen3_omni_arch = model_arch_override in (
         "Qwen3OmniTalker",
         "Qwen3OmniThinkerForCausalLM",
     )
-    if is_qwen3_omni_arch and getattr(server_args, "ep_size", 1) != 1:
+    if is_qwen3_omni_arch and server_args.ep_size != 1:
         raise ValueError(
             "Qwen3-Omni ModelWorker does not support expert parallelism; "
             "use ep_size=1."
@@ -477,7 +486,7 @@ def _apply_model_worker_backend_policy(
         server_args.fp8_gemm_runner_backend = "triton"
         fp8_gemm_backend = server_args.fp8_gemm_runner_backend
 
-    server_quantization = getattr(server_args, "quantization", None)
+    server_quantization = server_args.quantization
     logger.info(
         f"Configured SGLang backend policy: arch={model_arch_override} "
         f"effective_quantization={effective_quantization} "
@@ -503,30 +512,13 @@ def _model_config_has_moe(model_config: ModelConfig) -> bool:
 
 
 def _model_config_has_native_fp8_block_quant(model_config: ModelConfig) -> bool:
-    quant_config = _get_hf_quantization_config(model_config)
-    if quant_config is None:
+    quant_dict = resolve_quant_config(getattr(model_config, "hf_config", None))
+    if quant_dict is None:
         return False
-    quant_method = _get_config_value(quant_config, "quant_method")
-    weight_block_size = _get_config_value(quant_config, "weight_block_size")
     return (
-        _normalize_quantization(quant_method) == "fp8" and weight_block_size is not None
+        _normalize_quantization(quant_dict.get("quant_method")) == "fp8"
+        and quant_dict.get("weight_block_size") is not None
     )
-
-
-def _get_hf_quantization_config(model_config: ModelConfig) -> object | None:
-    hf_config = getattr(model_config, "hf_config", None)
-    quant_config = getattr(hf_config, "quantization_config", None)
-    if quant_config is not None:
-        return quant_config
-
-    hf_text_config = getattr(model_config, "hf_text_config", None)
-    return getattr(hf_text_config, "quantization_config", None)
-
-
-def _get_config_value(config: object, key: str) -> object | None:
-    if isinstance(config, dict):
-        return config.get(key)
-    return getattr(config, key, None)
 
 
 def _is_h20_device() -> bool:
@@ -554,6 +546,22 @@ def _is_fp8_cutlass_moe_supported() -> bool:
     return bool(
         cutlass_fp8_supported() and (is_sm90_supported() or is_sm100_supported())
     )
+
+
+def _apply_omni_quantization_adapters(model_config: ModelConfig) -> None:
+    """Apply Omni-specific quantization adapters before SGLang builds its config.
+
+    SGLang owns detection, config parsing, layer construction, and post-load
+    hooks. The only Omni-specific step needed here is stage-local checkpoint
+    name normalization for methods whose per-block quant names are matched
+    against runtime module names, currently AutoRound.
+    """
+    quant_dict = resolve_quant_config(getattr(model_config, "hf_config", None))
+    if quant_dict is None:
+        return
+
+    if needs_quant_config_normalization(quant_dict):
+        normalize_quant_config(model_config)
 
 
 def _initialize_model_worker_backend_globals(
