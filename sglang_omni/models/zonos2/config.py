@@ -93,6 +93,7 @@ class Zonos2PipelineConfig(PipelineConfig):
         "Zonos2Model",
         "ZONOS2",
     )
+    requires_model_capabilities: ClassVar[bool] = True
 
     @classmethod
     def mem_fraction_role_to_stage(cls) -> dict[str, str]:
