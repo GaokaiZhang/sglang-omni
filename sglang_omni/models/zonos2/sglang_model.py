@@ -17,10 +17,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
+from sglang_omni.models.zonos2.components.text_frontend import TTSSamplingParams
 from sglang_omni.models.zonos2.hf_config import Zonos2Config
 from sglang_omni.models.zonos2.radix_hash import poly_row_hash
 from sglang_omni.models.zonos2.sampler import sample_tts
-from sglang_omni.models.zonos2.components.text_frontend import TTSSamplingParams
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.layers import (
     RadixAttention,

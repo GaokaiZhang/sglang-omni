@@ -20,14 +20,14 @@ import pytest
 import torch
 
 from sglang_omni.models.zonos2.components import streaming_vocoder
+from sglang_omni.models.zonos2.components.streaming_vocoder import (
+    DAC_HOP_LENGTH,
+    Zonos2StreamingVocoderScheduler,
+)
 from sglang_omni.models.zonos2.payload_types import (
     N_CODEBOOKS,
     ZONOS2_SAMPLE_RATE,
     Zonos2State,
-)
-from sglang_omni.models.zonos2.components.streaming_vocoder import (
-    DAC_HOP_LENGTH,
-    Zonos2StreamingVocoderScheduler,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
