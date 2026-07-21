@@ -2030,8 +2030,13 @@ def test_qwen3_tts_engine_applies_compat_overrides_and_reenables_cuda_graph(
     qwen_tts_module.Qwen3TTSModel = FakeQwen3TTSModel
     monkeypatch.setitem(sys.modules, "qwen_tts", qwen_tts_module)
 
+    from sglang_omni.scheduling import engine_factory
+
     monkeypatch.setattr(stages, "_register_qwen3_tts_hf_config", lambda: None)
     monkeypatch.setattr(stages, "_resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(
+        engine_factory, "_resolve_checkpoint", lambda model_path: model_path
+    )
     monkeypatch.setattr(
         stages,
         "_load_qwen3_tts_tokenizer",
@@ -2164,7 +2169,7 @@ def test_qwen3_tts_engine_probes_runtime_before_checkpoint_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from sglang_omni.models.qwen3_tts import engine_builder as engine_builder_mod
-    from sglang_omni.models.qwen3_tts import stages
+    from sglang_omni.scheduling import engine_factory
 
     checkpoint_resolutions: list[str] = []
 
@@ -2179,7 +2184,7 @@ def test_qwen3_tts_engine_probes_runtime_before_checkpoint_resolution(
             raise ImportError("missing qwen_tts")
         return original_import_module(name, package)
 
-    monkeypatch.setattr(stages, "_resolve_checkpoint", fake_resolve_checkpoint)
+    monkeypatch.setattr(engine_factory, "_resolve_checkpoint", fake_resolve_checkpoint)
     monkeypatch.setattr(
         engine_builder_mod.importlib, "import_module", fake_import_module
     )
